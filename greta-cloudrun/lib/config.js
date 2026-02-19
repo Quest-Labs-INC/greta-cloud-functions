@@ -38,9 +38,10 @@ export const DEBOUNCE_DELAY = 3000;  // 3 seconds
 // Express API endpoints (not proxied to Python backend)
 export const EXPRESS_API_ENDPOINTS = [
   '/keepAlive', '/write-file', '/read-file', '/delete-file',
-  '/list-files', '/add-dependency', '/console-logs', '/clear-logs', '/sync-to-gcs',
+  '/list-files', '/add-dependency', '/add-python-dependency', '/console-logs', '/clear-logs', '/sync-to-gcs',
   '/bulk-write-files', '/bulk-read-files', '/search-replace', '/insert-text',
   '/grep', '/glob-files', '/execute-bash',
-  '/chat', '/chat/history', '/conversations'
+  '/chat', '/chat/history', '/conversations',
+  '/backend-logs', '/vite-errors'
 ];
 
