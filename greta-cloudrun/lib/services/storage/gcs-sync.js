@@ -55,8 +55,8 @@ const storage = new Storage({
 /** Batch size for parallel uploads/downloads */
 const BATCH_SIZE = 50;
 
-/** Directories to exclude from sync */
-const EXCLUDE_DIRS = ['node_modules', '.git', 'dist', '__pycache__', '.venv'];
+/** Directories to exclude from sync (dist is NOT excluded - needed for production builds) */
+const EXCLUDE_DIRS = ['node_modules', '.git', '__pycache__', '.venv'];
 
 
 /* ─────────────────────────────────────────────────────────────────────────────

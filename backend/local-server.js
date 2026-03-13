@@ -13,6 +13,20 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import OpenAI from 'openai';
 
+import {
+  GCP_PROJECT,
+  GCP_REGION,
+  GCS_BUCKET,
+  LATEST_IMAGE_VERSION,
+  CONTAINER_IMAGE,
+  DB_NAME,
+  FILE_MODIFYING_TOOLS,
+  DEFAULT_MODEL,
+  DEFAULT_MAX_TOKENS,
+  DEFAULT_TEMPERATURE,
+  MAX_AGENTIC_LOOPS
+} from './config.js';
+
 const execAsync = promisify(exec);
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -21,16 +35,6 @@ const PORT = 8000;
 
 // MongoDB Atlas connection
 const MONGO_URL = process.env.MONGO_URL || '';
-const DB_NAME = 'chat-testing';
-
-// GCP Config
-const GCP_PROJECT = 'velosapps-464607';
-const GCP_REGION = 'us-central1';
-const GCS_BUCKET = 'greta-projects';
-
-// Latest image version - UPDATE THIS when pushing new features!
-const LATEST_IMAGE_VERSION = 'v18'; // Fix: GCS sync function signature mismatch
-const CONTAINER_IMAGE = `${GCP_REGION}-docker.pkg.dev/${GCP_PROJECT}/greta-containers/greta-preview:v18`;
 
 // OpenRouter API Key (set this in your environment!)
 const OPEN_ROUTER_API_KEY = process.env.OPEN_ROUTER_API_KEY || '';
@@ -275,6 +279,24 @@ const TOOLS = [
         properties: {
           type: { type: 'string', enum: ['all', 'errors', 'stdout'], description: 'Type of logs to retrieve. "errors" for only errors, "stdout" for only output, "all" for both. Default is "all".' },
           clear: { type: 'boolean', description: 'If true, clears logs after reading. Default is false.' }
+        },
+        required: []
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'mcp_build_frontend',
+      description: 'Build the frontend for production deployment. Creates optimized bundle in dist/ folder. Use this when: 1) User requests a production build, 2) You need to check for build errors before deployment, 3) User wants to export/download their project. Returns build output including any errors.',
+      parameters: {
+        type: 'object',
+        properties: {
+          mode: {
+            type: 'string',
+            enum: ['production', 'development'],
+            description: 'Build mode. "production" (default) creates minified bundle. "development" includes source maps for debugging.'
+          }
         },
         required: []
       }
@@ -736,6 +758,45 @@ const createToolExecutors = (cloudRunUrl) => ({
     }
   },
 
+
+  // Build frontend - uses POST /api/build
+  async mcp_build_frontend({ mode = 'production' }) {
+    try {
+      console.log(`[Build] Starting ${mode} build...`);
+
+      const response = await fetch(`${cloudRunUrl}/api/build`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ mode })
+      });
+      const data = await response.json();
+
+      
+
+      if (data.success) {
+        return {
+          success: true,
+          message: data.message,
+          mode: data.mode,
+          duration: data.duration,
+          buildOutput: data.stdout || '',
+          warnings: data.stderr || ''
+        };
+      } else {
+        return {
+          success: false,
+          message: 'Build failed',
+          mode: data.mode,
+          duration: data.duration,
+          error: data.stderr || data.stdout || 'Unknown error',
+          exitCode: data.exitCode
+        };
+      }
+    } catch (err) {
+      return { error: `Failed to build frontend: ${err.message}` };
+    }
+  },
+
   // Take screenshot - uses POST /api/screenshot
   async mcp_screenshot({ path = '/', fullPage = false, width = 1280, height = 720, selector = null, waitFor = 2000 }) {
     try {
@@ -855,9 +916,6 @@ const createToolExecutors = (cloudRunUrl) => ({
     }
   }
 });
-
-// Tools that modify files and might cause Vite errors
-const FILE_MODIFYING_TOOLS = ['mcp_create_file', 'mcp_bulk_file_writer', 'mcp_search_replace'];
 
 // Extract clean error message from verbose Vite error
 function cleanViteError(errorMsg) {
@@ -1162,10 +1220,10 @@ app.post('/api/chat', async (req, res) => {
   const {
     message,
     chat_uuid,
-    image_url ='https://media-manager-c.questera.ai/greta-media/a82d46baad788cfac770e191944228d9a0cfc7a602dde7be66cdc121710e14b5d98183d1a2888432bc9f21dfb726db64/images/aW1hZ2Uvd2VicA==/20b005ce07efc8a1474640dc102b7720.webp',  // Optional image URL for vision support
-    model = 'google/gemini-3.1-pro-preview',
-    max_tokens = 32000,  // Increased for large tool calls
-    temperature = 0.8,
+    image_url = '',  // Optional image URL for vision support
+    model = DEFAULT_MODEL,
+    max_tokens = DEFAULT_MAX_TOKENS,
+    temperature = DEFAULT_TEMPERATURE,
     api_key
   } = req.body;
 
@@ -1487,8 +1545,7 @@ app.post('/api/chat', async (req, res) => {
     console.log(`[Chat API] Starting with ${messages.length} messages`);
 
     // ============ AGENTIC LOOP ============
-    // Allow up to 20 loops for complex tasks
-    const maxLoops = 20;
+    const maxLoops = MAX_AGENTIC_LOOPS;
     let loopCount = 0;
 
     console.log(JSON.stringify(messages, null, 2));

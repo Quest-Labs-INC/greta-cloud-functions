@@ -12,6 +12,7 @@
 import express from 'express';
 import { PROJECT_DIR, FRONTEND_DIR } from '../../core/config.js';
 import { resolveSafePath, apiResponse, execAsync } from './helpers.js';
+import { syncToGCS } from '../../services/storage/gcs-sync.js';
 
 const router = express.Router();
 
@@ -134,12 +135,95 @@ router.post('/execute-bash', async (req, res) => {
 
 
 /* ─────────────────────────────────────────────────────────────────────────────
+ * BUILD FRONTEND
+ * ───────────────────────────────────────────────────────────────────────────── */
+
+/**
+ * POST /build - Build the frontend for production
+ *
+ * Executes `bun run build` to create a production build in the dist/ folder.
+ * Optionally supports development mode builds via `mode` parameter.
+ *
+ * @body {string} [mode='production'] - Build mode: 'production' or 'development'
+ */
+router.post('/build', async (req, res) => {
+  try {
+    const { mode = 'production' } = req.body;
+    const validModes = ['production', 'development'];
+
+    if (!validModes.includes(mode)) {
+      return apiResponse(res, 400, { error: `Invalid mode. Use: ${validModes.join(', ')}` });
+    }
+
+    console.log(`🔨 Building frontend (mode: ${mode})...`);
+    const startTime = Date.now();
+
+    const buildCommand = mode === 'development'
+      ? 'bun run build:dev'
+      : 'bun run build';
+
+    try {
+      const { stdout, stderr } = await execAsync(buildCommand, {
+        cwd: FRONTEND_DIR,
+        timeout: 180000, // 3 minutes for build
+        maxBuffer: 1024 * 1024 * 10,
+        env: {
+          ...process.env,
+          NODE_ENV: mode
+        }
+      });
+
+      const duration = Date.now() - startTime;
+      console.log(`✅ Build completed in ${duration}ms`);
+
+      // Sync project to GCS so dist folder persists
+      console.log('📤 Syncing build output to GCS...');
+      try {
+        await syncToGCS(PROJECT_DIR);
+        console.log('✅ Build synced to GCS');
+      } catch (syncErr) {
+        console.error('⚠️ GCS sync failed (build still succeeded):', syncErr.message);
+      }
+
+      return apiResponse(res, 200, {
+        success: true,
+        mode,
+        duration,
+        stdout: stdout || '',
+        stderr: stderr || '',
+        message: `Frontend built successfully in ${(duration / 1000).toFixed(1)}s`
+      });
+    } catch (execError) {
+      const duration = Date.now() - startTime;
+      const output = execError.stdout || '';
+      const errorOutput = execError.stderr || execError.message || '';
+
+      console.error(`❌ Build failed in ${duration}ms`);
+
+      return apiResponse(res, 200, {
+        success: false,
+        mode,
+        duration,
+        stdout: output,
+        stderr: errorOutput,
+        exitCode: execError.code || 1,
+        message: 'Build failed'
+      });
+    }
+  } catch (error) {
+    console.error('Build error:', error);
+    return apiResponse(res, 500, { error: error.message });
+  }
+});
+
+
+/* ─────────────────────────────────────────────────────────────────────────────
  * TYPESCRIPT CHECK
  * ───────────────────────────────────────────────────────────────────────────── */
 
 /**
  * GET /typescript-check - Run TypeScript compiler check
- * 
+ *
  * Executes `tsc --noEmit` to find all TypeScript errors across the frontend project.
  * This provides more complete error detection than Vite's HMR.
  */
