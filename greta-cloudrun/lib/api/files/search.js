@@ -77,7 +77,7 @@ router.post('/search-replace', async (req, res) => {
 
     await fs.writeFile(fullPath, content, 'utf8');
     console.log(`✅ Search-replace in: ${filePath} (${replaceAll ? occurrences : 1} replacements)`);
-    scheduleSyncToGCS();
+    scheduleSyncToGCS(filePath);  // Incremental sync
 
     const response = {
       changed: true,
@@ -135,7 +135,7 @@ router.post('/insert-text', async (req, res) => {
 
     await fs.writeFile(fullPath, lines.join('\n'), 'utf8');
     console.log(`✅ Inserted ${newLines.length} line(s) at line ${lineIndex} in: ${filePath}`);
-    scheduleSyncToGCS();
+    scheduleSyncToGCS(filePath);  // Incremental sync
 
     return apiResponse(res, 200, {
       path: filePath,

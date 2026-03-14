@@ -78,7 +78,9 @@ router.post('/bulk-write-files', async (req, res) => {
     const successCount = results.filter(r => r.success).length;
 
     console.log(`✅ Bulk write: ${successCount}/${files.length} files written`);
-    scheduleSyncToGCS();
+
+    // Incremental sync - only the files that were written
+    results.filter(r => r.success).forEach(r => scheduleSyncToGCS(r.path));
 
     // Build response
     const response = {

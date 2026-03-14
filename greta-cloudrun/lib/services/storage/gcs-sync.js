@@ -128,6 +128,200 @@ export async function syncToGCS(sourceDir) {
 
 
 /* ─────────────────────────────────────────────────────────────────────────────
+ * INCREMENTAL SYNC - Individual Files
+ * ───────────────────────────────────────────────────────────────────────────── */
+
+/**
+ * Sync specific files to GCS (incremental sync)
+ *
+ * Used for quick updates when only a few files changed.
+ * Much faster than full sync for small changes.
+ *
+ * Errors are logged but don't stop the entire sync - partial success is allowed.
+ *
+ * @param {string} baseDir - Base directory (e.g., PROJECT_DIR)
+ * @param {string[]} filePaths - Array of relative file paths to sync
+ * @returns {Promise<{success: number, failed: number}>}
+ */
+export async function syncFilesToGCS(baseDir, filePaths) {
+  if (!filePaths || filePaths.length === 0) {
+    return { success: 0, failed: 0 };
+  }
+
+  // Validate inputs
+  if (!baseDir || typeof baseDir !== 'string') {
+    log.error('syncFilesToGCS: Invalid baseDir');
+    return { success: 0, failed: filePaths.length };
+  }
+
+  log.emoji('upload', `Syncing ${filePaths.length} file(s) to GCS...`);
+
+  const bucket = storage.bucket(GCS_BUCKET);
+  const startTime = Date.now();
+  let successCount = 0;
+  let failedCount = 0;
+
+  // Process files with individual error handling
+  const results = await Promise.allSettled(filePaths.map(async (relativePath) => {
+    try {
+      // Normalize path separators for cross-platform compatibility
+      const normalizedPath = relativePath.replace(/\\/g, '/');
+      const fullPath = path.join(baseDir, relativePath);
+
+      // Check if file exists
+      const exists = await fs.pathExists(fullPath);
+      if (!exists) {
+        // File was deleted - remove from GCS
+        const gcsPath = `projects/${projectId}/files/${normalizedPath}`;
+        try {
+          await bucket.file(gcsPath).delete();
+          log.info(`Deleted from GCS: ${normalizedPath}`);
+        } catch (e) {
+          // File might not exist in GCS, that's OK
+          if (e.code !== 404) {
+            log.warn(`Could not delete ${normalizedPath}: ${e.message}`);
+          }
+        }
+        return { path: normalizedPath, action: 'deleted' };
+      }
+
+      // Read and upload file
+      const content = await fs.readFile(fullPath);
+      const gcsPath = `projects/${projectId}/files/${normalizedPath}`;
+      const contentType = getContentType(relativePath);
+
+      await bucket.file(gcsPath).save(content, {
+        contentType,
+        metadata: { cacheControl: 'no-cache' }
+      });
+
+      return { path: normalizedPath, action: 'uploaded' };
+    } catch (error) {
+      throw new Error(`${relativePath}: ${error.message}`);
+    }
+  }));
+
+  // Count successes and failures
+  results.forEach((result, index) => {
+    if (result.status === 'fulfilled') {
+      successCount++;
+    } else {
+      failedCount++;
+      log.error(`Failed to sync ${filePaths[index]}: ${result.reason?.message || 'Unknown error'}`);
+    }
+  });
+
+  const elapsed = Date.now() - startTime;
+
+  if (failedCount === 0) {
+    log.success(`Synced ${successCount} file(s) in ${elapsed}ms`);
+  } else {
+    log.warn(`Synced ${successCount}/${filePaths.length} files (${failedCount} failed) in ${elapsed}ms`);
+  }
+
+  return { success: successCount, failed: failedCount };
+}
+
+
+/* ─────────────────────────────────────────────────────────────────────────────
+ * INCREMENTAL SYNC - Directory
+ * ───────────────────────────────────────────────────────────────────────────── */
+
+/**
+ * Sync a specific directory to GCS (e.g., dist/ after build)
+ *
+ * Uploads all files in the directory without updating the main archive.
+ * Individual file failures are logged but don't stop the entire sync.
+ *
+ * @param {string} baseDir - Base directory (e.g., PROJECT_DIR)
+ * @param {string} subDir - Subdirectory to sync (e.g., 'frontend/dist')
+ * @returns {Promise<{success: number, failed: number, total: number}>}
+ */
+export async function syncDirectoryToGCS(baseDir, subDir) {
+  // Validate inputs
+  if (!baseDir || typeof baseDir !== 'string') {
+    log.error('syncDirectoryToGCS: Invalid baseDir');
+    return { success: 0, failed: 0, total: 0 };
+  }
+  if (!subDir || typeof subDir !== 'string') {
+    log.error('syncDirectoryToGCS: Invalid subDir');
+    return { success: 0, failed: 0, total: 0 };
+  }
+
+  const fullDir = path.join(baseDir, subDir);
+
+  if (!await fs.pathExists(fullDir)) {
+    log.warn(`Directory does not exist: ${subDir}`);
+    return { success: 0, failed: 0, total: 0 };
+  }
+
+  log.emoji('upload', `Syncing directory ${subDir} to GCS...`);
+
+  const bucket = storage.bucket(GCS_BUCKET);
+  const startTime = Date.now();
+  let successCount = 0;
+  let failedCount = 0;
+
+  try {
+    const files = await listFilesRecursive(fullDir, []);
+
+    if (files.length === 0) {
+      log.info(`No files to sync in ${subDir}`);
+      return { success: 0, failed: 0, total: 0 };
+    }
+
+    log.info(`Uploading ${files.length} files from ${subDir}...`);
+
+    // Upload in batches with individual error handling
+    for (let i = 0; i < files.length; i += BATCH_SIZE) {
+      const batch = files.slice(i, i + BATCH_SIZE);
+
+      const results = await Promise.allSettled(batch.map(async (fullPath) => {
+        // Normalize path separators for cross-platform compatibility
+        const relativePath = path.relative(baseDir, fullPath).replace(/\\/g, '/');
+        const gcsPath = `projects/${projectId}/files/${relativePath}`;
+        const content = await fs.readFile(fullPath);
+        const contentType = getContentType(fullPath);
+
+        await bucket.file(gcsPath).save(content, {
+          contentType,
+          metadata: { cacheControl: 'no-cache' }
+        });
+
+        return relativePath;
+      }));
+
+      // Count successes and failures
+      results.forEach((result, idx) => {
+        if (result.status === 'fulfilled') {
+          successCount++;
+        } else {
+          failedCount++;
+          const failedPath = path.relative(baseDir, batch[idx]);
+          log.error(`Failed to upload ${failedPath}: ${result.reason?.message || 'Unknown error'}`);
+        }
+      });
+    }
+
+    const elapsed = Date.now() - startTime;
+
+    if (failedCount === 0) {
+      log.success(`Synced ${successCount} files from ${subDir} in ${elapsed}ms`);
+    } else {
+      log.warn(`Synced ${successCount}/${files.length} files from ${subDir} (${failedCount} failed) in ${elapsed}ms`);
+    }
+
+    return { success: successCount, failed: failedCount, total: files.length };
+
+  } catch (error) {
+    log.error(`Directory sync error: ${error.message}`);
+    // Return partial results if we have any
+    return { success: successCount, failed: failedCount, total: successCount + failedCount };
+  }
+}
+
+
+/* ─────────────────────────────────────────────────────────────────────────────
  * NODE_MODULES CACHING
  * ───────────────────────────────────────────────────────────────────────────── */
 

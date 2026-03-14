@@ -50,7 +50,7 @@ router.post('/write-file', async (req, res) => {
     await fs.writeFile(fullPath, content, 'utf8');
 
     console.log(`✅ File written: ${filePath}`);
-    scheduleSyncToGCS();
+    scheduleSyncToGCS(filePath);  // Incremental sync - only this file
 
     return apiResponse(res, 200, { path: filePath });
   } catch (error) {
@@ -158,7 +158,7 @@ router.delete('/delete-file', async (req, res) => {
     const fullPath = resolveSafePath(filePath);
     await fs.remove(fullPath);
 
-    scheduleSyncToGCS();
+    scheduleSyncToGCS(filePath);  // Incremental sync - mark file as deleted
     return apiResponse(res, 200, { path: filePath });
   } catch (error) {
     return apiResponse(res, 500, { error: error.message });
@@ -199,7 +199,10 @@ router.post('/rename-file', async (req, res) => {
     // Perform the rename/move
     await fs.move(fullOriginalPath, fullNewPath, { overwrite: false });
 
-    scheduleSyncToGCS();
+    // Sync both old path (deleted) and new path (created)
+    scheduleSyncToGCS(originalPath);
+    scheduleSyncToGCS(newPath);
+
     return apiResponse(res, 200, {
       success: true,
       original_path: originalPath,

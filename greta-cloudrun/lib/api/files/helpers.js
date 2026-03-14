@@ -14,7 +14,7 @@ import path from 'path';
 import { promisify } from 'util';
 import { exec as execCallback } from 'child_process';
 import { PROJECT_DIR, FRONTEND_DIR, DEBOUNCE_DELAY } from '../../core/config.js';
-import { syncToGCS } from '../../services/storage/gcs-sync.js';
+import { syncToGCS, syncFilesToGCS } from '../../services/storage/gcs-sync.js';
 import { logs, state } from '../../core/state.js';
 
 export const execAsync = promisify(execCallback);
@@ -102,33 +102,65 @@ export function apiResponse(res, status, data) {
 
 
 /* ─────────────────────────────────────────────────────────────────────────────
- * GCS SYNC SCHEDULING
+ * GCS SYNC SCHEDULING (INCREMENTAL)
  * ───────────────────────────────────────────────────────────────────────────── */
 
 let syncTimeout = null;
-let pendingSync = false;
+let pendingFiles = new Set(); // Track which files need syncing
 
 /**
- * Schedules a debounced sync to Google Cloud Storage.
+ * Schedules a debounced incremental sync to Google Cloud Storage.
  * Multiple rapid file changes will be batched into a single sync operation.
- * The sync is delayed by DEBOUNCE_DELAY to coalesce changes.
+ * Only the changed files are synced, not the entire project.
+ *
+ * @param {string} filePath - Relative path of the changed file
  */
-export function scheduleSyncToGCS() {
+export function scheduleSyncToGCS(filePath) {
   if (syncTimeout) clearTimeout(syncTimeout);
-  pendingSync = true;
+
+  // Track the changed file (validate input)
+  if (filePath && typeof filePath === 'string') {
+    pendingFiles.add(filePath);
+  }
 
   syncTimeout = setTimeout(async () => {
-    if (pendingSync) {
+    if (pendingFiles.size > 0) {
+      const filesToSync = Array.from(pendingFiles);
+      pendingFiles.clear();
+
       try {
-        console.log('🔄 Auto-syncing files to GCS...');
-        await syncToGCS(PROJECT_DIR);
-        console.log('✅ Auto-sync complete');
-        pendingSync = false;
+        console.log(`🔄 Incremental sync: ${filesToSync.length} file(s)...`);
+        const result = await syncFilesToGCS(PROJECT_DIR, filesToSync);
+
+        if (result.failed === 0) {
+          console.log(`✅ Incremental sync complete: ${result.success} file(s)`);
+        } else {
+          console.warn(`⚠️ Incremental sync partial: ${result.success} succeeded, ${result.failed} failed`);
+        }
       } catch (error) {
-        console.error('❌ Auto-sync failed:', error.message);
+        console.error('❌ Incremental sync failed:', error.message);
+        // Re-add files to pending for retry on next change
+        filesToSync.forEach(f => pendingFiles.add(f));
       }
     }
   }, DEBOUNCE_DELAY);
+}
+
+/**
+ * Force a full sync to GCS (used on shutdown)
+ */
+export async function forceFullSyncToGCS() {
+  if (syncTimeout) clearTimeout(syncTimeout);
+  pendingFiles.clear();
+
+  try {
+    console.log('🔄 Full sync to GCS...');
+    await syncToGCS(PROJECT_DIR);
+    console.log('✅ Full sync complete');
+  } catch (error) {
+    console.error('❌ Full sync failed:', error.message);
+    throw error; // Re-throw for shutdown handler
+  }
 }
 
 

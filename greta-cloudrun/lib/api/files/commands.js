@@ -12,7 +12,7 @@
 import express from 'express';
 import { PROJECT_DIR, FRONTEND_DIR } from '../../core/config.js';
 import { resolveSafePath, apiResponse, execAsync } from './helpers.js';
-import { syncToGCS } from '../../services/storage/gcs-sync.js';
+import { syncDirectoryToGCS } from '../../services/storage/gcs-sync.js';
 
 const router = express.Router();
 
@@ -176,12 +176,20 @@ router.post('/build', async (req, res) => {
       const duration = Date.now() - startTime;
       console.log(`✅ Build completed in ${duration}ms`);
 
-      // Sync project to GCS so dist folder persists
-      console.log('📤 Syncing build output to GCS...');
+      // Sync only dist folder to GCS (incremental - much faster!)
+      console.log('📤 Syncing dist folder to GCS...');
+      let syncResult = { success: 0, failed: 0, total: 0 };
+      let syncError = null;
+
       try {
-        await syncToGCS(PROJECT_DIR);
-        console.log('✅ Build synced to GCS');
+        syncResult = await syncDirectoryToGCS(PROJECT_DIR, 'frontend/dist');
+        if (syncResult.failed === 0) {
+          console.log(`✅ Dist folder synced to GCS (${syncResult.success} files)`);
+        } else {
+          console.warn(`⚠️ Dist sync partial: ${syncResult.success}/${syncResult.total} files`);
+        }
       } catch (syncErr) {
+        syncError = syncErr.message;
         console.error('⚠️ GCS sync failed (build still succeeded):', syncErr.message);
       }
 
@@ -191,7 +199,13 @@ router.post('/build', async (req, res) => {
         duration,
         stdout: stdout || '',
         stderr: stderr || '',
-        message: `Frontend built successfully in ${(duration / 1000).toFixed(1)}s`
+        message: `Frontend built successfully in ${(duration / 1000).toFixed(1)}s`,
+        gcsSync: {
+          filesUploaded: syncResult.success,
+          filesFailed: syncResult.failed,
+          totalFiles: syncResult.total,
+          error: syncError
+        }
       });
     } catch (execError) {
       const duration = Date.now() - startTime;
