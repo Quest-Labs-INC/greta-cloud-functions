@@ -47,6 +47,7 @@ import { syncFromGCS, syncToGCS } from './lib/services/storage/gcs-sync.js';
 import { startMongo, restoreMongoFromGCS, backupMongoToGCS } from './lib/services/processes/mongodb.js';
 import { startVite, setShuttingDown } from './lib/services/processes/vite.js';
 import { startBackend, setBackendShuttingDown } from './lib/services/processes/backend.js';
+import { loadSecretsFromGCS } from './lib/services/secrets/env-loader.js';
 
 /* ─────────────────────────────────────────────────────────────────────────────
  * IMPORTS - API Routers & Middleware
@@ -138,6 +139,7 @@ app.use(viteRouter);
  * Initialize the project on container startup.
  *
  * Sequence:
+ * 0. Load shared secrets from GCS (gs://{bucket}/secrets/.env)
  * 1. Setup frontend (copy template, sync from GCS, install deps)
  * 2. Start Vite dev server
  * 3. Setup backend (copy template)
@@ -151,6 +153,14 @@ async function initializeProject() {
   const { exec } = await import('child_process');
   const { promisify } = await import('util');
   const execAsync = promisify(exec);
+
+  /* ─────────────────────────────────────────────────────────────────────────────
+   * STEP 0: Load Shared Secrets from GCS
+   * ───────────────────────────────────────────────────────────────────────────── */
+
+  console.log('🔐 Loading shared secrets from GCS...');
+  await loadSecretsFromGCS();
+  console.log('✅ Secrets loaded into environment');
 
   /* ─────────────────────────────────────────────────────────────────────────────
    * STEP 1: Frontend Setup
