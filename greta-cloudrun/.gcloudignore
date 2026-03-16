@@ -1,0 +1,23 @@
+# Ignore node_modules - they get installed during build
+**/node_modules/
+
+# Git
+.git/
+.gitignore
+
+# IDE
+.vscode/
+.idea/
+
+# Build artifacts
+**/dist/
+**/.cache/
+
+# Logs
+*.log
+npm-debug.log*
+
+# Local env files
+.env.local
+.env.*.local
+
