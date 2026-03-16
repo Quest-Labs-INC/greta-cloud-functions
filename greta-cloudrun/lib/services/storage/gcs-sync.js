@@ -2,15 +2,16 @@
  * ═══════════════════════════════════════════════════════════════════════════════
  * GOOGLE CLOUD STORAGE SYNC
  * ═══════════════════════════════════════════════════════════════════════════════
- * 
+ *
  * Synchronizes project files between local filesystem and Google Cloud Storage.
- * 
+ *
  * Features:
  * - Fast archive-based downloads (files.zip)
  * - Parallel file uploads with batching
  * - node_modules caching for faster cold starts
  * - Fallback to individual file downloads for backwards compatibility
- * 
+ * - Project existence check (hasGCSData) for smart startup
+ *
  * @module services/storage/gcs-sync
  */
 
@@ -60,14 +61,57 @@ const EXCLUDE_DIRS = ['node_modules', '.git', '__pycache__', '.venv'];
 
 
 /* ─────────────────────────────────────────────────────────────────────────────
+ * CHECK GCS DATA EXISTS
+ * ───────────────────────────────────────────────────────────────────────────── */
+
+/**
+ * Check if project has data stored in GCS
+ *
+ * Used during container startup to decide whether to:
+ * - Use GCS data (existing project)
+ * - Use main-template (new project)
+ *
+ * @returns {Promise<boolean>} True if project has files in GCS
+ */
+export async function hasGCSData() {
+  try {
+    const bucket = storage.bucket(GCS_BUCKET);
+
+    // Check for files.zip first (fast path)
+    const zipFile = bucket.file(`projects/${projectId}/files.zip`);
+    const [zipExists] = await zipFile.exists();
+    if (zipExists) {
+      log.info(`Found files.zip in GCS for project ${projectId}`);
+      return true;
+    }
+
+    // Check for individual files (fallback)
+    const prefix = `projects/${projectId}/files/`;
+    const [files] = await bucket.getFiles({ prefix, maxResults: 1 });
+    if (files.length > 0) {
+      log.info(`Found individual files in GCS for project ${projectId}`);
+      return true;
+    }
+
+    log.info(`No GCS data found for project ${projectId} - will use template`);
+    return false;
+
+  } catch (error) {
+    log.error(`Error checking GCS data: ${error.message}`);
+    return false; // Assume no data on error, use template
+  }
+}
+
+
+/* ─────────────────────────────────────────────────────────────────────────────
  * DOWNLOAD FROM GCS
  * ───────────────────────────────────────────────────────────────────────────── */
 
 /**
  * Download project files from GCS
- * 
+ *
  * Uses optimized archive download when available, falls back to individual files.
- * 
+ *
  * @param {string} targetDir - Local directory to download to
  * @returns {Promise<boolean>} True if files were downloaded
  */

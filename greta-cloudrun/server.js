@@ -43,7 +43,7 @@ import { state } from './lib/core/state.js';
  * IMPORTS - Services
  * ───────────────────────────────────────────────────────────────────────────── */
 
-import { syncFromGCS, syncToGCS } from './lib/services/storage/gcs-sync.js';
+import { syncFromGCS, syncToGCS, hasGCSData } from './lib/services/storage/gcs-sync.js';
 import { startMongo, restoreMongoFromGCS, backupMongoToGCS } from './lib/services/processes/mongodb.js';
 import { startVite, setShuttingDown } from './lib/services/processes/vite.js';
 import { startBackend, setBackendShuttingDown } from './lib/services/processes/backend.js';
@@ -136,15 +136,27 @@ app.use(viteRouter);
  * ═══════════════════════════════════════════════════════════════════════════════ */
 
 /**
+ * Copy frontend template files (excluding node_modules)
+ */
+async function copyFrontendTemplate(templateDir, targetDir) {
+  const templateFiles = await fs.readdir(templateDir);
+  for (const file of templateFiles) {
+    if (file !== 'node_modules') {
+      await fs.copy(path.join(templateDir, file), path.join(targetDir, file));
+    }
+  }
+}
+
+/**
  * Initialize the project on container startup.
  *
  * Sequence:
- * 0. Load shared secrets from GCS (gs://{bucket}/secrets/.env)
- * 1. Setup frontend (copy template, sync from GCS, install deps)
- * 2. Start Vite dev server
- * 3. Setup backend (copy template)
- * 4. Start MongoDB and restore from GCS
- * 5. Start FastAPI backend
+ * Load shared secrets from GCS (gs://{bucket}/secrets/.env)
+ * 1. Check GCS for existing project data (GCS takes priority!)
+ * 2. If GCS has data → restore from GCS
+ * 3. If new project → copy template
+ * 4. Setup dependencies
+ * 5. Start Vite, MongoDB, FastAPI
  * 6. Enable periodic backups
  */
 async function initializeProject() {
@@ -163,30 +175,34 @@ async function initializeProject() {
   console.log('✅ Secrets loaded into environment');
 
   /* ─────────────────────────────────────────────────────────────────────────────
-   * STEP 1: Frontend Setup
+   * STEP 1: Check GCS for existing project data
    * ───────────────────────────────────────────────────────────────────────────── */
 
   await fs.ensureDir(FRONTEND_DIR);
 
-  // Copy template if no package.json
   const frontendPkgPath = path.join(FRONTEND_DIR, 'package.json');
   const templatePkgPath = path.join(FRONTEND_TEMPLATE_DIR, 'package.json');
 
-  if (!await fs.pathExists(frontendPkgPath)) {
-    console.log('📋 Copying frontend template...');
-    const templateFiles = await fs.readdir(FRONTEND_TEMPLATE_DIR);
-    for (const file of templateFiles) {
-      if (file !== 'node_modules') {
-        await fs.copy(path.join(FRONTEND_TEMPLATE_DIR, file), path.join(FRONTEND_DIR, file));
-      }
+  // CRITICAL: Check GCS FIRST before using template
+  console.log('🔍 Checking GCS for existing project data...');
+  const hasExistingData = await hasGCSData();
+
+  if (hasExistingData) {
+    // EXISTING PROJECT: Sync from GCS (user's saved work takes priority)
+    console.log('� Found existing project in GCS - restoring user data...');
+    const syncSuccess = await syncFromGCS(PROJECT_DIR);
+    if (syncSuccess) {
+      console.log('✅ User data restored from GCS');
+    } else {
+      console.log('⚠️ GCS sync failed, falling back to template');
+      await copyFrontendTemplate(FRONTEND_TEMPLATE_DIR, FRONTEND_DIR);
     }
+  } else {
+    // NEW PROJECT: Use template
+    console.log('� New project - copying template...');
+    await copyFrontendTemplate(FRONTEND_TEMPLATE_DIR, FRONTEND_DIR);
     console.log('✅ Frontend template copied');
   }
-
-  // Sync from GCS to get real package.json before checking deps
-  console.log('📥 Syncing from GCS...');
-  await syncFromGCS(PROJECT_DIR);
-  console.log('✅ GCS sync complete');
 
   // Decide: symlink (fast) vs full install (slow)
   const nodeModulesPath = path.join(FRONTEND_DIR, 'node_modules');
