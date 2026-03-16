@@ -131,3 +131,22 @@ export function stopBackend() {
   }
 }
 
+/**
+ * Restart the Python backend server
+ *
+ * Useful after environment variable changes or dependency updates.
+ *
+ * @returns {Promise<void>}
+ */
+export async function restartBackend() {
+  log.emoji('restart', 'Restarting Python backend...');
+
+  stopBackend();
+
+  // Wait for process to fully terminate
+  await new Promise(resolve => setTimeout(resolve, 1000));
+
+  await startBackend();
+  log.success('Python backend restarted');
+}
+

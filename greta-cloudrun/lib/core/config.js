@@ -23,7 +23,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
  * Image version - INCREMENT when pushing new features
  * Used for tracking deployed container versions
  */
-export const IMAGE_VERSION = 'v27';
+export const IMAGE_VERSION = 'v28';
 
 
 /* ─────────────────────────────────────────────────────────────────────────────
@@ -172,6 +172,9 @@ export const EXPRESS_API_ENDPOINTS = [
 
   // Build
   '/build',
+
+  // Environment & Server Management
+  '/update-env-and-restart',
 
   // Chat & AI
   '/chat', '/chat/history', '/conversations',

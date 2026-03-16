@@ -47,6 +47,7 @@ import { syncFromGCS, syncToGCS, hasGCSData } from './lib/services/storage/gcs-s
 import { startMongo, restoreMongoFromGCS, backupMongoToGCS } from './lib/services/processes/mongodb.js';
 import { startVite, setShuttingDown } from './lib/services/processes/vite.js';
 import { startBackend, setBackendShuttingDown } from './lib/services/processes/backend.js';
+import { loadSecretsFromGCS } from './lib/services/secrets/env-loader.js';
 
 /* ─────────────────────────────────────────────────────────────────────────────
  * IMPORTS - API Routers & Middleware
@@ -150,6 +151,7 @@ async function copyFrontendTemplate(templateDir, targetDir) {
  * Initialize the project on container startup.
  *
  * Sequence:
+ * Load shared secrets from GCS (gs://{bucket}/secrets/.env)
  * 1. Check GCS for existing project data (GCS takes priority!)
  * 2. If GCS has data → restore from GCS
  * 3. If new project → copy template
@@ -163,6 +165,14 @@ async function initializeProject() {
   const { exec } = await import('child_process');
   const { promisify } = await import('util');
   const execAsync = promisify(exec);
+
+  /* ─────────────────────────────────────────────────────────────────────────────
+   * STEP 0: Load Shared Secrets from GCS
+   * ───────────────────────────────────────────────────────────────────────────── */
+
+  console.log('🔐 Loading shared secrets from GCS...');
+  await loadSecretsFromGCS();
+  console.log('✅ Secrets loaded into environment');
 
   /* ─────────────────────────────────────────────────────────────────────────────
    * STEP 1: Check GCS for existing project data

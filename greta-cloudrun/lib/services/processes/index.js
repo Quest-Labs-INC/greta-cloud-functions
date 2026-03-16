@@ -20,6 +20,7 @@ export {
 export {
   startBackend,
   stopBackend,
+  restartBackend,
   setBackendShuttingDown,
 } from './backend.js';
 

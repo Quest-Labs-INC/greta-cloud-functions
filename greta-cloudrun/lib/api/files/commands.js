@@ -12,6 +12,8 @@
 import express from 'express';
 import { PROJECT_DIR, FRONTEND_DIR } from '../../core/config.js';
 import { resolveSafePath, apiResponse, execAsync } from './helpers.js';
+import { restartVite } from '../../services/processes/vite.js';
+import { restartBackend } from '../../services/processes/backend.js';
 import { syncDirectoryToGCS } from '../../services/storage/gcs-sync.js';
 
 const router = express.Router();
@@ -291,6 +293,131 @@ router.get('/typescript-check', async (req, res) => {
     }
   } catch (error) {
     console.error('TypeScript check error:', error);
+    return apiResponse(res, 500, { error: error.message });
+  }
+});
+
+
+/* ─────────────────────────────────────────────────────────────────────────────
+ * UPDATE ENVIRONMENT VARIABLES & RESTART SERVERS
+ * ───────────────────────────────────────────────────────────────────────────── */
+
+/**
+ * POST /update-env-and-restart - Update environment variables and restart servers
+ *
+ * First deletes specified env vars using `unset`, then sets new ones using `export`,
+ * and finally restarts both Vite (client) and Python backend servers.
+ *
+ * @body {Object} envToAdd - Key-value pairs of environment variables to add/update
+ * @body {string[]} envToDelete - Array of environment variable names to delete
+ * @body {boolean} [restartClient=true] - Whether to restart Vite client server
+ * @body {boolean} [restartServer=true] - Whether to restart Python backend server
+ */
+router.post('/update-env-and-restart', async (req, res) => {
+  try {
+    const {
+      envToAdd = {},
+      envToDelete = [],
+      restartClient = true,
+      restartServer = true
+    } = req.body;
+
+    const results = {
+      deleted: [],
+      added: [],
+      clientRestarted: false,
+      serverRestarted: false,
+      errors: []
+    };
+
+    console.log('🔄 Updating environment variables...');
+
+    // Step 1: Delete environment variables
+    if (Array.isArray(envToDelete) && envToDelete.length > 0) {
+      console.log(`🗑️ Deleting ${envToDelete.length} environment variable(s)...`);
+      for (const key of envToDelete) {
+        if (typeof key === 'string' && key.trim()) {
+          const sanitizedKey = key.trim().replace(/[^a-zA-Z0-9_]/g, '');
+          if (sanitizedKey) {
+            delete process.env[sanitizedKey];
+            results.deleted.push(sanitizedKey);
+            console.log(`  ✓ Unset: ${sanitizedKey}`);
+          }
+        }
+      }
+    }
+
+    // Step 2: Add/update environment variables
+    if (envToAdd && typeof envToAdd === 'object') {
+      const keys = Object.keys(envToAdd);
+      if (keys.length > 0) {
+        console.log(`📝 Setting ${keys.length} environment variable(s)...`);
+        for (const [key, value] of Object.entries(envToAdd)) {
+          if (typeof key === 'string' && key.trim()) {
+            const sanitizedKey = key.trim().replace(/[^a-zA-Z0-9_]/g, '');
+            if (sanitizedKey) {
+              process.env[sanitizedKey] = String(value);
+              results.added.push(sanitizedKey);
+              console.log(`  ✓ Set: ${sanitizedKey}=${String(value).substring(0, 20)}${String(value).length > 20 ? '...' : ''}`);
+            }
+          }
+        }
+      }
+    }
+
+    // Step 3: Restart servers
+    const restartPromises = [];
+
+    if (restartClient) {
+      console.log('🔄 Restarting Vite client server...');
+      restartPromises.push(
+        restartVite()
+          .then(() => {
+            results.clientRestarted = true;
+            console.log('✅ Vite client restarted');
+          })
+          .catch((err) => {
+            results.errors.push(`Vite restart failed: ${err.message}`);
+            console.error('❌ Vite restart failed:', err.message);
+          })
+      );
+    }
+
+    if (restartServer) {
+      console.log('🔄 Restarting Python backend server...');
+      restartPromises.push(
+        restartBackend()
+          .then(() => {
+            results.serverRestarted = true;
+            console.log('✅ Python backend restarted');
+          })
+          .catch((err) => {
+            results.errors.push(`Backend restart failed: ${err.message}`);
+            console.error('❌ Backend restart failed:', err.message);
+          })
+      );
+    }
+
+    // Wait for all restarts to complete
+    if (restartPromises.length > 0) {
+      await Promise.all(restartPromises);
+    }
+
+    const success = results.errors.length === 0;
+    console.log(success
+      ? '✅ Environment update and restart completed successfully'
+      : `⚠️ Environment update completed with errors: ${results.errors.join(', ')}`
+    );
+
+    return apiResponse(res, success ? 200 : 207, {
+      success,
+      message: success
+        ? 'Environment variables updated and servers restarted'
+        : 'Completed with some errors',
+      ...results
+    });
+  } catch (error) {
+    console.error('Update env and restart error:', error);
     return apiResponse(res, 500, { error: error.message });
   }
 });
