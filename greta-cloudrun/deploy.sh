@@ -7,7 +7,7 @@ set -e
 PROJECT_ID="${GCP_PROJECT_ID:-your-gcp-project}"
 REGION="${GCP_REGION:-us-central1}"
 REPOSITORY="greta-containers"
-IMAGE_NAME="greta-preview"
+IMAGE_NAME="greta-backend"
 
 echo "🚀 Deploying Greta Cloud Run container..."
 echo "Project: $PROJECT_ID"

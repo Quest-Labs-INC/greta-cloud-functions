@@ -69,10 +69,10 @@ export const backendProxy = createProxyMiddleware({
     const writeMethod = ['POST', 'PUT', 'DELETE', 'PATCH'].includes(req.method);
     const successStatus = proxyRes.statusCode >= 200 && proxyRes.statusCode < 300;
 
-    if (writeMethod && successStatus) {
-      console.log(`📝 Write operation detected: ${req.method} ${req.originalUrl} - scheduling backup`);
-      scheduleMongoBackup();
-    }
+    // if (writeMethod && successStatus) {
+    //   console.log(`📝 Write operation detected: ${req.method} ${req.originalUrl} - scheduling backup`);
+    //   scheduleMongoBackup();
+    // }
   },
 
   onError: (err, req, res) => {

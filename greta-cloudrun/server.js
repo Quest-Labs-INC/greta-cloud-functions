@@ -27,12 +27,9 @@ import path from 'path';
 import {
   PORT,
   PROJECT_DIR,
-  FRONTEND_DIR,
   BACKEND_DIR,
-  FRONTEND_TEMPLATE_DIR,
   BACKEND_TEMPLATE_DIR,
   projectId,
-  MONGO_BACKUP_INTERVAL,
   EXPRESS_API_ENDPOINTS,
   IMAGE_VERSION
 } from './lib/core/config.js';
@@ -43,9 +40,9 @@ import { state } from './lib/core/state.js';
  * IMPORTS - Services
  * ───────────────────────────────────────────────────────────────────────────── */
 
-import { syncFromGCS, syncToGCS } from './lib/services/storage/gcs-sync.js';
-import { startMongo, restoreMongoFromGCS, backupMongoToGCS } from './lib/services/processes/mongodb.js';
-import { startVite, setShuttingDown } from './lib/services/processes/vite.js';
+import { syncFromGCS } from './lib/services/storage/gcs-sync.js';
+// import { backupMongoToGCS } from './lib/services/processes/mongodb.js';
+import { setShuttingDown } from './lib/services/processes/vite.js';
 import { startBackend, setBackendShuttingDown } from './lib/services/processes/backend.js';
 import { loadSecretsFromGCS } from './lib/services/secrets/env-loader.js';
 
@@ -56,7 +53,7 @@ import { loadSecretsFromGCS } from './lib/services/secrets/env-loader.js';
 import fileApiRouter from './lib/api/files/index.js';
 import logsApiRouter from './lib/api/logs/index.js';
 import screenshotApiRouter from './lib/api/screenshot/index.js';
-import { apiRouter, viteRouter } from './lib/middleware/proxy.js';
+import { apiRouter } from './lib/middleware/proxy.js';
 
 const app = express();
 
@@ -129,7 +126,7 @@ app.use('/api', screenshotApiRouter);  // Playwright screenshots
 app.use('/api', apiRouter);
 
 // Proxy everything else to Vite frontend
-app.use(viteRouter);
+// app.use(viteRouter);
 
 /* ═══════════════════════════════════════════════════════════════════════════════
  * PROJECT INITIALIZATION
@@ -166,22 +163,22 @@ async function initializeProject() {
    * STEP 1: Frontend Setup
    * ───────────────────────────────────────────────────────────────────────────── */
 
-  await fs.ensureDir(FRONTEND_DIR);
+  // await fs.ensureDir(FRONTEND_DIR);
 
   // Copy template if no package.json
-  const frontendPkgPath = path.join(FRONTEND_DIR, 'package.json');
-  const templatePkgPath = path.join(FRONTEND_TEMPLATE_DIR, 'package.json');
+  // const frontendPkgPath = path.join(FRONTEND_DIR, 'package.json');
+  // const templatePkgPath = path.join(FRONTEND_TEMPLATE_DIR, 'package.json');
 
-  if (!await fs.pathExists(frontendPkgPath)) {
-    console.log('📋 Copying frontend template...');
-    const templateFiles = await fs.readdir(FRONTEND_TEMPLATE_DIR);
-    for (const file of templateFiles) {
-      if (file !== 'node_modules') {
-        await fs.copy(path.join(FRONTEND_TEMPLATE_DIR, file), path.join(FRONTEND_DIR, file));
-      }
-    }
-    console.log('✅ Frontend template copied');
-  }
+  // if (!await fs.pathExists(frontendPkgPath)) {
+  //   console.log('📋 Copying frontend template...');
+  //   const templateFiles = await fs.readdir(FRONTEND_TEMPLATE_DIR);
+  //   for (const file of templateFiles) {
+  //     if (file !== 'node_modules') {
+  //       await fs.copy(path.join(FRONTEND_TEMPLATE_DIR, file), path.join(FRONTEND_DIR, file));
+  //     }
+  //   }
+  //   console.log('✅ Frontend template copied');
+  // }
 
   // Sync from GCS to get real package.json before checking deps
   console.log('📥 Syncing from GCS...');
@@ -189,46 +186,46 @@ async function initializeProject() {
   console.log('✅ GCS sync complete');
 
   // Decide: symlink (fast) vs full install (slow)
-  const nodeModulesPath = path.join(FRONTEND_DIR, 'node_modules');
-  const templateNodeModules = path.join(FRONTEND_TEMPLATE_DIR, 'node_modules');
+  // const nodeModulesPath = path.join(FRONTEND_DIR, 'node_modules');
+  // const templateNodeModules = path.join(FRONTEND_TEMPLATE_DIR, 'node_modules');
 
-  const projectPkg = await fs.readJson(frontendPkgPath);
-  const templatePkg = await fs.readJson(templatePkgPath);
-  const depsMatch =
-    JSON.stringify(projectPkg.dependencies || {}) === JSON.stringify(templatePkg.dependencies || {}) &&
-    JSON.stringify(projectPkg.devDependencies || {}) === JSON.stringify(templatePkg.devDependencies || {});
+  // const projectPkg = await fs.readJson(frontendPkgPath);
+  // const templatePkg = await fs.readJson(templatePkgPath);
+  // const depsMatch =
+  //   JSON.stringify(projectPkg.dependencies || {}) === JSON.stringify(templatePkg.dependencies || {}) &&
+  //   JSON.stringify(projectPkg.devDependencies || {}) === JSON.stringify(templatePkg.devDependencies || {});
 
-  if (depsMatch && !await fs.pathExists(nodeModulesPath)) {
-    // FAST PATH: Dependencies match template - symlink (~2-3s)
-    console.log('⚡ Dependencies match template - using symlink');
-    await fs.symlink(templateNodeModules, nodeModulesPath);
-    console.log('✅ node_modules symlinked');
-  } else if (!await fs.pathExists(nodeModulesPath)) {
-    // SLOW PATH: Dependencies differ - full install (~25-30s)
-    console.log('📦 Dependencies differ - running bun install...');
+  // if (depsMatch && !await fs.pathExists(nodeModulesPath)) {
+  //   // FAST PATH: Dependencies match template - symlink (~2-3s)
+  //   console.log('⚡ Dependencies match template - using symlink');
+  //   await fs.symlink(templateNodeModules, nodeModulesPath);
+  //   console.log('✅ node_modules symlinked');
+  // } else if (!await fs.pathExists(nodeModulesPath)) {
+  //   // SLOW PATH: Dependencies differ - full install (~25-30s)
+  //   console.log('📦 Dependencies differ - running bun install...');
 
-    const bunCacheTar = '/bun-cache.tar.lz4';
-    const tmpBunCache = '/tmp/bun-cache';
+  //   const bunCacheTar = '/bun-cache.tar.lz4';
+  //   const tmpBunCache = '/tmp/bun-cache';
 
-    if (await fs.pathExists(bunCacheTar) && !await fs.pathExists(tmpBunCache)) {
-      console.log('📦 Extracting bun cache...');
-      await fs.ensureDir(tmpBunCache);
-      await execAsync(`lz4 -dc ${bunCacheTar} | tar -xf - -C ${tmpBunCache} --strip-components=1`, { timeout: 60000 });
-    }
+  //   if (await fs.pathExists(bunCacheTar) && !await fs.pathExists(tmpBunCache)) {
+  //     console.log('📦 Extracting bun cache...');
+  //     await fs.ensureDir(tmpBunCache);
+  //     await execAsync(`lz4 -dc ${bunCacheTar} | tar -xf - -C ${tmpBunCache} --strip-components=1`, { timeout: 60000 });
+  //   }
 
-    try {
-      await execAsync('bun install', {
-        cwd: FRONTEND_DIR,
-        timeout: 180000,
-        env: { ...process.env, BUN_INSTALL_CACHE_DIR: tmpBunCache }
-      });
-      console.log('✅ bun install completed');
-    } catch (err) {
-      console.error('⚠️ bun install failed:', err.message);
-    }
-  } else {
-    console.log('✅ node_modules already exists');
-  }
+  //   try {
+  //     await execAsync('bun install', {
+  //       cwd: FRONTEND_DIR,
+  //       timeout: 180000,
+  //       env: { ...process.env, BUN_INSTALL_CACHE_DIR: tmpBunCache }
+  //     });
+  //     console.log('✅ bun install completed');
+  //   } catch (err) {
+  //     console.error('⚠️ bun install failed:', err.message);
+  //   }
+  // } else {
+  //   console.log('✅ node_modules already exists');
+  // }
 
   /* ─────────────────────────────────────────────────────────────────────────────
    * STEP 2: Start Services
@@ -238,7 +235,7 @@ async function initializeProject() {
   await fs.ensureDir(BACKEND_DIR);
 
   // Start Vite frontend
-  await startVite();
+  // await startVite();
 
   // Copy backend template if needed
   const backendServerPath = path.join(BACKEND_DIR, 'server.py');
@@ -249,14 +246,14 @@ async function initializeProject() {
   }
 
   // Start MongoDB and restore data
-  await startMongo();
-  await restoreMongoFromGCS();
+  // await startMongo();
+  // await restoreMongoFromGCS();
 
   // Start FastAPI backend
   await startBackend();
 
   // Enable periodic backups
-  startPeriodicBackups();
+  // startPeriodicBackups();
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════════
@@ -269,19 +266,19 @@ async function initializeProject() {
  * NOTE: File sync is tool-triggered only (not periodic) to prevent race
  * conditions where template files could be uploaded before GCS download.
  */
-function startPeriodicBackups() {
-  setInterval(async () => {
-    try {
-      console.log('⏰ Periodic MongoDB backup...');
-      await backupMongoToGCS();
-      console.log('✅ Periodic MongoDB backup complete');
-    } catch (error) {
-      console.error('❌ Periodic MongoDB backup failed:', error.message);
-    }
-  }, MONGO_BACKUP_INTERVAL);
+// function startPeriodicBackups() {
+//   setInterval(async () => {
+//     try {
+//       console.log('⏰ Periodic MongoDB backup...');
+//       await backupMongoToGCS();
+//       console.log('✅ Periodic MongoDB backup complete');
+//     } catch (error) {
+//       console.error('❌ Periodic MongoDB backup failed:', error.message);
+//     }
+//   }, MONGO_BACKUP_INTERVAL);
 
-  console.log('🔒 Periodic MongoDB backup enabled. File sync is tool-triggered only.');
-}
+//   console.log('🔒 Periodic MongoDB backup enabled. File sync is tool-triggered only.');
+// }
 
 
 /* ═══════════════════════════════════════════════════════════════════════════════
@@ -300,29 +297,29 @@ async function shutdown() {
   setBackendShuttingDown();
 
   // Backup MongoDB
-  try {
-    await backupMongoToGCS();
-  } catch (error) {
-    console.error('Failed to backup MongoDB:', error.message);
-  }
+  // try {
+  //   await backupMongoToGCS();
+  // } catch (error) {
+  //   console.error('Failed to backup MongoDB:', error.message);
+  // }
 
   // Sync files to GCS
-  try {
-    await syncToGCS(PROJECT_DIR);
-    console.log('✅ Files saved to GCS');
-  } catch (error) {
-    console.error('Failed to save files to GCS:', error.message);
-  }
+  // try {
+  //   await syncToGCS(PROJECT_DIR);
+  //   console.log('✅ Files saved to GCS');
+  // } catch (error) {
+  //   console.error('Failed to save files to GCS:', error.message);
+  // }
 
-  // Stop all processes
-  if (state.mongoProcess) {
-    state.mongoProcess.kill();
-    console.log('MongoDB stopped');
-  }
-  if (state.viteProcess) {
-    state.viteProcess.kill();
-    console.log('Vite stopped');
-  }
+  // // Stop all processes
+  // if (state.mongoProcess) {
+  //   state.mongoProcess.kill();
+  //   console.log('MongoDB stopped');
+  // }
+  // if (state.viteProcess) {
+  //   state.viteProcess.kill();
+  //   console.log('Vite stopped');
+  // }
   if (state.backendProcess) {
     state.backendProcess.kill();
     console.log('Backend stopped');

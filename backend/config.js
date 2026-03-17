@@ -8,8 +8,8 @@ const GCP_REGION = 'us-central1';
 const GCS_BUCKET = 'greta-projects-prod';
 
 // Latest image version - UPDATE THIS when pushing new features!
-const LATEST_IMAGE_VERSION = 'v25'; // Need to update after building again
-const CONTAINER_IMAGE = `${GCP_REGION}-docker.pkg.dev/${GCP_PROJECT}/greta-containers/greta-preview:${LATEST_IMAGE_VERSION}`;
+const LATEST_IMAGE_VERSION = 'v1';
+const CONTAINER_IMAGE = `${GCP_REGION}-docker.pkg.dev/${GCP_PROJECT}/greta-containers/greta-backend:${LATEST_IMAGE_VERSION}`;
 
 // MongoDB Config
 const DB_NAME = 'chat-testing';
