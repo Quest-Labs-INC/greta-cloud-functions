@@ -8,7 +8,7 @@ const GCP_REGION = 'us-central1';
 const GCS_BUCKET = 'greta-projects-prod';
 
 // Latest image version - UPDATE THIS when pushing new features!
-const LATEST_IMAGE_VERSION = 'v1';
+const LATEST_IMAGE_VERSION = 'v2';
 const CONTAINER_IMAGE = `${GCP_REGION}-docker.pkg.dev/${GCP_PROJECT}/greta-containers/greta-backend:${LATEST_IMAGE_VERSION}`;
 
 // MongoDB Config

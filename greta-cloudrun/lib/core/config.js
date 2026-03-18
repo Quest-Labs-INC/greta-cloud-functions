@@ -23,7 +23,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
  * Image version - INCREMENT when pushing new features
  * Used for tracking deployed container versions
  */
-export const IMAGE_VERSION = 'v1';
+export const IMAGE_VERSION = 'v2';
 
 
 /* ─────────────────────────────────────────────────────────────────────────────
@@ -150,23 +150,24 @@ export const MAX_LOGS = 100;
 export const EXPRESS_API_ENDPOINTS = [
   // Core operations
   '/keepAlive',
-  
+  '/reload-backend',
+
   // File operations
   '/write-file', '/read-file', '/delete-file', '/rename-file',
   '/list-files', '/bulk-write-files', '/bulk-read-files',
   '/search-replace', '/insert-text', '/grep', '/glob-files',
-  
+
   // Package management
   '/add-dependency', '/remove-dependency',
   '/add-python-dependency', '/remove-python-dependency',
-  
+
   // Logs & debugging
   '/console-logs', '/clear-logs', '/backend-logs', '/vite-errors',
   '/typescript-check',
-  
+
   // Storage
   '/sync-to-gcs',
-  
+
   // Bash execution
   '/execute-bash',
 

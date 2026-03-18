@@ -4,8 +4,8 @@
 set -e
 
 # Configuration
-PROJECT_ID="${GCP_PROJECT_ID:-your-gcp-project}"
-REGION="${GCP_REGION:-us-central1}"
+PROJECT_ID="${GCP_PROJECT_ID:-$(gcloud config get-value project 2>/dev/null)}"
+REGION="${GCP_REGION:-$(gcloud config get-value compute/region 2>/dev/null || echo 'us-central1')}"
 REPOSITORY="greta-containers"
 IMAGE_NAME="greta-backend"
 
