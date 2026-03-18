@@ -77,12 +77,8 @@ export async function loadSecretsFromGCS() {
     const count = Object.keys(secrets).length;
     log.success(`Loaded ${count} environment variables from GCS`);
 
-    // Merge into process.env (don't overwrite existing)
     for (const [key, value] of Object.entries(secrets)) {
-      if (!(key in process.env)) {
-        // Convert to string (env vars are always strings)
-        process.env[key] = String(value);
-      }
+      process.env[key] = String(value);
     }
 
     return secrets;
