@@ -191,17 +191,40 @@ async function initializeProject() {
 
   if (hasExistingData) {
     // EXISTING PROJECT: Sync from GCS (user's saved work takes priority)
-    console.log('� Found existing project in GCS - restoring user data...');
-    const syncSuccess = await syncFromGCS(PROJECT_DIR);
-    if (syncSuccess) {
-      console.log('✅ User data restored from GCS');
-    } else {
-      console.log('⚠️ GCS sync failed, falling back to template');
+    console.log('📦 Found existing project in GCS - restoring user data...');
+
+    // Try multiple times with exponential backoff - user data is precious!
+    let syncSuccess = false;
+    const maxRetries = 3;
+    const retryDelays = [2000, 5000, 10000]; // 2s, 5s, 10s
+
+    for (let attempt = 0; attempt < maxRetries; attempt++) {
+      if (attempt > 0) {
+        console.log(`⏳ Retry attempt ${attempt + 1}/${maxRetries} after ${retryDelays[attempt - 1]}ms...`);
+        await new Promise(resolve => setTimeout(resolve, retryDelays[attempt - 1]));
+      }
+
+      syncSuccess = await syncFromGCS(PROJECT_DIR);
+      if (syncSuccess) {
+        console.log('✅ User data restored from GCS');
+        break;
+      } else {
+        console.error(`❌ GCS sync attempt ${attempt + 1} failed`);
+      }
+    }
+
+    if (!syncSuccess) {
+      // GCS sync failed - fall back to template to keep container running
+      console.warn('⚠️  GCS sync failed after retries - falling back to template');
+      console.warn('⚠️  User may see stale data until GCS sync succeeds');
+
+      // Copy template as fallback
       await copyFrontendTemplate(FRONTEND_TEMPLATE_DIR, FRONTEND_DIR);
+      console.log('✅ Frontend template copied as fallback');
     }
   } else {
     // NEW PROJECT: Use template
-    console.log('� New project - copying template...');
+    console.log('📦 New project - copying template...');
     await copyFrontendTemplate(FRONTEND_TEMPLATE_DIR, FRONTEND_DIR);
     console.log('✅ Frontend template copied');
   }
@@ -264,6 +287,46 @@ async function initializeProject() {
     console.log('📋 Copying backend template...');
     await fs.copy(BACKEND_TEMPLATE_DIR, BACKEND_DIR);
     console.log('✅ Backend template copied');
+  }
+
+  // Handle Python dependencies (similar to frontend node_modules logic)
+  const requirementsPath = path.join(BACKEND_DIR, 'requirements.txt');
+  const templateRequirementsPath = path.join(BACKEND_TEMPLATE_DIR, 'requirements.txt');
+  const venvMarkerPath = path.join(BACKEND_DIR, '.venv_installed');
+
+  if (await fs.pathExists(requirementsPath)) {
+    // Check if dependencies have changed by comparing requirements.txt files
+    let depsMatch = false;
+
+    if (await fs.pathExists(templateRequirementsPath) && await fs.pathExists(venvMarkerPath)) {
+      const projectReqs = await fs.readFile(requirementsPath, 'utf8');
+      const templateReqs = await fs.readFile(templateRequirementsPath, 'utf8');
+      depsMatch = projectReqs.trim() === templateReqs.trim();
+    }
+
+    if (depsMatch) {
+      // FAST PATH: Dependencies match template - skip installation
+      console.log('⚡ Python dependencies match template - skipping installation');
+    } else {
+      // SLOW PATH: Dependencies differ or first install - run pip install
+      console.log('📦 Installing Python dependencies...');
+      try {
+        await execAsync('pip install -r requirements.txt', {
+          cwd: BACKEND_DIR,
+          timeout: 180000, // 3 minutes
+          env: { ...process.env, PATH: `/opt/venv/bin:${process.env.PATH}` }
+        });
+
+        // Create marker file to track that dependencies are installed
+        await fs.writeFile(venvMarkerPath, new Date().toISOString());
+        console.log('✅ Python dependencies installed');
+      } catch (err) {
+        console.error('⚠️ pip install failed:', err.message);
+        console.error('Backend may fail to start if dependencies are missing');
+      }
+    }
+  } else {
+    console.log('⏭️ No requirements.txt found, skipping Python dependency installation');
   }
 
   // Start MongoDB and restore data

@@ -141,13 +141,14 @@ export async function syncFromGCS(targetDir) {
 
 /**
  * Upload project files to GCS
- * 
+ *
  * Creates both a zip archive (for fast downloads) and individual files (for browsing).
- * 
+ *
  * @param {string} sourceDir - Local directory to upload from
+ * @param {object} [metadata] - Optional metadata (conversationId, messageId, timestamp)
  * @returns {Promise<void>}
  */
-export async function syncToGCS(sourceDir) {
+export async function syncToGCS(sourceDir, metadata = {}) {
   log.emoji('upload', `Uploading to GCS: gs://${GCS_BUCKET}/projects/${projectId}/`);
 
   try {
@@ -155,12 +156,15 @@ export async function syncToGCS(sourceDir) {
     const files = await listFilesRecursive(sourceDir, EXCLUDE_DIRS);
 
     log.info(`Uploading ${files.length} files...`);
+    if (metadata.conversationId) {
+      log.info(`Conversation: ${metadata.conversationId}, Message: ${metadata.messageId}`);
+    }
 
     // Create and upload archive
-    await uploadArchive(bucket, sourceDir, files);
+    await uploadArchive(bucket, sourceDir, files, metadata);
 
     // Also upload individual files for browsing
-    await uploadIndividualFiles(bucket, sourceDir, files);
+    await uploadIndividualFiles(bucket, sourceDir, files, metadata);
 
     log.success(`Uploaded ${files.length} files to GCS`);
 
@@ -185,9 +189,10 @@ export async function syncToGCS(sourceDir) {
  *
  * @param {string} baseDir - Base directory (e.g., PROJECT_DIR)
  * @param {string[]} filePaths - Array of relative file paths to sync
+ * @param {object} [metadata] - Optional metadata (conversationId, messageId, timestamp)
  * @returns {Promise<{success: number, failed: number}>}
  */
-export async function syncFilesToGCS(baseDir, filePaths) {
+export async function syncFilesToGCS(baseDir, filePaths, metadata = {}) {
   if (!filePaths || filePaths.length === 0) {
     return { success: 0, failed: 0 };
   }
@@ -199,6 +204,9 @@ export async function syncFilesToGCS(baseDir, filePaths) {
   }
 
   log.emoji('upload', `Syncing ${filePaths.length} file(s) to GCS...`);
+  if (metadata.conversationId) {
+    log.info(`Conversation: ${metadata.conversationId}, Message: ${metadata.messageId}`);
+  }
 
   const bucket = storage.bucket(GCS_BUCKET);
   const startTime = Date.now();
@@ -234,9 +242,25 @@ export async function syncFilesToGCS(baseDir, filePaths) {
       const gcsPath = `projects/${projectId}/files/${normalizedPath}`;
       const contentType = getContentType(relativePath);
 
+      // Build GCS metadata
+      const gcsMetadata = {
+        cacheControl: 'no-cache'
+      };
+
+      // Add conversation metadata if provided
+      if (metadata.conversationId) {
+        gcsMetadata['x-goog-meta-conversation-id'] = metadata.conversationId;
+      }
+      if (metadata.messageId) {
+        gcsMetadata['x-goog-meta-message-id'] = metadata.messageId;
+      }
+      if (metadata.timestamp) {
+        gcsMetadata['x-goog-meta-timestamp'] = metadata.timestamp;
+      }
+
       await bucket.file(gcsPath).save(content, {
         contentType,
-        metadata: { cacheControl: 'no-cache' }
+        metadata: gcsMetadata
       });
 
       return { path: normalizedPath, action: 'uploaded' };
@@ -264,6 +288,156 @@ export async function syncFilesToGCS(baseDir, filePaths) {
   }
 
   return { success: successCount, failed: failedCount };
+}
+
+
+/* ─────────────────────────────────────────────────────────────────────────────
+ * VERSION MANAGEMENT - List and Restore Versions
+ * ───────────────────────────────────────────────────────────────────────────── */
+
+/**
+ * List all versions of a file in GCS
+ *
+ * @param {string} filePath - Relative file path (e.g., 'frontend/src/App.tsx')
+ * @returns {Promise<Array<{generation: string, timeCreated: string, metadata: object}>>}
+ */
+export async function listFileVersions(filePath) {
+  try {
+    const bucket = storage.bucket(GCS_BUCKET);
+    const normalizedPath = filePath.replace(/\\/g, '/');
+    const gcsPath = `projects/${projectId}/files/${normalizedPath}`;
+
+    const file = bucket.file(gcsPath);
+    const [versions] = await file.getMetadata();
+
+    log.info(`Checking versions for ${filePath}`);
+
+    // Note: To get all versions, we need to list with versions=true
+    const [files] = await bucket.getFiles({
+      prefix: gcsPath,
+      versions: true
+    });
+
+    const versionList = files
+      .filter(f => f.name === gcsPath)
+      .map(v => ({
+        generation: v.metadata.generation,
+        timeCreated: v.metadata.timeCreated,
+        size: v.metadata.size,
+        conversationId: v.metadata.metadata?.['x-goog-meta-conversation-id'],
+        messageId: v.metadata.metadata?.['x-goog-meta-message-id'],
+        timestamp: v.metadata.metadata?.['x-goog-meta-timestamp']
+      }));
+
+    log.info(`Found ${versionList.length} version(s) of ${filePath}`);
+    return versionList;
+
+  } catch (error) {
+    log.error(`Failed to list versions for ${filePath}: ${error.message}`);
+    return [];
+  }
+}
+
+/**
+ * Restore a specific version of a file from GCS
+ *
+ * @param {string} filePath - Relative file path
+ * @param {string} generation - GCS generation ID (version)
+ * @param {string} destDir - Destination directory to restore to
+ * @returns {Promise<boolean>}
+ */
+export async function restoreFileVersion(filePath, generation, destDir) {
+  try {
+    const bucket = storage.bucket(GCS_BUCKET);
+    const normalizedPath = filePath.replace(/\\/g, '/');
+    const gcsPath = `projects/${projectId}/files/${normalizedPath}`;
+    const localPath = path.join(destDir, normalizedPath);
+
+    log.info(`Restoring ${filePath} (generation: ${generation})`);
+
+    // Download specific version
+    const file = bucket.file(gcsPath, { generation });
+    const [content] = await file.download();
+
+    // Write to local filesystem
+    await fs.ensureDir(path.dirname(localPath));
+    await fs.writeFile(localPath, content);
+
+    log.success(`Restored ${filePath} from version ${generation}`);
+    return true;
+
+  } catch (error) {
+    log.error(`Failed to restore ${filePath}: ${error.message}`);
+    return false;
+  }
+}
+
+/**
+ * List all versions of the project (files.zip snapshots)
+ *
+ * @returns {Promise<Array<{generation: string, timeCreated: string, size: number, metadata: object}>>}
+ */
+export async function listProjectVersions() {
+  try {
+    const bucket = storage.bucket(GCS_BUCKET);
+    const gcsPath = `projects/${projectId}/files.zip`;
+
+    const [files] = await bucket.getFiles({
+      prefix: gcsPath,
+      versions: true
+    });
+
+    const versionList = files
+      .filter(f => f.name === gcsPath)
+      .map(v => ({
+        generation: v.metadata.generation,
+        timeCreated: v.metadata.timeCreated,
+        size: v.metadata.size,
+        conversationId: v.metadata.metadata?.['x-goog-meta-conversation-id'],
+        messageId: v.metadata.metadata?.['x-goog-meta-message-id'],
+        timestamp: v.metadata.metadata?.['x-goog-meta-timestamp']
+      }))
+      .sort((a, b) => new Date(b.timeCreated) - new Date(a.timeCreated)); // Newest first
+
+    log.info(`Found ${versionList.length} project snapshot(s)`);
+    return versionList;
+
+  } catch (error) {
+    log.error(`Failed to list project versions: ${error.message}`);
+    return [];
+  }
+}
+
+/**
+ * Restore entire project from a specific version (files.zip snapshot)
+ *
+ * @param {string} generation - GCS generation ID of files.zip
+ * @param {string} destDir - Destination directory to restore to
+ * @returns {Promise<boolean>}
+ */
+export async function restoreProjectVersion(generation, destDir) {
+  try {
+    const bucket = storage.bucket(GCS_BUCKET);
+    const gcsPath = `projects/${projectId}/files.zip`;
+    const zipPath = path.join(destDir, 'restore.zip');
+
+    log.info(`Restoring project from snapshot (generation: ${generation})`);
+
+    // Download specific version of files.zip
+    const file = bucket.file(gcsPath, { generation });
+    await file.download({ destination: zipPath });
+
+    log.info('Extracting archive...');
+    await extractZip(zipPath, { dir: destDir });
+    await fs.remove(zipPath);
+
+    log.success(`Project restored from version ${generation}`);
+    return true;
+
+  } catch (error) {
+    log.error(`Failed to restore project: ${error.message}`);
+    return false;
+  }
 }
 
 
@@ -510,7 +684,7 @@ async function downloadNodeModulesCache(bucket, targetDir) {
  * Create and upload zip archive
  * @private
  */
-async function uploadArchive(bucket, sourceDir, files) {
+async function uploadArchive(bucket, sourceDir, files, metadata = {}) {
   const zipPath = path.join(sourceDir, 'files.zip');
 
   // Create archive
@@ -530,10 +704,26 @@ async function uploadArchive(bucket, sourceDir, files) {
     archive.finalize();
   });
 
+  // Build GCS metadata
+  const gcsMetadata = {
+    contentType: 'application/zip'
+  };
+
+  // Add conversation metadata if provided
+  if (metadata.conversationId) {
+    gcsMetadata['x-goog-meta-conversation-id'] = metadata.conversationId;
+  }
+  if (metadata.messageId) {
+    gcsMetadata['x-goog-meta-message-id'] = metadata.messageId;
+  }
+  if (metadata.timestamp) {
+    gcsMetadata['x-goog-meta-timestamp'] = metadata.timestamp;
+  }
+
   // Upload archive
   await bucket.upload(zipPath, {
     destination: `projects/${projectId}/files.zip`,
-    metadata: { contentType: 'application/zip' },
+    metadata: gcsMetadata,
   });
 
   await fs.remove(zipPath);
@@ -543,16 +733,33 @@ async function uploadArchive(bucket, sourceDir, files) {
  * Upload individual files for browsing
  * @private
  */
-async function uploadIndividualFiles(bucket, sourceDir, files) {
+async function uploadIndividualFiles(bucket, sourceDir, files, metadata = {}) {
   const prefix = `projects/${projectId}/files/`;
 
   for (let i = 0; i < files.length; i += BATCH_SIZE) {
     const batch = files.slice(i, i + BATCH_SIZE);
     await Promise.all(batch.map(async (file) => {
       const relativePath = path.relative(sourceDir, file).replace(/\\/g, '/');
+
+      // Build GCS metadata
+      const gcsMetadata = {
+        contentType: getContentType(file)
+      };
+
+      // Add conversation metadata if provided
+      if (metadata.conversationId) {
+        gcsMetadata['x-goog-meta-conversation-id'] = metadata.conversationId;
+      }
+      if (metadata.messageId) {
+        gcsMetadata['x-goog-meta-message-id'] = metadata.messageId;
+      }
+      if (metadata.timestamp) {
+        gcsMetadata['x-goog-meta-timestamp'] = metadata.timestamp;
+      }
+
       await bucket.upload(file, {
         destination: `${prefix}${relativePath}`,
-        metadata: { contentType: getContentType(file) },
+        metadata: gcsMetadata,
       });
     }));
   }

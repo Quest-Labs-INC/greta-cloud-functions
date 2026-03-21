@@ -150,23 +150,25 @@ export const MAX_LOGS = 100;
 export const EXPRESS_API_ENDPOINTS = [
   // Core operations
   '/keepAlive',
-  
+
   // File operations
   '/write-file', '/read-file', '/delete-file', '/rename-file',
   '/list-files', '/bulk-write-files', '/bulk-read-files',
   '/search-replace', '/insert-text', '/grep', '/glob-files',
-  
+
   // Package management
   '/add-dependency', '/remove-dependency',
   '/add-python-dependency', '/remove-python-dependency',
-  
+
   // Logs & debugging
   '/console-logs', '/clear-logs', '/backend-logs', '/vite-errors',
   '/typescript-check',
-  
-  // Storage
+
+  // Storage & Versioning
   '/sync-to-gcs',
-  
+  '/list-versions', '/restore-version',
+  '/file-history', '/restore-file-version',
+
   // Bash execution
   '/execute-bash',
 
@@ -178,7 +180,7 @@ export const EXPRESS_API_ENDPOINTS = [
 
   // Chat & AI
   '/chat', '/chat/history', '/conversations',
-  
+
   // Screenshot
   '/screenshot', '/screenshot/health',
 

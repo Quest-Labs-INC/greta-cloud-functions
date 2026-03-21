@@ -83,7 +83,8 @@ router.post('/search-replace', async (req, res) => {
       changed: true,
       path: filePath,
       replacements: replaceAll ? occurrences : 1,
-      total_occurrences: occurrences
+      total_occurrences: occurrences,
+      previousContent: originalContent  // Store original content for rollback
     };
 
     if (status) response.status = getAppStatus();

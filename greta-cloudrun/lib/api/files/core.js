@@ -13,11 +13,17 @@ import express from 'express';
 import fs from 'fs-extra';
 import path from 'path';
 import { PROJECT_DIR } from '../../core/config.js';
-import { syncToGCS } from '../../services/storage/gcs-sync.js';
+import {
+  syncToGCS,
+  syncFilesToGCS,
+  listProjectVersions,
+  restoreProjectVersion,
+  listFileVersions,
+  restoreFileVersion
+} from '../../services/storage/gcs-sync.js';
 import {
   resolveSafePath,
   apiResponse,
-  scheduleSyncToGCS,
   listFilesRecursive
 } from './helpers.js';
 
@@ -50,7 +56,7 @@ router.post('/write-file', async (req, res) => {
     await fs.writeFile(fullPath, content, 'utf8');
 
     console.log(`✅ File written: ${filePath}`);
-    scheduleSyncToGCS(filePath);  // Incremental sync - only this file
+    // NOTE: No auto-sync here - backend will call /api/sync-to-gcs after conversation completes
 
     return apiResponse(res, 200, { path: filePath });
   } catch (error) {
@@ -158,7 +164,7 @@ router.delete('/delete-file', async (req, res) => {
     const fullPath = resolveSafePath(filePath);
     await fs.remove(fullPath);
 
-    scheduleSyncToGCS(filePath);  // Incremental sync - mark file as deleted
+    // NOTE: No auto-sync here - backend will call /api/sync-to-gcs after conversation completes
     return apiResponse(res, 200, { path: filePath });
   } catch (error) {
     return apiResponse(res, 500, { error: error.message });
@@ -199,9 +205,7 @@ router.post('/rename-file', async (req, res) => {
     // Perform the rename/move
     await fs.move(fullOriginalPath, fullNewPath, { overwrite: false });
 
-    // Sync both old path (deleted) and new path (created)
-    scheduleSyncToGCS(originalPath);
-    scheduleSyncToGCS(newPath);
+    // NOTE: No auto-sync here - backend will call /api/sync-to-gcs after conversation completes
 
     return apiResponse(res, 200, {
       success: true,
@@ -243,16 +247,202 @@ router.get('/list-files', async (req, res) => {
  * ───────────────────────────────────────────────────────────────────────────── */
 
 /**
- * POST /sync-to-gcs - Manually trigger GCS sync
+ * POST /sync-to-gcs - Trigger GCS sync (conversation-based or full)
  *
- * Forces an immediate sync of project files to Google Cloud Storage.
+ * Supports three modes:
+ * 1. Incremental sync: { files: ['App.tsx', 'Button.tsx'], conversationId, messageId }
+ * 2. Full sync: { fullSync: true, conversationId, messageId }
+ * 3. Auto-detect: { conversationId, messageId } (syncs all modified files)
+ *
+ * This endpoint is called by the backend after agent conversations complete,
+ * ensuring all file changes are synced as a single atomic version.
+ *
+ * @body {string[]} [files] - Array of file paths to sync (incremental mode)
+ * @body {boolean} [fullSync] - If true, sync all files (full mode)
+ * @body {string} [conversationId] - Conversation ID for metadata
+ * @body {string} [messageId] - Message ID for metadata
  */
 router.post('/sync-to-gcs', async (req, res) => {
   try {
-    await syncToGCS(PROJECT_DIR);
-    res.json({ success: true, message: 'Synced to GCS' });
+    const { files, fullSync = false, conversationId, messageId } = req.body;
+
+    const metadata = {
+      conversationId,
+      messageId,
+      timestamp: new Date().toISOString()
+    };
+
+    let result;
+
+    if (fullSync) {
+      // Full sync - everything in PROJECT_DIR
+      console.log('🔄 Full sync to GCS requested');
+      await syncToGCS(PROJECT_DIR, metadata);
+      result = {
+        mode: 'full',
+        message: 'All files synced to GCS'
+      };
+
+    } else if (files && Array.isArray(files) && files.length > 0) {
+      // Incremental sync - only specified files
+      console.log(`🔄 Incremental sync: ${files.length} file(s)`);
+      const syncResult = await syncFilesToGCS(PROJECT_DIR, files, metadata);
+      result = {
+        mode: 'incremental',
+        filesSynced: syncResult.success,
+        filesFailed: syncResult.failed,
+        files: files
+      };
+
+    } else {
+      // No files specified and not full sync - nothing to do
+      console.log('⏭️ No files to sync');
+      result = {
+        mode: 'none',
+        message: 'No files to sync'
+      };
+    }
+
+    return apiResponse(res, 200, {
+      ...result,
+      conversationId,
+      messageId
+    });
+
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    console.error('❌ Sync to GCS failed:', error);
+    return apiResponse(res, 500, { error: error.message });
+  }
+});
+
+
+/* ─────────────────────────────────────────────────────────────────────────────
+ * VERSION MANAGEMENT
+ * ───────────────────────────────────────────────────────────────────────────── */
+
+/**
+ * GET /list-versions - List all project snapshots (files.zip versions)
+ *
+ * Returns all versions of the project with metadata showing when each
+ * snapshot was created and which conversation/message triggered it.
+ */
+router.get('/list-versions', async (req, res) => {
+  try {
+    console.log('📜 Listing project versions...');
+    const versions = await listProjectVersions();
+
+    return apiResponse(res, 200, {
+      success: true,
+      versions,
+      count: versions.length
+    });
+
+  } catch (error) {
+    console.error('❌ Failed to list versions:', error);
+    return apiResponse(res, 500, { error: error.message });
+  }
+});
+
+/**
+ * POST /restore-version - Restore project from a specific snapshot
+ *
+ * Body: { generation: string }
+ *
+ * Restores the entire project to a previous state by downloading
+ * and extracting a specific version of files.zip.
+ */
+router.post('/restore-version', async (req, res) => {
+  try {
+    const { generation } = req.body;
+
+    if (!generation) {
+      return apiResponse(res, 400, { error: 'generation required' });
+    }
+
+    console.log(`🔄 Restoring project to version: ${generation}`);
+    const success = await restoreProjectVersion(generation, PROJECT_DIR);
+
+    if (success) {
+      return apiResponse(res, 200, {
+        success: true,
+        message: 'Project restored successfully',
+        generation
+      });
+    } else {
+      return apiResponse(res, 500, {
+        success: false,
+        error: 'Failed to restore project'
+      });
+    }
+
+  } catch (error) {
+    console.error('❌ Restore failed:', error);
+    return apiResponse(res, 500, { error: error.message });
+  }
+});
+
+/**
+ * GET /list-file-versions - List all versions of a specific file
+ *
+ * Query: ?path=frontend/src/App.tsx
+ */
+router.get('/list-file-versions', async (req, res) => {
+  try {
+    const filePath = req.query.path;
+
+    if (!filePath) {
+      return apiResponse(res, 400, { error: 'path query parameter required' });
+    }
+
+    console.log(`📜 Listing versions for: ${filePath}`);
+    const versions = await listFileVersions(filePath);
+
+    return apiResponse(res, 200, {
+      success: true,
+      file: filePath,
+      versions,
+      count: versions.length
+    });
+
+  } catch (error) {
+    console.error('❌ Failed to list file versions:', error);
+    return apiResponse(res, 500, { error: error.message });
+  }
+});
+
+/**
+ * POST /restore-file-version - Restore a specific file to a previous version
+ *
+ * Body: { path: string, generation: string }
+ */
+router.post('/restore-file-version', async (req, res) => {
+  try {
+    const { path: filePath, generation } = req.body;
+
+    if (!filePath || !generation) {
+      return apiResponse(res, 400, { error: 'path and generation required' });
+    }
+
+    console.log(`🔄 Restoring ${filePath} to version: ${generation}`);
+    const success = await restoreFileVersion(filePath, generation, PROJECT_DIR);
+
+    if (success) {
+      return apiResponse(res, 200, {
+        success: true,
+        message: 'File restored successfully',
+        file: filePath,
+        generation
+      });
+    } else {
+      return apiResponse(res, 500, {
+        success: false,
+        error: 'Failed to restore file'
+      });
+    }
+
+  } catch (error) {
+    console.error('❌ File restore failed:', error);
+    return apiResponse(res, 500, { error: error.message });
   }
 });
 
