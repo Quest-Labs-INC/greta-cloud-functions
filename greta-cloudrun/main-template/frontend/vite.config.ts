@@ -31,9 +31,15 @@ export default defineConfig(({ mode }) => ({
   resolve: {
     // Force all packages to use the same React instance (prevents "Invalid hook call" errors)
     // This is critical when using pnpm's symlinked node_modules structure
-    dedupe: ['react', 'react-dom', 'react-router-dom', 'scheduler'],
+    dedupe: ['react', 'react-dom', 'react-router-dom', 'scheduler', 'react/jsx-runtime', 'react/jsx-dev-runtime'],
     alias: {
       "@": path.resolve(__dirname, "./src"),
+      // CRITICAL: Force all React imports to use the exact same instance
+      // This prevents "Invalid hook call" errors when dependencies install their own React
+      "react": path.resolve(__dirname, "./node_modules/react"),
+      "react-dom": path.resolve(__dirname, "./node_modules/react-dom"),
+      "react/jsx-runtime": path.resolve(__dirname, "./node_modules/react/jsx-runtime"),
+      "react/jsx-dev-runtime": path.resolve(__dirname, "./node_modules/react/jsx-dev-runtime"),
     },
   },
 }));
