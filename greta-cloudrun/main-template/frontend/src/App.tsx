@@ -6,6 +6,8 @@ import { BrowserRouter, Routes, Route } from "react-router-dom";
 import Index from "./pages/Index";
 import NotFound from "./pages/NotFound";
 
+export const API_URL = (import.meta as any).env?.VITE_BACKEND_URL || "";
+
 const queryClient = new QueryClient();
 
 const App = () => (
