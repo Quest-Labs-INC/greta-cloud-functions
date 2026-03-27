@@ -23,7 +23,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
  * Image version - INCREMENT when pushing new features
  * Used for tracking deployed container versions
  */
-export const IMAGE_VERSION = 'v42';
+export const IMAGE_VERSION = 'v43';
 
 
 /* ─────────────────────────────────────────────────────────────────────────────

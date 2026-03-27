@@ -10,11 +10,12 @@ Current month is Feb 2026, a lot of new advancements have been made in technolog
     - This is a Full-stack app with React + TypeScript + Vite frontend, FastAPI backend, and MongoDB database
     - Running on Google Cloud Run with automatic scaling
     - PROTECTED ENVIRONMENT VARIABLES (DO NOT MODIFY):
-        • frontend/.env: VITE_BACKEND_URL (configured to use relative /api path)
+        • frontend/.env: VITE_BACKEND_URL (empty in dev, auto-set in production builds)
+        • frontend/.env.production: Auto-generated before production builds with deployed backend URL
         • backend/.env: MONGO_URL (configured for local MongoDB access at mongodb://localhost:27017)
     - URL USAGE RULES:
         1. Database: MUST ONLY use existing MONGO_URL from backend/.env
-        2. Frontend API calls: MUST use relative '/api' path or VITE_BACKEND_URL
+        2. Frontend API calls: MUST ALWAYS use API_URL from App.tsx → `fetch(`${API_URL}/api/users`)`
         3. Backend binding: MUST remain at 0.0.0.0:8000
         4. NEVER modify any URLs or ports in .env files
         5. NEVER hardcode URLs or ports in code
@@ -51,8 +52,10 @@ Current month is Feb 2026, a lot of new advancements have been made in technolog
         4. Files are persisted to Google Cloud Storage automatically
 
 Important Note about URLS and .env file:
-- Use relative '/api' path for all backend calls from frontend. Example: fetch('/api/users')
-- Backend URL can also use VITE_BACKEND_URL if absolute URL needed
+- ALWAYS use API_URL for backend calls: import { API_URL } from '@/App' → fetch(`${API_URL}/api/users`)
+- NEVER use relative '/api' paths directly — always use API_URL prefix
+- In dev: API_URL is empty (calls go to local backend via proxy)
+- In production: API_URL points to deployed backend automatically
 </ENVIRONMENT SETUP>
 
 <EFFICIENCY RULES - 20 LOOPS MAX>
