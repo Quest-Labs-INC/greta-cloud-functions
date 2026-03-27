@@ -44,6 +44,16 @@ router.post('/add-dependency', async (req, res) => {
       timeout: 120000
     });
 
+    // CRITICAL: Re-run bun install after bun add to enforce `resolutions` in package.json.
+    // `bun add` alone does NOT re-apply resolutions globally — newly added packages can
+    // create nested node_modules/react copies, causing "Invalid hook call" errors.
+    // `bun install` does a full resolve pass and collapses duplicates.
+    console.log(`🔧 Running bun install to enforce resolutions (prevent duplicate React)...`);
+    await execAsync(`bun install`, {
+      cwd: FRONTEND_DIR,
+      timeout: 120000
+    });
+
     console.log(`✅ Installed package: ${packageName}`);
 
     // Sync package.json to GCS for persistence
