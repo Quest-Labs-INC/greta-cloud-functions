@@ -69,13 +69,13 @@ RUN pip install --no-cache-dir -r requirements.txt
 RUN curl -fsSL https://bun.sh/install | bash
 ENV PATH="/root/.bun/bin:$PATH"
 
-# Pre-populate bun cache and node_modules at build time
-# - Keep node_modules in template for fast symlink path
-# - Create lz4-compressed tar of bun cache for slow path (when deps differ)
+# Pre-populate bun cache at build time (no node_modules in image)
+# At runtime, bun install uses this cache for fast offline installs (~5-10s)
 WORKDIR /frontend-template
 RUN bun install && \
-    tar -cf - -C /root/.bun/install cache | lz4 -9 > /bun-cache.tar.lz4
-# NOTE: We do NOT delete node_modules - it's needed for symlink fast path!
+    tar -cf - -C /root/.bun/install cache | lz4 -9 > /bun-cache.tar.lz4 && \
+    rm -rf node_modules && \
+    rm -rf /root/.bun/install/cache
 
 # Go back to app directory
 WORKDIR /app
