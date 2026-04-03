@@ -182,9 +182,6 @@ async function initializeProject() {
 
   await fs.ensureDir(FRONTEND_DIR);
 
-  const frontendPkgPath = path.join(FRONTEND_DIR, 'package.json');
-  const templatePkgPath = path.join(FRONTEND_TEMPLATE_DIR, 'package.json');
-
   // CRITICAL: Check GCS FIRST before using template
   console.log('🔍 Checking GCS for existing project data...');
   const hasExistingData = await hasGCSData();
@@ -229,24 +226,12 @@ async function initializeProject() {
     console.log('✅ Frontend template copied');
   }
 
-  // Decide: symlink (fast) vs full install (slow)
+  // Always run bun install using the baked-in cache (~5-10s)
+  // No symlinks - avoids stale Vite cache and duplicate React issues
   const nodeModulesPath = path.join(FRONTEND_DIR, 'node_modules');
-  const templateNodeModules = path.join(FRONTEND_TEMPLATE_DIR, 'node_modules');
 
-  const projectPkg = await fs.readJson(frontendPkgPath);
-  const templatePkg = await fs.readJson(templatePkgPath);
-  const depsMatch =
-    JSON.stringify(projectPkg.dependencies || {}) === JSON.stringify(templatePkg.dependencies || {}) &&
-    JSON.stringify(projectPkg.devDependencies || {}) === JSON.stringify(templatePkg.devDependencies || {});
-
-  if (depsMatch && !await fs.pathExists(nodeModulesPath)) {
-    // FAST PATH: Dependencies match template - symlink (~2-3s)
-    console.log('⚡ Dependencies match template - using symlink');
-    await fs.symlink(templateNodeModules, nodeModulesPath);
-    console.log('✅ node_modules symlinked');
-  } else if (!await fs.pathExists(nodeModulesPath)) {
-    // SLOW PATH: Dependencies differ - full install (~25-30s)
-    console.log('📦 Dependencies differ - running bun install...');
+  if (!await fs.pathExists(nodeModulesPath)) {
+    console.log('📦 Installing frontend dependencies...');
 
     const bunCacheTar = '/bun-cache.tar.lz4';
     const tmpBunCache = '/tmp/bun-cache';
