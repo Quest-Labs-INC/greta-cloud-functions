@@ -10,7 +10,7 @@
  */
 
 import { createProxyMiddleware } from 'http-proxy-middleware';
-import { VITE_PORT, BACKEND_PORT, EXPRESS_API_ENDPOINTS, DEBOUNCE_DELAY } from '../core/config.js';
+import { VITE_PORT, BACKEND_PORT, DEBOUNCE_DELAY } from '../core/config.js';
 import { backupMongoToGCS } from '../services/processes/mongodb.js';
 
 
@@ -119,14 +119,7 @@ export const viteProxy = createProxyMiddleware({
  * Routes /api/* to backend proxy, except Express-handled endpoints.
  */
 export function apiRouter(req, res, next) {
-  console.log(`[API Route] ${req.method} ${req.path}`);
-  
-  // Check if this is an Express-handled endpoint
-  if (EXPRESS_API_ENDPOINTS.some(ep => req.path.startsWith(ep))) {
-    return next();
-  }
-  
-  // Proxy to FastAPI backend
+  console.log(`[API Route -> FastAPI proxy] ${req.method} ${req.originalUrl}`);
   return backendProxy(req, res, next);
 }
 
@@ -135,12 +128,13 @@ export function apiRouter(req, res, next) {
  * Routes non-API requests to Vite frontend.
  */
 export function viteRouter(req, res, next) {
-  // Skip API and health endpoints
-  if (req.path.startsWith('/api/') || req.path === '/health') {
+  // Use originalUrl (un-stripped) to reliably detect /api/* regardless of mount point
+  if (req.originalUrl.startsWith('/api') || req.originalUrl === '/health') {
+    console.warn(`[Vite Router] Unexpected /api path: ${req.method} ${req.originalUrl}`);
     return next();
   }
-  
-  // Proxy to Vite
+
+  console.log(`[Vite Route] ${req.method} ${req.originalUrl}`);
   return viteProxy(req, res, next);
 }
 

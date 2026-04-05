@@ -57,6 +57,17 @@ router.get('/console-logs', (req, res) => {
 });
 
 /**
+ * POST /api/browser-error - Receive runtime errors captured from the iframe app
+ */
+router.post('/browser-error', (_req, res) => {
+  const { message } = _req.body;
+  if (message) {
+    logs.viteErrors.push({ message: `[BROWSER] ${message}`, timestamp: Date.now() });
+  }
+  res.json({ success: true });
+});
+
+/**
  * POST /api/clear-logs - Clear all console logs.
  */
 router.post('/clear-logs', (req, res) => {

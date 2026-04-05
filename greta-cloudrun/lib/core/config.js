@@ -24,7 +24,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
  * Used for tracking deployed container versions
  */
 
-export const IMAGE_VERSION = 'v49';
+export const IMAGE_VERSION = 'v51';
 
 
 /* ─────────────────────────────────────────────────────────────────────────────
@@ -162,7 +162,7 @@ export const EXPRESS_API_ENDPOINTS = [
   '/add-python-dependency', '/remove-python-dependency',
 
   // Logs & debugging
-  '/console-logs', '/clear-logs', '/backend-logs', '/vite-errors',
+  '/console-logs', '/clear-logs', '/backend-logs', '/vite-errors', '/browser-error',
   '/typescript-check',
 
   // Storage & Versioning
