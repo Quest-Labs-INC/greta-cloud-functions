@@ -26,7 +26,7 @@ steps:
 substitutions:
   _REGION: us-central1
   _REPOSITORY: greta-containers
-  _TAG: v51
+  _TAG: v52
 
 images:
   - '${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPOSITORY}/greta-preview:${_TAG}'
