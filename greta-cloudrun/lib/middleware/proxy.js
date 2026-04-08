@@ -103,8 +103,24 @@ export const viteProxy = createProxyMiddleware({
   onError: (err, req, res) => {
     console.error('Vite proxy error:', err.message);
     if (res.writeHead) {
-      res.writeHead(502, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: 'Vite not ready' }));
+      res.writeHead(503, { 'Content-Type': 'text/html' });
+      res.end(`<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="refresh" content="3">
+    <style>
+      * { margin: 0; padding: 0; box-sizing: border-box; }
+      body { display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; background: #09090b; font-family: sans-serif; color: #666; gap: 16px; }
+      .spinner { width: 36px; height: 36px; border: 3px solid #2a2a2a; border-top-color: #888; border-radius: 50%; animation: spin 0.8s linear infinite; }
+      @keyframes spin { to { transform: rotate(360deg); } }
+      p { font-size: 13px; letter-spacing: 0.02em; }
+    </style>
+  </head>
+  <body>
+    <div class="spinner"></div>
+    <p>Starting dev server...</p>
+  </body>
+</html>`);
     }
   }
 });

@@ -24,7 +24,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
  * Used for tracking deployed container versions
  */
 
-export const IMAGE_VERSION = 'v51';
+export const IMAGE_VERSION = 'v52';
 
 
 /* ─────────────────────────────────────────────────────────────────────────────
