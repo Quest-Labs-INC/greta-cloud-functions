@@ -64,7 +64,6 @@ vi.mock('./lib/config.js', () => ({
   projectId: 'test-project-123',
   FILE_SYNC_INTERVAL: 120000,
   MONGO_BACKUP_INTERVAL: 300000,
-  EXPRESS_API_ENDPOINTS: ['/keepAlive', '/write-file'],
   IMAGE_VERSION: '1.0.0-test'
 }));
 
@@ -98,7 +97,7 @@ function createTestApp() {
   });
 
   // keepAlive endpoint
-  app.post('/api/keepAlive', (req, res) => {
+  app.post('/_greta/keepAlive', (req, res) => {
     state.lastKeepAlive = Date.now();
     res.json({
       status: 'alive',
@@ -135,11 +134,11 @@ describe('Greta Cloud Run Server', () => {
     });
   });
   
-  describe('POST /api/keepAlive', () => {
+  describe('POST /_greta/keepAlive', () => {
     it('should return alive status and update timestamp', async () => {
       const beforeTimestamp = Date.now();
-      
-      const response = await request(app).post('/api/keepAlive');
+
+      const response = await request(app).post('/_greta/keepAlive');
       
       expect(response.status).toBe(200);
       expect(response.body.status).toBe('alive');

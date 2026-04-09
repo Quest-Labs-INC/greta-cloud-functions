@@ -88,7 +88,7 @@ app.post('/api/container/:projectId/write-file', async (req, res) => {
     }
     
     // Forward to container
-    const response = await fetch(`${containerUrl}/api/write-file`, {
+    const response = await fetch(`${containerUrl}/_greta/write-file`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ filePath, content })

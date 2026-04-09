@@ -24,7 +24,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
  * Used for tracking deployed container versions
  */
 
-export const IMAGE_VERSION = 'v52';
+export const IMAGE_VERSION = 'v56';
 
 
 /* ─────────────────────────────────────────────────────────────────────────────
@@ -150,42 +150,42 @@ export const MAX_LOGS = 100;
  */
 export const EXPRESS_API_ENDPOINTS = [
   // Core operations
-  '/keepAlive',
+  '/_greta/keepAlive',
 
   // File operations
-  '/write-file', '/read-file', '/delete-file', '/rename-file',
-  '/list-files', '/bulk-write-files', '/bulk-read-files',
-  '/search-replace', '/insert-text', '/grep', '/glob-files',
+  '/_greta/write-file', '/_greta/read-file', '/_greta/delete-file', '/_greta/rename-file',
+  '/_greta/list-files', '/_greta/bulk-write-files', '/_greta/bulk-read-files',
+  '/_greta/search-replace', '/_greta/insert-text', '/_greta/grep', '/_greta/glob-files',
 
   // Package management
-  '/add-dependency', '/remove-dependency',
-  '/add-python-dependency', '/remove-python-dependency',
+  '/_greta/add-dependency', '/_greta/remove-dependency',
+  '/_greta/add-python-dependency', '/_greta/remove-python-dependency',
 
   // Logs & debugging
-  '/console-logs', '/clear-logs', '/backend-logs', '/vite-errors', '/browser-error',
-  '/typescript-check',
+  '/_greta/console-logs', '/_greta/clear-logs', '/_greta/backend-logs', '/_greta/vite-errors', '/_greta/browser-error',
+  '/_greta/typescript-check',
 
   // Storage & Versioning
-  '/sync-to-gcs',
-  '/list-versions', '/restore-version',
-  '/file-history', '/restore-file-version',
+  '/_greta/sync-to-gcs',
+  '/_greta/list-versions', '/_greta/restore-version',
+  '/_greta/file-history', '/_greta/restore-file-version',
 
   // Bash execution
-  '/execute-bash',
+  '/_greta/execute-bash',
 
   // Build
-  '/build',
+  '/_greta/build',
 
   // Environment & Server Management
-  '/update-env-and-restart',
+  '/_greta/update-env-and-restart',
 
   // Chat & AI
   '/chat', '/chat/history', '/conversations',
 
   // Screenshot
-  '/screenshot', '/screenshot/health',
+  '/_greta/screenshot', '/_greta/screenshot/health',
 
   // Agents (browser automation)
-  '/agents/frontend-test', '/agents/backend-test', '/agents/browser-automate', '/agents/health',
+  '/_greta/agents/frontend-test', '/_greta/agents/backend-test', '/_greta/agents/browser-automate', '/_greta/agents/health',
 ];
 
