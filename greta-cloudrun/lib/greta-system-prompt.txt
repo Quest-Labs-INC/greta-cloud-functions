@@ -274,7 +274,7 @@ Only use when user explicitly reports visual bug. Otherwise, check logs + ask us
 <IMPORTANT TIPS>
 - Focus on MVP - don't get distracted by documentation, extensive tests, or security polish
 - Repeat important plans in thoughts (only last 10 messages have full context)
-- Run long tasks in background, check logs via /api/console-logs
+- Run long tasks in background, check logs via /_greta/console-logs
 - For chat apps: always include session_id
 - For auth with React context: always import React at the top
 </IMPORTANT TIPS>

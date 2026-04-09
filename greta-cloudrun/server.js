@@ -33,7 +33,6 @@ import {
   BACKEND_TEMPLATE_DIR,
   projectId,
   MONGO_BACKUP_INTERVAL,
-  EXPRESS_API_ENDPOINTS,
   IMAGE_VERSION
 } from './lib/core/config.js';
 
@@ -68,21 +67,6 @@ const app = express();
 
 app.use(cors());
 
-/**
- * Conditional JSON body parser.
- * Only parses JSON for Express-handled endpoints, not proxied requests.
- */
-app.use((req, res, next) => {
-  const expressApiPaths = EXPRESS_API_ENDPOINTS.map(p => `/api${p}`);
-  const shouldParse = expressApiPaths.some(p => req.path.startsWith(p)) || !req.path.startsWith('/api/');
-
-  if (shouldParse) {
-    express.json({ limit: '50mb' })(req, res, next);
-  } else {
-    next();
-  }
-});
-
 
 /* ═══════════════════════════════════════════════════════════════════════════════
  * HEALTH & KEEPALIVE ENDPOINTS
@@ -103,9 +87,9 @@ app.get('/health', (req, res) => {
 });
 
 /**
- * POST /api/keepAlive - Called every 30s by frontend to keep container alive.
+ * POST /_greta/keepAlive - Called every 30s by frontend to keep container alive.
  */
-app.post('/api/keepAlive', (req, res) => {
+app.post('/_greta/keepAlive', (req, res) => {
   state.lastKeepAlive = Date.now();
   res.json({
     status: 'alive',
@@ -121,16 +105,17 @@ app.post('/api/keepAlive', (req, res) => {
  * API ROUTES
  * ═══════════════════════════════════════════════════════════════════════════════ */
 
-// Express-handled API modules
-app.use('/api', fileApiRouter);        // File operations
-app.use('/api', logsApiRouter);        // Console/backend logs
-app.use('/api', screenshotApiRouter);  // Playwright screenshots
-app.use('/api', agentsApiRouter);      // Browser automation agents
+// ✅ Express internal APIs
+app.use('/_greta', express.json({ limit: '50mb' }));
+app.use('/_greta', fileApiRouter);
+app.use('/_greta', logsApiRouter);
+app.use('/_greta', screenshotApiRouter);
+app.use('/_greta', agentsApiRouter);
 
-// Proxy remaining /api/* to FastAPI backend
+// ✅ Python backend (pure proxy, no filtering)
 app.use('/api', apiRouter);
 
-// Proxy everything else to Vite frontend
+// ✅ Frontend
 app.use(viteRouter);
 
 /* ═══════════════════════════════════════════════════════════════════════════════
