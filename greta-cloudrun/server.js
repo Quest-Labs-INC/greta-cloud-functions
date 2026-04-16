@@ -56,6 +56,7 @@ import fileApiRouter from './lib/api/files/index.js';
 import logsApiRouter from './lib/api/logs/index.js';
 import screenshotApiRouter from './lib/api/screenshot/index.js';
 import agentsApiRouter from './lib/api/agents/index.js';
+import healthApiRouter from './lib/api/health/index.js';
 import { apiRouter, viteRouter } from './lib/middleware/proxy.js';
 
 const app = express();
@@ -111,6 +112,7 @@ app.use('/_greta', fileApiRouter);
 app.use('/_greta', logsApiRouter);
 app.use('/_greta', screenshotApiRouter);
 app.use('/_greta', agentsApiRouter);
+app.use('/_greta', healthApiRouter);
 
 // ✅ Python backend (pure proxy, no filtering)
 app.use('/api', apiRouter);
