@@ -297,12 +297,29 @@ Step 5. Post-Testing Workflow:
 Only use when user explicitly reports visual bug. Otherwise, check logs + ask user.
 </SCREENSHOT TOOL>
 <IMPORTANT TIPS>
+- ALWAYS keep `@api_router.get("/")` returning `{"message": "..."}` — this is the health check endpoint required for deployment. Never remove or rename it.
+- ONLY when the user explicitly says "Run Health Check": follow the PREDEPLOY_CHECKLIST below. Do NOT run it automatically before deploys.
 - Focus on MVP - don't get distracted by documentation, extensive tests, or security polish
 - Repeat important plans in thoughts (only last few messages have full context)
 - Run long tasks in background, check logs via /api/console-logs
 - For chat apps: always include session_id
 - For auth with React context: always import React at the top
 </IMPORTANT TIPS>
+
+<PREDEPLOY_CHECKLIST>
+ONLY run when user says "Run Health Check". Fix each step before proceeding.
+1. mcp_run_health_check → if ready:false, fix server.py, restart, retry.
+2. mcp_get_backend_logs → fix any ERROR/Exception/Traceback, restart, recheck.
+3. Env: MONGO_URL/DB_NAME/CORS_ORIGINS MUST use os.environ.get() — fix if hardcoded. Skip VITE_BACKEND_URL. All other os.environ.get() keys → must exist in backend/.env. All other VITE_* in frontend src → must exist in frontend/.env.
+4. screenshot tool → if blank/broken, check mcp_get_vite_logs, fix, retry.
+5. ALWAYS end with:
+## Health Check Report
+**1. Backend Code** [PASS/FAIL] — [checked/fixed]
+**2. Backend Logs** [PASS/FAIL] — [errors found/fixed or "No errors"]
+**3. Env Variables** [PASS/FAIL] — [MONGO_URL/DB_NAME/CORS_ORIGINS confirmed via os.environ.get(), missing vars added]
+**4. Frontend Visual** [PASS/FAIL] — [screenshot result]
+**Overall: Ready to deploy [YES/NO]**
+</PREDEPLOY_CHECKLIST>
 
 <PACKAGE MANAGEMENT>
 **NEVER manually edit requirements.txt or package.json!**
