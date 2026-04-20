@@ -11,7 +11,10 @@
 
 import express from 'express';
 import { spawn } from 'child_process';
-import { PROJECT_DIR, FRONTEND_DIR } from '../../core/config.js';
+import path from 'path';
+import fs from 'fs/promises';
+import { PROJECT_DIR, FRONTEND_DIR, GCS_BUCKET, projectId } from '../../core/config.js';
+import { Storage } from '@google-cloud/storage';
 import { resolveSafePath, apiResponse, execAsync } from './helpers.js';
 import { restartVite } from '../../services/processes/vite.js';
 import { restartBackend } from '../../services/processes/backend.js';
@@ -152,80 +155,86 @@ router.post('/execute-bash', async (req, res) => {
  *
  * @body {string} [mode='production'] - Build mode: 'production' or 'development'
  */
-router.post('/build', async (req, res) => {
-  try {
-    const { mode = 'production', buildId } = req.body;
-    const validModes = ['production', 'development'];
 
-    if (!validModes.includes(mode)) {
-      return apiResponse(res, 400, { error: `Invalid mode. Use: ${validModes.join(', ')}` });
+router.post('/build', (req, res) => {
+  const { mode = 'production', buildId, minify = false, outDir: outDirOverride } = req.body;
+  const validModes = ['production', 'development'];
+
+  if (!validModes.includes(mode)) {
+    return apiResponse(res, 400, { error: `Invalid mode. Use: ${validModes.join(', ')}` });
+  }
+
+  if (!buildId) {
+    return apiResponse(res, 400, { error: 'buildId is required' });
+  }
+
+  apiResponse(res, 202, { success: true, buildId, message: 'Build started' });
+
+  console.log(`🔨 Building frontend (mode: ${mode}, buildId: ${buildId})...`);
+
+  const buildScript = mode === 'development' ? 'build:dev' : 'build';
+  const outDir = outDirOverride || `dist/${buildId}`;
+  const startTime = Date.now();
+
+  let stdout = '';
+  let stderr = '';
+
+  const buildProcess = spawn(
+    'bash',
+    ['-c', `nice -n 19 ionice -c 3 bun run ${buildScript} -- --outDir ${outDir}${minify ? '' : ' --minify false'}`],
+    {
+      cwd: FRONTEND_DIR,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env: { ...process.env, NODE_ENV: mode }
     }
+  );
 
-    if (!buildId) {
-      return apiResponse(res, 400, { error: 'buildId is required' });
-    }
+  buildProcess.stdout.on('data', (data) => {
+    const line = data.toString().trim();
+    stdout += line + '\n';
+    console.log(`[BUILD]: ${line}`);
+  });
 
-    console.log(`🔨 Building frontend (mode: ${mode}, buildId: ${buildId})...`);
+  buildProcess.stderr.on('data', (data) => {
+    const line = data.toString().trim();
+    stderr += line + '\n';
+    console.error(`[BUILD ERROR]: ${line}`);
+  });
 
-    const buildScript = mode === 'development' ? 'build:dev' : 'build';
-    const outDir = `dist/${buildId}`;
-    const startTime = Date.now();
-
-    const buildResult = await new Promise((resolve) => {
-      let stdout = '';
-      let stderr = '';
-
-      const buildProcess = spawn(
-        'bash',
-        ['-c', `bun run ${buildScript} -- --outDir ${outDir}`],
-        {
-          cwd: FRONTEND_DIR,
-          stdio: ['ignore', 'pipe', 'pipe'],
-          env: {
-            ...process.env,
-            NODE_ENV: mode
-          }
-        }
-      );
-
-      buildProcess.stdout.on('data', (data) => {
-        const line = data.toString().trim();
-        stdout += line + '\n';
-        console.log(`[BUILD]: ${line}`);
-      });
-
-      buildProcess.stderr.on('data', (data) => {
-        const line = data.toString().trim();
-        stderr += line + '\n';
-        console.error(`[BUILD ERROR]: ${line}`);
-      });
-
-      buildProcess.on('exit', (code) => {
-        resolve({ code, stdout, stderr });
-      });
-
-      buildProcess.on('error', (err) => {
-        resolve({ code: 1, stdout, stderr: err.message });
-      });
-    });
-
+  buildProcess.on('exit', async (code) => {
     const duration = Date.now() - startTime;
-
-    if (buildResult.code !== 0) {
-      console.error(`❌ Build failed with exit code ${buildResult.code} after ${duration}ms`);
-      return apiResponse(res, 200, {
-        success: false,
-        message: `Build failed with exit code ${buildResult.code}`,
-        mode,
-        duration,
-        stdout: buildResult.stdout,
-        stderr: buildResult.stderr
-      });
+    if (code !== 0) {
+      console.error(`❌ Build failed with exit code ${code} after ${duration}ms`);
+      return;
     }
 
     console.log(`✅ Build completed in ${duration}ms`);
 
-    // Full sync all project files to GCS
+    // Clean up old build folders only after confirming new build exists
+    try {
+      const distDir = path.join(FRONTEND_DIR, path.dirname(outDir));
+      const newBuildDir = path.join(FRONTEND_DIR, outDir);
+      await fs.access(newBuildDir); // throws if new build doesn't exist
+
+      const entries = await fs.readdir(distDir);
+      const oldEntries = entries.filter(entry => entry !== buildId);
+
+      // Delete locally
+      await Promise.all(oldEntries.map(entry =>
+        fs.rm(path.join(distDir, entry), { recursive: true, force: true })
+      ));
+
+      // Delete from GCS
+      const bucket = new Storage().bucket(GCS_BUCKET);
+      const gcsPrefix = `projects/${projectId}/files/frontend/${path.dirname(outDir)}/`;
+      await Promise.all(oldEntries.map(async (entry) => {
+        const [files] = await bucket.getFiles({ prefix: `${gcsPrefix}${entry}/` });
+        await Promise.all(files.map(f => f.delete().catch(() => {})));
+      }));
+    } catch (err) {
+      console.error('⚠️ Old build cleanup failed:', err.message);
+    }
+
     console.log('📤 Running full sync to GCS...');
     try {
       await syncToGCS(PROJECT_DIR);
@@ -233,21 +242,13 @@ router.post('/build', async (req, res) => {
     } catch (err) {
       console.error('⚠️ GCS sync failed:', err.message);
     }
+  });
 
-    return apiResponse(res, 200, {
-      success: true,
-      message: `Build completed in ${duration}ms`,
-      mode,
-      buildId,
-      duration,
-      stdout: buildResult.stdout
-    });
-
-  } catch (error) {
-    console.error('Build error:', error);
-    return apiResponse(res, 500, { error: error.message });
-  }
+  buildProcess.on('error', (err) => {
+    console.error(`❌ Build process error: ${err.message}`);
+  });
 });
+
 
 
 /* ─────────────────────────────────────────────────────────────────────────────
