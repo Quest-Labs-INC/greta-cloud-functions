@@ -5,8 +5,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { BrowserRouter, Routes, Route } from "react-router-dom";
 import Index from "./pages/Index";
 import NotFound from "./pages/NotFound";
-
-export const API_URL = (import.meta as any).env?.VITE_BACKEND_URL || "";
+export { API_URL } from "./config";
 
 const queryClient = new QueryClient();
 

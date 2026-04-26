@@ -188,6 +188,9 @@ router.post('/screenshot', async (req, res) => {
       consoleErrors.push(`[PAGE ERROR] ${error.message}`);
     });
 
+    // Always navigate to the target URL first
+    await page.goto(url, { waitUntil: 'networkidle', timeout: 30000 });
+
     // Execute pre-screenshot actions if provided
     if (hasActions) {
       console.log(`🎬 Executing ${actions.length} pre-screenshot actions...`);
@@ -201,14 +204,20 @@ router.post('/screenshot', async (req, res) => {
           // Continue anyway, don't break - let screenshot show the state
         } else {
           console.log(`✅ Action: ${action.type}${action.selector ? ` on ${action.selector}` : ''}`);
+
+          // After a click, wait for any navigation to settle
+          if (action.type === 'click') {
+            try {
+              await page.waitForLoadState('networkidle', { timeout: 5000 });
+            } catch {
+              // No navigation happened, that's fine
+            }
+          }
         }
       }
 
       // Wait a bit after actions for any dynamic content
       await page.waitForTimeout(500);
-    } else {
-      // No actions - just navigate to URL directly
-      await page.goto(url, { waitUntil: 'networkidle', timeout: 30000 });
     }
 
     // Additional wait if specified
