@@ -22,6 +22,10 @@ console.log(`[Container] Backend Gateway: ${BACKEND_GATEWAY_URL}`);
 let toolsCache = null;
 let toolsCacheKey = null;
 
+let mcpToolsCache = null;
+let mcpToolsCacheTime = null;
+const MCP_CACHE_TTL_MS = 10 * 60 * 1000; // 10 minutes
+
 let gatewaySignature = null;
 let signatureExpiry = null;
 
@@ -67,22 +71,39 @@ async function initializeAgent() {
 async function consolidateMemory({ currentMemory, conversationTurns, agentName }) {
     try {
         const llm = createOpenRouterLLM({ temperature: 0 });
-        const prompt = `You are updating an AI agent's long-term memory.
+        const prompt = `You are maintaining the long-term memory for an AI agent named "${agentName}".
+
+Memory has two sections. Keep them clearly separated:
+
+## Facts
+Permanent, stable facts about the user — name, preferences, account identifiers, recurring needs.
+Update only when something genuinely new is learned about the user.
+
+## Recent context
+A short narrative paragraph (2-4 sentences) summarising what topics were discussed and what was done in the recent conversation. Rewrite this section each time to reflect the latest context.
+
+---
 
 Current memory:
-${currentMemory || '(empty)'}
+${currentMemory || '(none yet)'}
 
 Recent conversation:
 ${conversationTurns.map(m => `${m.role}: ${m.content}`).join('\n')}
 
-Extract any NEW facts worth remembering long-term: user preferences, names, decisions, recurring patterns, important context.
-If nothing new was learned, return the current memory unchanged.
-Return ONLY the updated memory text, no explanation, no preamble.`;
+---
+
+Rules:
+- Facts: only user identity, preferences, account info (names, orgs, repos they own). One line each.
+- Recent context: a flowing summary of topics and outcomes — NOT a list of every message.
+- NEVER store: tool names or parameters, tool errors/failures, "user is aware that..." statements, tool capabilities, one-time questions that won't recur.
+- If nothing new was learned about the user, return the current memory exactly as-is.
+- Keep total memory under 400 words.
+- Return ONLY the memory text with the two sections. No explanation, no preamble.`;
 
         const response = await llm.invoke([new HumanMessage(prompt)]);
-        const updatedMemory = typeof response.content === 'string' ? response.content : currentMemory;
+        const updatedMemory = typeof response.content === 'string' ? response.content.trim() : currentMemory;
 
-        if (updatedMemory === currentMemory) return;
+        if (!updatedMemory || updatedMemory === currentMemory) return;
 
         await axios.post(
             `${BACKEND_GATEWAY_URL}/api/greta/gateway/memory`,
@@ -201,8 +222,10 @@ app.post('/chat', async (req, res) => {
         const composioApps = agentConfig.composioApps || [];
         const currentMemory = agentConfig.memory || '';
         const isOnboarding = agentConfig.onboardingStatus === 'in_progress';
+        const mcpEnabled = agentConfig.mcpEnabled || false;
+        const mcpServers = agentConfig.mcpServers || [];
 
-        console.log(`[Chat] Agent: ${agentName}, Apps: ${JSON.stringify(composioApps)}, Onboarding: ${isOnboarding}`);
+        console.log(`[Chat] Agent: ${agentName}, Apps: ${JSON.stringify(composioApps)}, MCP: ${mcpEnabled}, Onboarding: ${isOnboarding}`);
 
         let toolDefs = [];
         let selfConfigToolInstances = [];
@@ -211,35 +234,63 @@ app.post('/chat', async (req, res) => {
             selfConfigToolInstances = createSelfConfigTools({ agentId: AGENT_ID, userId, gatewayUrl: BACKEND_GATEWAY_URL, composioApps });
             toolDefs = selfConfigToolInstances;
             console.log(`[Chat] Onboarding mode — loaded ${toolDefs.length} self-config tools`);
-        } else if (composioApps.length > 0) {
-            const cacheKey = composioApps.slice().sort().join(',');
-            if (toolsCache && toolsCacheKey === cacheKey) {
-                toolDefs = toolsCache;
-                console.log(`[Chat] Using cached tools (${toolDefs.length})`);
-            } else {
-                try {
-                    const toolResults = await Promise.allSettled(
-                        composioApps.map(app =>
-                            axios.post(
-                                `${BACKEND_GATEWAY_URL}/api/greta/gateway/composio/tools`,
-                                { agentId: AGENT_ID, userId, apps: [app] },
-                                { headers: { 'x-gateway-signature': gatewaySignature } }
+        } else {
+            // Load Composio tools
+            if (composioApps.length > 0) {
+                const cacheKey = composioApps.slice().sort().join(',');
+                if (toolsCache && toolsCacheKey === cacheKey) {
+                    toolDefs.push(...toolsCache);
+                    console.log(`[Chat] Using cached Composio tools (${toolsCache.length})`);
+                } else {
+                    try {
+                        const composioDefs = [];
+                        const toolResults = await Promise.allSettled(
+                            composioApps.map(app =>
+                                axios.post(
+                                    `${BACKEND_GATEWAY_URL}/api/greta/gateway/composio/tools`,
+                                    { agentId: AGENT_ID, userId, apps: [app] },
+                                    { headers: { 'x-gateway-signature': gatewaySignature } }
+                                )
                             )
-                        )
-                    );
-                    for (let i = 0; i < toolResults.length; i++) {
-                        if (toolResults[i].status === 'fulfilled' && toolResults[i].value.data.success) {
-                            toolDefs.push(...toolResults[i].value.data.tools);
-                        } else {
-                            console.error(`[Chat] Failed tools for ${composioApps[i]}:`, toolResults[i].reason?.message);
+                        );
+                        for (let i = 0; i < toolResults.length; i++) {
+                            if (toolResults[i].status === 'fulfilled' && toolResults[i].value.data.success) {
+                                composioDefs.push(...toolResults[i].value.data.tools);
+                            } else {
+                                console.error(`[Chat] Failed tools for ${composioApps[i]}:`, toolResults[i].reason?.message);
+                            }
                         }
+                        toolsCache = composioDefs;
+                        toolsCacheKey = cacheKey;
+                        toolDefs.push(...composioDefs);
+                        console.log(`[Chat] Loaded ${composioDefs.length} Composio tools`);
+                    } catch (e) {
+                        console.error('[Chat] Failed to load Composio tools:', e.message);
                     }
-                    toolsCache = toolDefs;
-                    toolsCacheKey = cacheKey;
-                    console.log(`[Chat] Loaded ${toolDefs.length} tools`);
-                } catch (e) {
-                    console.error('[Chat] Failed to load tools:', e.message);
-                    toolDefs = [];
+                }
+            }
+
+            // Load MCP tools via gateway — cached for 10 minutes per container lifetime
+            if (mcpEnabled && mcpServers.filter(s => s.enabled !== false).length > 0) {
+                const mcpCacheValid = mcpToolsCache && mcpToolsCacheTime && (Date.now() - mcpToolsCacheTime < MCP_CACHE_TTL_MS);
+                if (mcpCacheValid) {
+                    toolDefs.push(...mcpToolsCache);
+                    console.log(`[Chat] Using cached MCP tools (${mcpToolsCache.length})`);
+                } else {
+                    try {
+                        const mcpRes = await axios.post(
+                            `${BACKEND_GATEWAY_URL}/api/greta/gateway/mcp/tools`,
+                            { agentId: AGENT_ID, userId },
+                            { headers: { 'x-gateway-signature': gatewaySignature } }
+                        );
+                        const mcpDefs = mcpRes.data.success ? (mcpRes.data.tools || []) : [];
+                        mcpToolsCache = mcpDefs;
+                        mcpToolsCacheTime = Date.now();
+                        toolDefs.push(...mcpDefs);
+                        console.log(`[Chat] Loaded ${mcpDefs.length} MCP tools (cached)`);
+                    } catch (e) {
+                        console.error('[Chat] Failed to load MCP tools:', e.message);
+                    }
                 }
             }
         }
@@ -253,13 +304,16 @@ app.post('/chat', async (req, res) => {
             const currentTimeStr = now.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', timeZoneName: 'short' });
             const memorySection = currentMemory ? `\n\n## What you remember about this user\n${currentMemory}` : '';
             const appsSection = composioApps.length > 0 ? `\n\n## Connected apps\n${composioApps.join(', ')}` : '';
+            const mcpSection = mcpEnabled && mcpServers.filter(s => s.enabled !== false).length > 0
+                ? `\n\n## MCP servers\n${mcpServers.filter(s => s.enabled !== false).map(s => s.name).join(', ')}`
+                : '';
             systemPrompt = `You are ${agentName}.
 
 ${coreInstructions}
 
 ## Current date and time
 Today is ${currentDateStr} at ${currentTimeStr}. Always use this when working with dates, calendars, or time-sensitive tasks.
-${memorySection}${appsSection}
+${memorySection}${appsSection}${mcpSection}
 
 ## Tool use rules
 - When you need data or need to perform an action, call the tool immediately. Do not describe what you are about to do.
@@ -288,6 +342,20 @@ ${memorySection}${appsSection}
         async function executeTool(toolCall) {
             const localTool = selfConfigToolInstances.find(t => t.name === toolCall.name);
             if (localTool) return String(await localTool.invoke(toolCall.args));
+
+            // MCP tools are prefixed mcp_ — route to MCP gateway endpoint
+            if (toolCall.name.startsWith('mcp_')) {
+                try {
+                    const mcpRes = await axios.post(
+                        `${BACKEND_GATEWAY_URL}/api/greta/gateway/mcp/execute`,
+                        { agentId: AGENT_ID, userId, toolName: toolCall.name, args: toolCall.args },
+                        { headers: { 'x-gateway-signature': gatewaySignature } }
+                    );
+                    return mcpRes.data.success
+                        ? (typeof mcpRes.data.result === 'string' ? mcpRes.data.result : JSON.stringify(mcpRes.data.result))
+                        : `Error: ${mcpRes.data.error}`;
+                } catch (e) { return `Tool failed: ${e.message}`; }
+            }
 
             const doExec = async () => axios.post(
                 `${BACKEND_GATEWAY_URL}/api/greta/gateway/composio/execute`,
@@ -403,13 +471,17 @@ ${memorySection}${appsSection}
         emit({ type: 'done', response: cleanText, conversationId });
         res.end();
 
-        if (!isOnboarding) {
+        // Consolidate memory every 10 messages — not every turn.
+        // history.length is the number of prior messages before this turn.
+        // Adding 2 (user + assistant) gives total turns after this message.
+        if (!isOnboarding && (history.length + 2) % 10 === 0) {
             const conversationTurns = [
-                ...history.slice(-10),
+                ...history.slice(-12),
                 { role: 'user', content: message },
                 { role: 'assistant', content: cleanText }
             ];
             consolidateMemory({ currentMemory, conversationTurns, agentName });
+            console.log(`[Memory] Consolidation triggered at turn ${history.length + 2}`);
         }
 
     } catch (error) {
