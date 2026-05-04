@@ -141,6 +141,44 @@ router.post('/execute-bash', async (req, res) => {
 
 
 /* ─────────────────────────────────────────────────────────────────────────────
+ * HELPER - Retry with Delay
+ * ───────────────────────────────────────────────────────────────────────────── */
+
+/**
+ * Retries a function up to maxAttempts times with a delay between attempts
+ *
+ * @param {Function} fn - Async function to retry
+ * @param {number} maxAttempts - Maximum number of attempts
+ * @param {number} delayMs - Delay in milliseconds between retries
+ * @param {string} operationName - Name of the operation for logging
+ * @returns {Promise<any>} Result of the function
+ */
+async function retryWithDelay(fn, maxAttempts, delayMs, operationName) {
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      return await fn();
+    } catch (error) {
+      if (attempt === maxAttempts) {
+        console.error(`❌ ${operationName} failed after ${maxAttempts} attempts`);
+        throw error;
+      }
+      console.warn(`⚠️ ${operationName} attempt ${attempt}/${maxAttempts} failed: ${error.message}`);
+      console.log(`⏳ Retrying in ${delayMs / 1000} seconds...`);
+      await new Promise(resolve => setTimeout(resolve, delayMs));
+    }
+  }
+}
+
+/**
+ * Sleep for a specified duration
+ * @param {number} ms - Milliseconds to sleep
+ */
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+
+/* ─────────────────────────────────────────────────────────────────────────────
  * BUILD FRONTEND
  * ───────────────────────────────────────────────────────────────────────────── */
 
@@ -153,7 +191,11 @@ router.post('/execute-bash', async (req, res) => {
  * IMPORTANT: Build runs in background to prevent blocking the event loop.
  * Returns immediately with status. Check logs for build completion.
  *
+ * When minify=true, both build and GCS sync will retry up to 3 times on failure
+ * with 5 second intervals between attempts.
+ *
  * @body {string} [mode='production'] - Build mode: 'production' or 'development'
+ * @body {boolean} [minify=false] - Whether to minify the build (enables retries)
  */
 
 router.post('/build', (req, res) => {
@@ -170,45 +212,99 @@ router.post('/build', (req, res) => {
 
   apiResponse(res, 202, { success: true, buildId, message: 'Build started' });
 
-  console.log(`🔨 Building frontend (mode: ${mode}, buildId: ${buildId})...`);
-
   const buildScript = mode === 'development' ? 'build:dev' : 'build';
   const outDir = outDirOverride || `dist/${buildId}`;
-  const startTime = Date.now();
 
-  let stdout = '';
-  let stderr = '';
+  // Helper to execute a single build attempt
+  const executeBuild = () => {
+    return new Promise((resolve, reject) => {
+      console.log(`🔨 Building frontend (mode: ${mode}, buildId: ${buildId})...`);
+      const startTime = Date.now();
+      let stdout = '';
+      let stderr = '';
 
-  const buildProcess = spawn(
-    'bash',
-    ['-c', `nice -n 19 ionice -c 3 bun run ${buildScript} -- --outDir ${outDir}${minify ? '' : ' --minify false'}`],
-    {
-      cwd: FRONTEND_DIR,
-      stdio: ['ignore', 'pipe', 'pipe'],
-      env: { ...process.env, NODE_ENV: mode }
+      const buildProcess = spawn(
+        'bash',
+        ['-c', `nice -n 19 ionice -c 3 bun run ${buildScript} -- --outDir ${outDir}${minify ? '' : ' --minify false'}`],
+        {
+          cwd: FRONTEND_DIR,
+          stdio: ['ignore', 'pipe', 'pipe'],
+          env: { ...process.env, NODE_ENV: mode }
+        }
+      );
+
+      buildProcess.stdout.on('data', (data) => {
+        const line = data.toString().trim();
+        stdout += line + '\n';
+        console.log(`[BUILD]: ${line}`);
+      });
+
+      buildProcess.stderr.on('data', (data) => {
+        const line = data.toString().trim();
+        stderr += line + '\n';
+        console.error(`[BUILD ERROR]: ${line}`);
+      });
+
+      buildProcess.on('exit', (code) => {
+        const duration = Date.now() - startTime;
+        if (code !== 0) {
+          console.error(`❌ Build failed with exit code ${code} after ${duration}ms`);
+          reject(new Error(`Build process exited with code ${code}`));
+        } else {
+          console.log(`✅ Build completed in ${duration}ms`);
+          resolve({ duration, stdout, stderr });
+        }
+      });
+
+      buildProcess.on('error', (err) => {
+        console.error(`❌ Build process error: ${err.message}`);
+        reject(err);
+      });
+    });
+  };
+
+  // Main build execution with retry logic
+  const runBuild = async () => {
+    const MAX_RETRIES = 3;
+    const RETRY_DELAY_MS = 5000;
+
+    let buildSucceeded = false;
+
+    if (minify) {
+      // With retry logic for minified builds
+      for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+        try {
+          await executeBuild();
+          buildSucceeded = true;
+          break; // Success, exit retry loop
+        } catch (error) {
+          const errorMsg = error?.message || String(error) || 'Unknown error';
+          if (attempt === MAX_RETRIES) {
+            console.error(`❌ Build failed after ${MAX_RETRIES} attempts: ${errorMsg}`);
+            return; // Exit without proceeding to cleanup/sync
+          }
+          console.warn(`⚠️ Build attempt ${attempt}/${MAX_RETRIES} failed: ${errorMsg}`);
+          console.log(`⏳ Retrying in ${RETRY_DELAY_MS / 1000} seconds...`);
+          await sleep(RETRY_DELAY_MS);
+        }
+      }
+    } else {
+      // No retry for non-minified builds
+      try {
+        await executeBuild();
+        buildSucceeded = true;
+      } catch (error) {
+        const errorMsg = error?.message || String(error) || 'Unknown error';
+        console.error(`❌ Build failed: ${errorMsg}`);
+        return; // Exit without proceeding to cleanup/sync
+      }
     }
-  );
 
-  buildProcess.stdout.on('data', (data) => {
-    const line = data.toString().trim();
-    stdout += line + '\n';
-    console.log(`[BUILD]: ${line}`);
-  });
-
-  buildProcess.stderr.on('data', (data) => {
-    const line = data.toString().trim();
-    stderr += line + '\n';
-    console.error(`[BUILD ERROR]: ${line}`);
-  });
-
-  buildProcess.on('exit', async (code) => {
-    const duration = Date.now() - startTime;
-    if (code !== 0) {
-      console.error(`❌ Build failed with exit code ${code} after ${duration}ms`);
+    // Safety check - should never reach here if build failed
+    if (!buildSucceeded) {
+      console.error(`❌ Build did not succeed, skipping cleanup and sync`);
       return;
     }
-
-    console.log(`✅ Build completed in ${duration}ms`);
 
     // Clean up old build folders only after confirming new build exists
     try {
@@ -229,23 +325,49 @@ router.post('/build', (req, res) => {
       const gcsPrefix = `projects/${projectId}/files/frontend/${path.dirname(outDir)}/`;
       await Promise.all(oldEntries.map(async (entry) => {
         const [files] = await bucket.getFiles({ prefix: `${gcsPrefix}${entry}/` });
-        await Promise.all(files.map(f => f.delete().catch(() => {})));
+        await Promise.all(files.map(f => f.delete().catch(() => { })));
       }));
     } catch (err) {
-      console.error('⚠️ Old build cleanup failed:', err.message);
+      const errorMsg = err?.message || String(err) || 'Unknown error';
+      console.error(`⚠️ Old build cleanup failed: ${errorMsg}`);
     }
 
+    // Sync to GCS with retry logic if minify is true
     console.log('📤 Running full sync to GCS...');
-    try {
-      await syncToGCS(PROJECT_DIR);
-      console.log('✅ Full sync to GCS complete');
-    } catch (err) {
-      console.error('⚠️ GCS sync failed:', err.message);
+    if (minify) {
+      // With retry logic for minified builds
+      for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+        try {
+          await syncToGCS(PROJECT_DIR);
+          console.log('✅ Full sync to GCS complete');
+          break; // Success, exit retry loop
+        } catch (err) {
+          const errorMsg = err?.message || String(err) || 'Unknown error';
+          if (attempt === MAX_RETRIES) {
+            console.error(`❌ GCS sync failed after ${MAX_RETRIES} attempts: ${errorMsg}`);
+          } else {
+            console.warn(`⚠️ GCS sync attempt ${attempt}/${MAX_RETRIES} failed: ${errorMsg}`);
+            console.log(`⏳ Retrying in ${RETRY_DELAY_MS / 1000} seconds...`);
+            await sleep(RETRY_DELAY_MS);
+          }
+        }
+      }
+    } else {
+      // No retry for non-minified builds
+      try {
+        await syncToGCS(PROJECT_DIR);
+        console.log('✅ Full sync to GCS complete');
+      } catch (err) {
+        const errorMsg = err?.message || String(err) || 'Unknown error';
+        console.error(`⚠️ GCS sync failed: ${errorMsg}`);
+      }
     }
-  });
+  };
 
-  buildProcess.on('error', (err) => {
-    console.error(`❌ Build process error: ${err.message}`);
+  // Run build asynchronously
+  runBuild().catch(err => {
+    const errorMsg = err?.message || String(err) || 'Unknown error';
+    console.error(`❌ Unexpected error in build process: ${errorMsg}`);
   });
 });
 
