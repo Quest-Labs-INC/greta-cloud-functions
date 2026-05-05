@@ -1,8 +1,29 @@
 const axios = require('axios');
-const { HumanMessage, SystemMessage, ToolMessage } = require('@langchain/core/messages');
 const { createOpenRouterLLM } = require('../llm/openRouterService');
 const { MongoClient } = require('mongodb');
 const { createMongoQueryTool } = require('../tools/mongoQueryTool');
+const { SystemMessage, HumanMessage, ToolMessage, AIMessage } = require('@langchain/core/messages');
+
+const GET_CURRENT_TIME_TOOL = {
+    type: 'function',
+    function: {
+        name: 'get_current_time',
+        description: "Returns the current date and time. Call this when you need today's date, current time, or day of the week.",
+        parameters: { type: 'object', properties: {}, required: [] },
+    },
+};
+
+function executeGetCurrentTime() {
+    const now = new Date();
+    return JSON.stringify({
+        date: now.toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' }),
+        time: now.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', timeZoneName: 'short' }),
+        iso: now.toISOString(),
+    });
+}
+
+let triggerToolsCache = null;
+let triggerToolsCacheKey = null;
 
 let db = null;
 async function getMongoConnection() {
@@ -87,6 +108,12 @@ class AgentExecutor {
     async loadTools(composioApps) {
         if (!composioApps.length) return [];
 
+        const cacheKey = composioApps.slice().sort().join(',');
+        if (triggerToolsCache && triggerToolsCacheKey === cacheKey) {
+            console.log(`[AgentExecutor] Using cached tools (${triggerToolsCache.length})`);
+            return [...triggerToolsCache];
+        }
+
         const results = await Promise.allSettled(
             composioApps.map(app =>
                 axios.post(
@@ -106,31 +133,38 @@ class AgentExecutor {
                 console.error(`[AgentExecutor] Failed tools for ${composioApps[i]}:`, results[i].reason?.message);
             }
         }
+
+        triggerToolsCache = toolDefs;
+        triggerToolsCacheKey = cacheKey;
         return toolDefs;
     }
 
     async runAgentLoop({ systemPrompt, userPrompt, toolDefs, localTools = new Map() }) {
         const llm = createOpenRouterLLM({ temperature: 0 });
-        const llmWithTools = toolDefs.length > 0 ? llm.bindTools(toolDefs) : llm;
+        const allTools = [GET_CURRENT_TIME_TOOL, ...toolDefs];
+        const llmWithTools = allTools.length > 0 ? llm.bindTools(allTools) : llm;
 
-        const messages = [new SystemMessage(systemPrompt), new HumanMessage(userPrompt)];
-
-        const extractText = (r) => {
-            if (typeof r.content === 'string') return r.content;
-            if (Array.isArray(r.content)) return r.content.filter(p => p.type === 'text').map(p => p.text).join('');
-            return '';
-        };
+        const messages = [
+            new SystemMessage(systemPrompt),
+            new HumanMessage(userPrompt)
+        ];
 
         const executeTool = async (tc) => {
-            if (localTools.has(tc.name)) {
-                try { return JSON.stringify(await localTools.get(tc.name)(tc.args)); }
+            // LangChain format: tc.name / tc.args (already parsed object)
+            const name = tc.name;
+            const args = tc.args || {};
+
+            if (name === 'get_current_time') return executeGetCurrentTime();
+
+            if (localTools.has(name)) {
+                try { return JSON.stringify(await localTools.get(name)(args)); }
                 catch (e) { return `Tool failed: ${e.message}`; }
             }
-            if (tc.name.startsWith('mcp_')) {
+            if (name.startsWith('mcp_')) {
                 try {
                     const res = await axios.post(
                         `${this.backendGatewayUrl}/api/greta/gateway/mcp/execute`,
-                        { agentId: this.agentId, userId: this.userId, toolName: tc.name, args: tc.args },
+                        { agentId: this.agentId, userId: this.userId, toolName: name, args },
                         { headers: { 'x-gateway-signature': this.gatewaySignature } }
                     );
                     return res.data.success
@@ -141,7 +175,7 @@ class AgentExecutor {
             try {
                 const res = await axios.post(
                     `${this.backendGatewayUrl}/api/greta/gateway/composio/execute`,
-                    { agentId: this.agentId, userId: this.userId, action: tc.name, params: tc.args },
+                    { agentId: this.agentId, userId: this.userId, action: name, params: args },
                     { headers: { 'x-gateway-signature': this.gatewaySignature } }
                 );
                 return res.data.success ? JSON.stringify(res.data.data) : `Error: ${res.data.error}`;
@@ -149,34 +183,24 @@ class AgentExecutor {
         };
 
         for (let step = 0; step < 10; step++) {
-            const response = await llmWithTools.invoke(messages);
-            messages.push(response);
+            const msg = await llmWithTools.invoke(messages);
+            messages.push(msg);
 
-            const text = extractText(response);
-            const hasTools = response.tool_calls?.length > 0;
-            console.log(`[AgentExecutor] Step ${step + 1} — tools:${response.tool_calls?.length ?? 0} text:"${text.substring(0, 80)}"`);
+            const text = typeof msg.content === 'string' ? msg.content : '';
+            const toolCalls = msg.tool_calls || [];
+            console.log(`[AgentExecutor] Step ${step + 1} — tools:${toolCalls.length} text:"${text.substring(0, 80)}"`);
 
-            if (!hasTools) {
-                // Detect prompt-too-vague: agent asked a question on the very first step
-                const isQuestion = /\?\s*$/.test(text.trim()) ||
-                    /please (tell|share|provide|give|let me know|specify|clarify|describe)/i.test(text) ||
-                    /what (are|is) your/i.test(text) ||
-                    /could you (tell|share|provide|give|clarify)/i.test(text);
-                if (isQuestion && step === 0) {
-                    throw new Error(`Agent asked a question instead of acting. Prompt needs to be more specific. Response: "${text.substring(0, 150)}"`);
-                }
-                // Detect real infrastructure failures — NOT empty results
+            if (toolCalls.length === 0) {
                 const isFailureReport = /payload too large|tool response.*too large|413.*payload/i.test(text);
                 if (isFailureReport) throw new Error(text);
                 return text || 'Task completed.';
             }
 
-            // Execute all tool calls in parallel, track failures
-            console.log(`[AgentExecutor] Executing:`, response.tool_calls.map(t => t.name).join(', '));
+            console.log(`[AgentExecutor] Executing:`, toolCalls.map(t => t.name).join(', '));
             let successCount = 0;
             const errors = [];
             await Promise.all(
-                response.tool_calls.map(async (tc) => {
+                toolCalls.map(async (tc) => {
                     const result = await executeTool(tc);
                     messages.push(new ToolMessage({ tool_call_id: tc.id, content: result }));
                     if (result.startsWith('Tool failed:') || result.startsWith('Error:')) {
@@ -187,13 +211,9 @@ class AgentExecutor {
                 })
             );
 
-            // All tools failed — no point continuing
             if (successCount === 0 && errors.length > 0) {
                 throw new Error(`All tool calls failed: ${errors.join('; ')}`);
             }
-
-            // Tool results are in messages — loop continues so the agent can
-            // call more tools (e.g. send email after fetching data) or produce a final summary.
         }
 
         return 'Task completed.';
@@ -237,9 +257,7 @@ class AgentExecutor {
     }
 
     buildSystemPrompt(agent, { projectMongoUrl = null } = {}) {
-        const now = new Date();
-        const dateStr = now.toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
-        const timeStr = now.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', timeZoneName: 'short' });
+        // Timestamp removed — use get_current_time tool instead so system prompt stays stable for caching.
         const memorySection = agent.memory ? `\n\n## What you remember about this user\n${agent.memory}` : '';
         const appsSection = (agent.composioApps || []).length > 0 ? `\n\n## Connected apps\n${agent.composioApps.join(', ')}` : '';
         const projectSection = projectMongoUrl
@@ -249,9 +267,6 @@ class AgentExecutor {
         return `You are ${agent.name || 'Assistant'}.
 
 ${agent.coreInstructions || 'You are a helpful assistant.'}
-
-## Current date and time
-Today is ${dateStr} at ${timeStr}. Always use this when working with dates or schedules.
 ${memorySection}${appsSection}${projectSection}
 
 ## AUTONOMOUS TASK — CRITICAL RULES
@@ -264,7 +279,8 @@ You are running as a background job. There is NO USER present. No one will see y
 5. Call tools immediately. Do not narrate what you are about to do.
 6. After tools return, write a clear summary of what was found/done. That summary is the task output.
 7. Zero results from a tool is a valid outcome — include it in your summary and keep going. Never abort the whole task because one data source was empty.
-8. Only respond with "Task could not complete: [reason]" if a hard infrastructure error (auth failure, API down) makes it impossible to proceed at all.`;
+8. Only respond with "Task could not complete: [reason]" if a hard infrastructure error (auth failure, API down) makes it impossible to proceed at all.
+9. If you have no tools connected and the task requires external integrations, respond with "Task could not complete: no integrations connected for this agent."`;
     }
 
     async loadAgentConfig() {
