@@ -182,6 +182,9 @@ class AgentExecutor {
             } catch (e) { return `Tool failed: ${e.message}`; }
         };
 
+        let nudgedOnce = false;
+        let toolsCalledCount = 0;
+
         for (let step = 0; step < 10; step++) {
             const msg = await llmWithTools.invoke(messages);
             messages.push(msg);
@@ -193,6 +196,14 @@ class AgentExecutor {
             if (toolCalls.length === 0) {
                 const isFailureReport = /payload too large|tool response.*too large|413.*payload/i.test(text);
                 if (isFailureReport) throw new Error(text);
+
+                if (!nudgedOnce && toolsCalledCount > 0 && step < 9) {
+                    nudgedOnce = true;
+                    console.log(`[AgentExecutor] Step ${step + 1} — LLM stopped mid-task, nudging to continue`);
+                    messages.push(new HumanMessage('Continue with any remaining tasks.'));
+                    continue;
+                }
+
                 return text || 'Task completed.';
             }
 
@@ -214,6 +225,7 @@ class AgentExecutor {
             if (successCount === 0 && errors.length > 0) {
                 throw new Error(`All tool calls failed: ${errors.join('; ')}`);
             }
+            toolsCalledCount++;
         }
 
         return 'Task completed.';
@@ -276,11 +288,13 @@ You are running as a background job. There is NO USER present. No one will see y
 2. NEVER say "please tell me" or "could you share". There is nobody listening.
 3. If you need data — use your tools to fetch it RIGHT NOW.
 4. ALWAYS complete the task with whatever data is available. If any tool returns zero results, note it briefly and continue with all remaining steps.
-5. Call tools immediately. Do not narrate what you are about to do.
-6. After tools return, write a clear summary of what was found/done. That summary is the task output.
-7. Zero results from a tool is a valid outcome — include it in your summary and keep going. Never abort the whole task because one data source was empty.
-8. Only respond with "Task could not complete: [reason]" if a hard infrastructure error (auth failure, API down) makes it impossible to proceed at all.
-9. If you have no tools connected and the task requires external integrations, respond with "Task could not complete: no integrations connected for this agent."`;
+5. Call tools immediately. NEVER narrate or describe what you are about to do — just call the tool. Never say "Now I will fetch...", "Next I'll...", "I am going to...", etc. Call first, narrate never.
+6. If multiple independent tools are needed (e.g., fetch emails AND fetch calendar events), call ALL of them — you can call them in parallel in the same step.
+7. Only write a final response AFTER all tools have been called and all results received.
+8. After all tools return, write a clear summary of what was found/done. That summary is the task output.
+9. Zero results from a tool is a valid outcome — include it in your summary and keep going. Never abort the whole task because one data source was empty.
+10. Only respond with "Task could not complete: [reason]" if a hard infrastructure error (auth failure, API down) makes it impossible to proceed at all.
+11. If you have no tools connected and the task requires external integrations, respond with "Task could not complete: no integrations connected for this agent."`;
     }
 
     async loadAgentConfig() {

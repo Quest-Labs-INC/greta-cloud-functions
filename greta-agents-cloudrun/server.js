@@ -159,7 +159,11 @@ app.post('/execute', async (req, res) => {
 
     try {
         if (!agentExecutor) {
-            return res.status(503).json({ success: false, error: 'Agent executor not initialized' });
+            console.log('[Execute] Agent not initialized — initializing now...');
+            await initializeAgent();
+            if (!agentExecutor) {
+                return res.status(503).json({ success: false, error: 'Agent executor failed to initialize' });
+            }
         }
 
         const { trigger, payload = {}, headers = {}, projectMongoUrl = null } = req.body;
