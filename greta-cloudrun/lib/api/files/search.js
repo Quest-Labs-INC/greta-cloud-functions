@@ -58,6 +58,8 @@ router.post('/search-replace', async (req, res) => {
     }
 
     let content = await fs.readFile(fullPath, 'utf8');
+    // Normalize CRLF → LF so searches always work regardless of file line endings
+    content = content.replace(/\r\n/g, '\n');
     const originalContent = content;
 
     // Count occurrences before replacing
@@ -77,7 +79,7 @@ router.post('/search-replace', async (req, res) => {
 
     await fs.writeFile(fullPath, content, 'utf8');
     console.log(`✅ Search-replace in: ${filePath} (${replaceAll ? occurrences : 1} replacements)`);
-    scheduleSyncToGCS(filePath);  // Incremental sync
+    scheduleSyncToGCS(filePath);
 
     const response = {
       changed: true,

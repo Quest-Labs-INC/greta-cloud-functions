@@ -76,6 +76,16 @@ export async function startMongo() {
   state.mongoProcess.on('close', (code) => {
     log.info(`Process exited with code ${code}`);
     state.mongoProcess = null;
+    // Auto-restart MongoDB — without it the backend silently fails all DB operations
+    log.warn('MongoDB stopped unexpectedly, auto-restarting in 3 seconds...');
+    setTimeout(async () => {
+      try {
+        await startMongo();
+        log.success('MongoDB restarted successfully');
+      } catch (err) {
+        log.error(`MongoDB restart failed: ${err.message}`);
+      }
+    }, 3000);
   });
 
   // Wait for MongoDB to initialize

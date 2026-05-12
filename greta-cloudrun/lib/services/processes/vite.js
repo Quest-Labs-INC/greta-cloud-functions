@@ -14,10 +14,23 @@
  * @module services/processes/vite
  */
 
-import { spawn } from 'child_process';
+import { spawn, execSync } from 'child_process';
+import fs from 'fs';
 import { VITE_PORT, FRONTEND_DIR } from '../../core/config.js';
 import { state, addLog } from '../../core/state.js';
 import { viteLogger as log } from '../../core/logger.js';
+
+const VITE_STATUS_FILE = '/tmp/vite-compiling';
+
+function clearViteStatus() {
+  try { fs.rmSync(VITE_STATUS_FILE, { force: true }); } catch {}
+}
+
+function killOrphanedEsbuild() {
+  try {
+    execSync('pkill -f "esbuild --service" 2>/dev/null || true', { timeout: 3000 });
+  } catch {}
+}
 
 
 /* ─────────────────────────────────────────────────────────────────────────────
@@ -73,11 +86,24 @@ export async function startVite() {
     addLog('vite', message);
   });
 
-  // Capture stderr
+  // Capture stderr — filter known non-error noise Vite prints to stderr
+  const VITE_STDERR_NOISE = [
+    'Experimental optimizeDeps',
+    'Browserslist',
+    'caniuse-lite',
+    'update-browserslist-db',
+    'vite --host',
+    'VITE v',
+    'ready in',
+    'Local:',
+    'Network:',
+    'press h + enter',
+  ];
   state.viteProcess.stderr.on('data', (data) => {
     const message = data.toString().trim();
     log.error(message);
-    addLog('viteErrors', message);
+    const isNoise = VITE_STDERR_NOISE.some(pattern => message.includes(pattern));
+    addLog(isNoise ? 'vite' : 'viteErrors', message);
   });
 
   // Handle process exit
@@ -98,6 +124,7 @@ export async function startVite() {
 
   // Wait for Vite to initialize
   await new Promise(resolve => setTimeout(resolve, 3000));
+  clearViteStatus();
   log.success('Vite dev server started');
 }
 
@@ -108,6 +135,8 @@ export function stopVite() {
   if (state.viteProcess) {
     state.viteProcess.kill();
     state.viteProcess = null;
+    killOrphanedEsbuild();
+    clearViteStatus();
     log.info('Vite stopped');
   }
 }

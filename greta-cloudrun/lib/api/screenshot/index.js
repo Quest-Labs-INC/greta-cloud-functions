@@ -69,7 +69,9 @@ async function executeAction(page, action) {
   try {
     switch (action.type) {
       case 'goto':
-        await page.goto(action.url, { waitUntil: 'networkidle', timeout: 30000 });
+        // 'load' not 'networkidle' — Vite keeps a HMR WebSocket open permanently
+        // which means networkidle NEVER fires on dev servers, causing 30s hangs
+        await page.goto(action.url, { waitUntil: 'load', timeout: 15000 });
         return { success: true, type: 'goto', url: action.url };
 
       case 'fill':
@@ -89,7 +91,7 @@ async function executeAction(page, action) {
         return { success: true, type: 'waitForSelector', selector: action.selector };
 
       case 'waitForNavigation':
-        await page.waitForNavigation({ waitUntil: 'networkidle', timeout: 30000 });
+        await page.waitForNavigation({ waitUntil: 'load', timeout: 15000 });
         return { success: true, type: 'waitForNavigation' };
 
       case 'type':
@@ -166,6 +168,8 @@ router.post('/screenshot', async (req, res) => {
     const browserInstance = await getBrowser();
     const context = await browserInstance.newContext({ viewport: { width, height } });
     const page = await context.newPage();
+    let contextClosed = false;
+    const closeContext = async () => { if (!contextClosed) { contextClosed = true; await context.close().catch(() => {}); } };
 
     // Capture console logs and errors
     const consoleLogs = [];
@@ -188,8 +192,8 @@ router.post('/screenshot', async (req, res) => {
       consoleErrors.push(`[PAGE ERROR] ${error.message}`);
     });
 
-    // Always navigate to the target URL first
-    await page.goto(url, { waitUntil: 'networkidle', timeout: 30000 });
+    // 'load' not 'networkidle' — Vite HMR WebSocket prevents networkidle from ever firing
+    await page.goto(url, { waitUntil: 'load', timeout: 15000 });
 
     // Execute pre-screenshot actions if provided
     if (hasActions) {
@@ -208,7 +212,11 @@ router.post('/screenshot', async (req, res) => {
           // After a click, wait for any navigation to settle
           if (action.type === 'click') {
             try {
-              await page.waitForLoadState('networkidle', { timeout: 5000 });
+              // Wait for either navigation or network settle after click
+              await Promise.race([
+                page.waitForNavigation({ waitUntil: 'load', timeout: 5000 }),
+                page.waitForTimeout(2000)
+              ]).catch(() => {});
             } catch {
               // No navigation happened, that's fine
             }
@@ -238,7 +246,7 @@ router.post('/screenshot', async (req, res) => {
       screenshotBuffer = await page.screenshot({ type: 'png', fullPage });
     }
 
-    await context.close();
+    await closeContext();
 
     // Log captured errors
     if (consoleErrors.length > 0) {
@@ -248,19 +256,29 @@ router.post('/screenshot', async (req, res) => {
 
     console.log(`✅ Screenshot taken (${Math.round(screenshotBuffer.length / 1024)}KB)${hasActions ? ` after ${actionResults.filter(r => r.success).length}/${actions.length} actions` : ''}`);
 
+    const finalUrl = page.url();
+    const requestedPath = url.replace('http://localhost:5173', '').split('?')[0];
+    const landedPath = finalUrl.replace('http://localhost:5173', '').split('?')[0];
+    const redirectedToLogin = landedPath.startsWith('/login') || landedPath.startsWith('/signup');
+    const onExpectedPage = landedPath === requestedPath || landedPath.startsWith(requestedPath);
+    const reachedTarget = !redirectedToLogin && onExpectedPage;
+
     const response = {
       success: true,
       image: screenshotBuffer.toString('base64'),
       mimeType: 'image/png',
       size: screenshotBuffer.length,
       dimensions: { width, height },
-      url: page.url(), // Return actual URL (may have changed after actions)
+      url: finalUrl,
+      intended: requestedPath,      // what page you asked for
+      landedOn: landedPath,         // what page Playwright actually captured
+      reachedTarget,                // true = you are on the right page. false = wrong page, do NOT analyze screenshot
+      redirectedToLogin,            // true = not logged in, login actions failed
       consoleLogs: consoleLogs.slice(-20),
       consoleErrors,
       hasErrors: consoleErrors.length > 0
     };
 
-    // Include action results if actions were performed
     if (hasActions) {
       response.actionsExecuted = actionResults.length;
       response.actionsSucceeded = actionResults.filter(r => r.success).length;
@@ -269,11 +287,92 @@ router.post('/screenshot', async (req, res) => {
 
     res.json(response);
   } catch (error) {
+    await closeContext().catch(() => {});
     console.error('❌ Screenshot error:', error.message);
     res.status(500).json({
       error: error.message,
       hint: 'Make sure the frontend is running on port 5173'
     });
+  }
+});
+
+
+/* ─────────────────────────────────────────────────────────────────────────────
+ * BROWSER CHECK - Visit pages and collect real console errors
+ * ───────────────────────────────────────────────────────────────────────────── */
+
+/**
+ * POST /browser-check - Visit multiple pages and return real browser console errors.
+ * Much more useful than screenshots for debugging — captures actual JS errors per page.
+ *
+ * Body: { paths: ['/', '/login', '/dashboard'], actions?: [...] }
+ */
+router.post('/browser-check', async (req, res) => {
+  const { paths = ['/'], waitMs = 2000 } = req.body || {};
+  const BASE_URL = 'http://localhost:5173';
+
+  try {
+    const browserInstance = await getBrowser();
+    const results = [];
+
+    for (const pagePath of paths.slice(0, 5)) { // max 5 pages
+      const context = await browserInstance.newContext({ viewport: { width: 1280, height: 720 } });
+      const page = await context.newPage();
+      let contextClosed = false;
+      const closeCtx = async () => { if (!contextClosed) { contextClosed = true; await context.close().catch(() => {}); } };
+
+      const consoleErrors = [];
+      const consoleWarnings = [];
+      const networkErrors = [];
+
+      page.on('console', msg => {
+        if (msg.type() === 'error') consoleErrors.push(msg.text());
+        if (msg.type() === 'warning') consoleWarnings.push(msg.text());
+      });
+      page.on('pageerror', err => consoleErrors.push(`[JS Error] ${err.message}`));
+      page.on('requestfailed', req => {
+        const url = req.url();
+        // Only report API/asset failures, not HMR websocket
+        if (!url.includes('/@vite') && !url.includes('ws://')) {
+          networkErrors.push(`${req.method()} ${url} — ${req.failure()?.errorText || 'failed'}`);
+        }
+      });
+
+      try {
+        await page.goto(`${BASE_URL}${pagePath}`, { waitUntil: 'load', timeout: 15000 });
+        await page.waitForTimeout(waitMs);
+      } catch (err) {
+        consoleErrors.push(`[Navigation Error] ${err.message}`);
+      }
+
+      results.push({
+        path: pagePath,
+        hasErrors: consoleErrors.length > 0,
+        consoleErrors: consoleErrors.slice(0, 10),
+        consoleWarnings: consoleWarnings.slice(0, 5),
+        networkErrors: networkErrors.slice(0, 5),
+      });
+
+      await closeCtx();
+    }
+
+    const totalErrors = results.reduce((sum, r) => sum + r.consoleErrors.length, 0);
+    console.log(`🔍 Browser check: ${paths.length} page(s), ${totalErrors} total errors`);
+
+    const hasErrors = totalErrors > 0;
+    res.json({
+      success: true,          // tool ran successfully
+      appHealthy: !hasErrors, // TRUE = no errors found, FALSE = errors exist — use this to decide if fixes needed
+      totalErrors,
+      hasErrors,
+      pages: results,
+      errorSummary: hasErrors
+        ? results.filter(r => r.hasErrors).map(r => `${r.path}: ${r.consoleErrors.join(' | ')}`).join('\n')
+        : 'No errors found — app is healthy'
+    });
+  } catch (error) {
+    console.error('❌ Browser check error:', error.message);
+    res.status(500).json({ success: false, error: error.message });
   }
 });
 

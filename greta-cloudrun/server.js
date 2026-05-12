@@ -18,6 +18,7 @@
 import express from 'express';
 import cors from 'cors';
 import fs from 'fs-extra';
+import { existsSync } from 'fs';
 import path from 'path';
 
 /* ─────────────────────────────────────────────────────────────────────────────
@@ -82,6 +83,7 @@ app.get('/health', (req, res) => {
     projectId,
     imageVersion: IMAGE_VERSION,
     viteRunning: !!state.viteProcess,
+    viteCompiling: existsSync('/tmp/vite-compiling'),
     backendRunning: !!state.backendProcess,
     mongoRunning: !!state.mongoProcess
   });
@@ -393,8 +395,13 @@ process.on('SIGINT', shutdown);
  * START SERVER
  * ═══════════════════════════════════════════════════════════════════════════════ */
 
-app.listen(PORT, async () => {
+const server = app.listen(PORT, async () => {
   console.log(`🌐 Greta Cloud Run server listening on port ${PORT}`);
   console.log(`📁 Project ID: ${projectId}`);
   await initializeProject();
 });
+
+// Fix: Node's default keepAliveTimeout (5s) is lower than nginx's proxy_read_timeout (3600s)
+// This causes nginx to reuse a dead connection → 504. Set Node's timeout higher than nginx.
+server.keepAliveTimeout = 65000;   // 65s — above nginx's 60s default upstream keepalive
+server.headersTimeout = 66000;     // must be > keepAliveTimeout
