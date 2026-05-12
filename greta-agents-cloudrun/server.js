@@ -5,6 +5,7 @@ const { HumanMessage, SystemMessage, ToolMessage, AIMessage } = require('@langch
 const { createOpenRouterLLM } = require('./lib/llm/openRouterService');
 const { createSelfConfigTools } = require('./lib/tools/selfConfigTools');
 const { getOnboardingPrompt } = require('./lib/tools/onboardingPrompt');
+const { createOrchestrationTools } = require('./lib/tools/agentOrchestrationTools');
 
 const app = express();
 app.use(express.json({ limit: '10mb' }));
@@ -28,6 +29,40 @@ const MCP_CACHE_TTL_MS = 10 * 60 * 1000; // 10 minutes
 
 let gatewaySignature = null;
 let signatureExpiry = null;
+
+// Local tool: Create a scheduled task/trigger from chat
+const CREATE_TRIGGER_TOOL = {
+    type: 'function',
+    function: {
+        name: 'create_trigger',
+        description: `Create a scheduled task or webhook trigger for this agent.
+
+CRITICAL: The runPrompt is NOT a static message — it is an AGENTIC instruction. When the trigger fires, this agent runs autonomously with ALL connected tools (GitHub, Gmail, Slack, etc.) and executes the runPrompt as a full AI task. This means the runPrompt CAN:
+- Fetch live data from GitHub (list PRs, check review status, filter by author, check age)
+- Send conditional emails or Slack messages based on what it finds
+- Track "already notified" state across runs using watch_set/watch_get (prevents duplicate alerts)
+- Make decisions: "if PR has no reviews after 5 minutes, send email; otherwise skip"
+
+ANY monitoring + conditional notification workflow IS achievable as a SCHEDULED trigger that polls on a schedule. For example:
+- "Every 5 min: check GitHub for PRs by DhaanuI with no reviews older than 5 min. For each not yet notified (check watch_get), send email to x@y.com and watch_set the PR as notified."
+- "Every 30 min: check Gmail unread > 24h, send Slack digest"
+
+Call this tool after gathering: what to monitor, what condition to check, what action to take, how often to run.`,
+        parameters: {
+            type: 'object',
+            properties: {
+                name: { type: 'string', description: 'Short descriptive name (e.g. "PR review alert")' },
+                description: { type: 'string', description: 'Human-readable description of what this task does' },
+                type: { type: 'string', enum: ['SCHEDULED', 'WEBHOOK_RECEIVED'], description: 'SCHEDULED for time-based polling, WEBHOOK_RECEIVED for webhook-triggered' },
+                cronExpression: { type: 'string', description: 'Cron expression for SCHEDULED tasks (e.g. "*/5 * * * *" = every 5 min, "0 9 * * 1" = Monday 9am). REQUIRED for SCHEDULED type.' },
+                timezone: { type: 'string', description: 'Timezone for SCHEDULED tasks (e.g. "America/New_York", "UTC"). Default UTC.' },
+                runPrompt: { type: 'string', description: 'The agentic instruction the agent will follow at runtime. Be detailed and specific: what to fetch, what condition to check, what action to take, and how to avoid duplicate notifications using watch_set/watch_get.' },
+                composioApps: { type: 'array', items: { type: 'string' }, description: 'Apps this task needs. CRITICAL: only list apps from your "Connected apps" section. If an app is not connected, do NOT include it here — the task will still be created and the runPrompt can still reference that app.' },
+            },
+            required: ['name', 'type', 'runPrompt'],
+        },
+    },
+};
 
 // Local tool: Always available to help agent understand current date/time
 // Critical for calendar queries, scheduling, relative dates ("next week", "tomorrow")
@@ -364,6 +399,9 @@ You run in two phases. In the first phase no tools are available.
 - Never ask "Would you like me to...?", "Shall I...?", "Should I...?". Either answer or output TOOLS_NEEDED.
 - CRITICAL: If the user asks for MULTIPLE things from MULTIPLE apps, list ALL the apps needed, separated by commas.
 
+## Creating scheduled tasks
+If the user wants to create a task, automation, reminder, schedule, recurring job, OR any "monitor X and notify Y" workflow → output TOOLS_NEEDED:CREATE_TRIGGER immediately. NEVER explain limitations, hedge, or say it's impossible. Everything is achievable via scheduled polling. Just ask for missing details and create it.
+
 ${responseStyle}`;
 
             // Phase 3 prompt: NO TOOLS_NEEDED instructions (tools already loaded!)
@@ -388,6 +426,24 @@ ${baseGuidance}
 - After a tool returns, use the result to answer. Do not re-call the same tool unless the result was an error.
 - If a tool fails, report the error in one sentence and stop.
 - If you need an external integration and have no tools for it, tell the user clearly in one sentence.
+
+## Creating scheduled tasks — MANDATORY RULES
+
+Use the **create_trigger** tool when the user wants to create a task, automation, reminder, or any "monitor X and do Y" workflow.
+
+**RULE 1 — NEVER say something is impossible.**
+"Check for new PRs every 5 minutes and email if unreviewed" = SCHEDULED trigger running every 5 min (cron: "*/5 * * * *") that fetches PRs created in the last 10 minutes and checks review count. This IS possible. ANY monitoring + conditional notification task is achievable via scheduled polling. If you catch yourself saying "I cannot", stop — you are wrong. Reframe as a polling approach and proceed.
+
+**RULE 2 — On create_trigger error, fix and retry immediately.**
+If create_trigger returns an error, diagnose and retry with corrected parameters in the SAME response. Do NOT tell the user "I encountered an error and cannot proceed." That is unacceptable. Common fixes: remove apps from composioApps that aren't in your connected apps list, fix the cronExpression format, ensure runPrompt is non-empty.
+
+**RULE 3 — The runPrompt is fully agentic.**
+When the trigger fires, this agent runs with ALL connected tools (GitHub MCP, Gmail, Slack, etc.). The runPrompt can: fetch live GitHub data, check review status, send conditional emails, track state with watch_set/watch_get to avoid duplicate alerts. Write it in detail.
+
+**RULE 4 — Use a fixed dedup key format.**
+In the runPrompt, always specify the exact watch key string, e.g. watch_get("notified_pr_{owner}_{repo}_{number}"). This prevents the agent from inventing different key names across runs.
+
+Before calling create_trigger: ask only truly missing info in ONE message. Then call the tool. After success, confirm to the user.
 
 ${responseStyle}`;
         }
@@ -424,6 +480,34 @@ ${responseStyle}`;
             // LangChain format: tc.name / tc.args (already-parsed object)
             const name = tc.name;
             const args = tc.args || {};
+
+            // Self-orchestration tools (watch_set/get/clear, create_task) — handled locally
+            if (['watch_set', 'watch_get', 'watch_clear', 'create_task'].includes(name)) {
+                try {
+                    const orchTools = createOrchestrationTools({
+                        agentId: AGENT_ID, userId,
+                        backendGatewayUrl: BACKEND_GATEWAY_URL,
+                        getSignature: () => gatewaySignature,
+                    });
+                    return await orchTools.executeOrchestrationTool(name, args);
+                } catch (e) { return `Tool failed: ${e.message}`; }
+            }
+
+            // create_trigger — creates a scheduled task via backend, then notifies frontend
+            if (name === 'create_trigger') {
+                try {
+                    const trigRes = await axios.post(
+                        `${BACKEND_GATEWAY_URL}/api/greta/gateway/trigger/create`,
+                        { agentId: AGENT_ID, userId, ...args },
+                        { headers: { 'x-gateway-signature': gatewaySignature } }
+                    );
+                    if (trigRes.data.success) {
+                        emit({ type: 'trigger_created', triggerId: trigRes.data.triggerId, name: args.name });
+                        return JSON.stringify({ success: true, message: `Task "${args.name}" created successfully.` });
+                    }
+                    return `Error: ${trigRes.data.error}`;
+                } catch (e) { return `Tool failed: ${e.message}`; }
+            }
 
             if (name.startsWith('mcp_')) {
                 try {
@@ -498,6 +582,7 @@ ${responseStyle}`;
             // LLM outputs TOOLS_NEEDED:APP1,APP2 or answers directly.
             let requestedApps = [];
             let needsMcp = false;
+            let needsCreateTrigger = false;
 
             let p1msg;
             try {
@@ -511,10 +596,11 @@ ${responseStyle}`;
             if (sentinelMatch) {
                 if (sentinelMatch[1]) {
                     const parsed = sentinelMatch[1].split(',').map(s => s.trim().toUpperCase()).filter(Boolean);
-                    requestedApps = parsed.filter(a => a !== 'MCP');
+                    requestedApps = parsed.filter(a => a !== 'MCP' && a !== 'CREATE_TRIGGER');
                     needsMcp = parsed.includes('MCP');
+                    needsCreateTrigger = parsed.includes('CREATE_TRIGGER');
                 }
-                console.log(`[Chat] Phase 1 sentinel — apps: [${requestedApps.join(',')}], mcp: ${needsMcp}`);
+                console.log(`[Chat] Phase 1 sentinel — apps: [${requestedApps.join(',')}], mcp: ${needsMcp}, createTrigger: ${needsCreateTrigger}`);
                 // CRITICAL: Do NOT set finalText here! We need to load tools and run Phase 3.
             } else if (p1text) {
                 // Direct answer — re-run with full history for context-aware response
@@ -530,9 +616,9 @@ ${responseStyle}`;
 
             const hasToolsConfigured = composioApps.length > 0 || (mcpEnabled && mcpServers.filter(s => s.enabled !== false).length > 0);
 
-            console.log(`[Chat] After Phase 1 — finalText:"${finalText.slice(0, 50)}", finalText.length:${finalText.length}, hasToolsConfigured:${hasToolsConfigured}`);
+            console.log(`[Chat] After Phase 1 — finalText:"${finalText.slice(0, 50)}", finalText.length:${finalText.length}, hasToolsConfigured:${hasToolsConfigured}, needsCreateTrigger:${needsCreateTrigger}`);
 
-            if (!finalText && hasToolsConfigured) {
+            if (!finalText && (hasToolsConfigured || needsCreateTrigger)) {
                 // ── Phase 2: Smart tool loading — only apps the LLM asked for ────
                 // If sentinel specified apps, load only those. Else load all (fallback).
                 const appsToLoad = requestedApps.length > 0
@@ -604,7 +690,19 @@ ${responseStyle}`;
 
                 // Add get_current_time as a local tool — always available in Phase 3
                 toolDefs.push(GET_CURRENT_TIME_TOOL);
-                console.log(`[Chat] Added get_current_time tool (${toolDefs.length} total tools)`);
+
+                // Add create_trigger — lets agent create scheduled tasks from chat
+                toolDefs.push(CREATE_TRIGGER_TOOL);
+
+                // Add self-orchestration tools — watch_set/get/clear + create_task
+                const orchestration = createOrchestrationTools({
+                    agentId: AGENT_ID,
+                    userId,
+                    backendGatewayUrl: BACKEND_GATEWAY_URL,
+                    getSignature: () => gatewaySignature,
+                });
+                toolDefs.push(...orchestration.toolDefs);
+                console.log(`[Chat] ${toolDefs.length} total tools (incl. orchestration)`);
 
                 // ── Phase 3: ReAct loop — mirrors main backend exactly ───────────────
                 // Uses LangChain bindTools + invoke — same approach as gretaAgentFunctions.js

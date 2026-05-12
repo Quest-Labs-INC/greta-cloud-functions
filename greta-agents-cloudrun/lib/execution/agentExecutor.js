@@ -2,6 +2,7 @@ const axios = require('axios');
 const { createOpenRouterLLM } = require('../llm/openRouterService');
 const { MongoClient } = require('mongodb');
 const { createMongoQueryTool } = require('../tools/mongoQueryTool');
+const { createOrchestrationTools } = require('../tools/agentOrchestrationTools');
 const { SystemMessage, HumanMessage, ToolMessage, AIMessage } = require('@langchain/core/messages');
 
 const GET_CURRENT_TIME_TOOL = {
@@ -58,13 +59,28 @@ class AgentExecutor {
             const userPrompt = this.buildPrompt(trigger, payload, headers);
             console.log(`[AgentExecutor] Prompt: "${userPrompt.substring(0, 200)}"`);
 
-            const toolDefs = await this.loadTools(agent.composioApps || []);
-
-            // Load MCP tools via gateway
+            // Prefer trigger-level app list (only apps this task actually needs).
+            // Fall back to agent-level list for older triggers that predate this field.
+            const appsToLoad = (trigger.composioApps?.length > 0) ? trigger.composioApps : (agent.composioApps || []);
+            const cachedToolDefs = await this.loadTools(appsToLoad);
             const mcpToolDefs = await this.loadMCPTools(agent);
-            toolDefs.push(...mcpToolDefs);
+
+            // Self-orchestration tools — always available for trigger execution
+            const orchestration = createOrchestrationTools({
+                agentId: this.agentId,
+                userId: this.userId,
+                backendGatewayUrl: this.backendGatewayUrl,
+                getSignature: () => this.gatewaySignature,
+            });
+
+            // Build final tool list without mutating the cache
+            const toolDefs = [...cachedToolDefs, ...mcpToolDefs, ...orchestration.toolDefs];
 
             const localTools = new Map();
+            for (const td of orchestration.toolDefs) {
+                localTools.set(td.function.name, (args) => orchestration.executeOrchestrationTool(td.function.name, args));
+            }
+
             if (projectMongoUrl) {
                 const mongoTool = createMongoQueryTool(projectMongoUrl);
                 toolDefs.push(mongoTool.toolDef);
@@ -72,7 +88,7 @@ class AgentExecutor {
                 console.log(`[AgentExecutor] mongo_query tool injected`);
             }
 
-            console.log(`[AgentExecutor] ${toolDefs.length} tools ready (incl. ${mcpToolDefs.length} MCP)`);
+            console.log(`[AgentExecutor] ${toolDefs.length} tools ready (incl. ${mcpToolDefs.length} MCP, ${orchestration.toolDefs.length} orchestration)`);
 
             const systemPrompt = this.buildSystemPrompt(agent, { projectMongoUrl });
             const output = await this.runAgentLoop({ systemPrompt, userPrompt, toolDefs, localTools });
@@ -263,6 +279,10 @@ class AgentExecutor {
                     .replace(/\{\{headers\}\}/g, JSON.stringify(headers, null, 2));
             }
 
+            case 'FOLLOWUP':
+                // Agent-created delayed task — instruction is the exact thing to do now
+                return `${trigger.instruction || trigger.name}\n\nContext from when this follow-up was scheduled:\n${JSON.stringify(payload, null, 2)}`;
+
             default:
                 return `Trigger "${trigger.name}" fired.\nPayload: ${JSON.stringify(payload, null, 2)}`;
         }
@@ -280,6 +300,14 @@ class AgentExecutor {
 
 ${agent.coreInstructions || 'You are a helpful assistant.'}
 ${memorySection}${appsSection}${projectSection}
+
+## Self-orchestration tools always available
+- **watch_set(key, value, ttlHours?)** — persist state between runs (track what you're monitoring)
+- **watch_get(key)** — retrieve previously stored state
+- **watch_clear(key)** — delete state when done monitoring
+- **create_task(instruction, delayMinutes, context?)** — schedule a delayed follow-up execution of yourself
+
+Use these when you need to: remember something across runs, avoid duplicate actions, or check a condition after a time delay.
 
 ## AUTONOMOUS TASK — CRITICAL RULES
 You are running as a background job. There is NO USER present. No one will see your questions or reply to them.
