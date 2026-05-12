@@ -46,6 +46,9 @@ RUN curl -fsSL https://www.mongodb.org/static/pgp/server-7.0.asc | gpg --dearmor
 RUN python3 -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
+# Install ruff for Python linting (available globally)
+RUN pip install --no-cache-dir ruff
+
 # Create MongoDB data directory
 RUN mkdir -p /data/db && chown -R node:node /data/db
 

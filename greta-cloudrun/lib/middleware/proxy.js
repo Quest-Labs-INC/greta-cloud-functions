@@ -14,6 +14,7 @@ import { VITE_PORT, BACKEND_PORT, DEBOUNCE_DELAY } from '../core/config.js';
 import { backupMongoToGCS } from '../services/processes/mongodb.js';
 
 
+
 /* ─────────────────────────────────────────────────────────────────────────────
  * MONGODB BACKUP SCHEDULING
  * ───────────────────────────────────────────────────────────────────────────── */
@@ -97,6 +98,8 @@ export const viteProxy = createProxyMiddleware({
   target: `http://localhost:${VITE_PORT}`,
   changeOrigin: true,
   ws: true, // Enable WebSocket for HMR
+  proxyTimeout: 10000, // 10s — fail fast instead of waiting 100s for Cloudflare to timeout
+  timeout: 10000,
 
   logLevel: 'warn',
 
@@ -144,7 +147,6 @@ export function apiRouter(req, res, next) {
  * Routes non-API requests to Vite frontend.
  */
 export function viteRouter(req, res, next) {
-  // Use originalUrl (un-stripped) to reliably detect /api/* regardless of mount point
   if (req.originalUrl.startsWith('/api') || req.originalUrl === '/health') {
     console.warn(`[Vite Router] Unexpected /api path: ${req.method} ${req.originalUrl}`);
     return next();

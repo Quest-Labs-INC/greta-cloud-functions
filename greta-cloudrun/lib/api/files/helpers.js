@@ -106,7 +106,10 @@ export function apiResponse(res, status, data) {
  * ───────────────────────────────────────────────────────────────────────────── */
 
 let syncTimeout = null;
-let pendingFiles = new Set(); // Track which files need syncing
+let pendingFiles = new Set();
+let syncRetryCount = 0;
+const MAX_SYNC_RETRIES = 3;
+
 
 /**
  * Schedules a debounced incremental sync to Google Cloud Storage.
@@ -132,6 +135,7 @@ export function scheduleSyncToGCS(filePath) {
         console.log(`🔄 Incremental sync: ${filesToSync.length} file(s)...`);
         const result = await syncFilesToGCS(PROJECT_DIR, filesToSync);
 
+        syncRetryCount = 0;
         if (result.failed === 0) {
           console.log(`✅ Incremental sync complete: ${result.success} file(s)`);
         } else {
@@ -139,8 +143,15 @@ export function scheduleSyncToGCS(filePath) {
         }
       } catch (error) {
         console.error('❌ Incremental sync failed:', error.message);
-        // Re-add files to pending for retry on next change
-        filesToSync.forEach(f => pendingFiles.add(f));
+        // Retry up to MAX_SYNC_RETRIES — prevents infinite loop if GCS is down
+        if (syncRetryCount < MAX_SYNC_RETRIES) {
+          syncRetryCount++;
+          filesToSync.forEach(f => pendingFiles.add(f));
+          console.warn(`⚠️ Will retry sync (attempt ${syncRetryCount}/${MAX_SYNC_RETRIES})`);
+        } else {
+          syncRetryCount = 0;
+          console.error(`❌ Sync failed after ${MAX_SYNC_RETRIES} retries, dropping pending files`);
+        }
       }
     }
   }, DEBOUNCE_DELAY);

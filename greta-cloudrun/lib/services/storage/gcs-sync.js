@@ -32,9 +32,9 @@ import { getContentType } from './content-types.js';
  * HTTP AGENT CONFIGURATION
  * ───────────────────────────────────────────────────────────────────────────── */
 
-// Increase connection pool for parallel downloads (Node.js default is only 5!)
-https.globalAgent.maxSockets = 100;
-http.globalAgent.maxSockets = 100;
+// Modest connection pool — aggressive values (100) cause memory spikes under load
+https.globalAgent.maxSockets = 25;
+http.globalAgent.maxSockets = 25;
 
 
 /* ─────────────────────────────────────────────────────────────────────────────
@@ -148,7 +148,19 @@ export async function syncFromGCS(targetDir) {
  * @param {object} [metadata] - Optional metadata (conversationId, messageId, timestamp)
  * @returns {Promise<void>}
  */
+// Prevent concurrent full syncs from stacking up
+let syncInProgress = false;
+let syncQueued = false;
+
 export async function syncToGCS(sourceDir, metadata = {}) {
+  // If a sync is already running, queue one more and return
+  if (syncInProgress) {
+    syncQueued = true;
+    log.info('GCS sync already in progress, queued for after completion');
+    return;
+  }
+
+  syncInProgress = true;
   log.emoji('upload', `Uploading to GCS: gs://${GCS_BUCKET}/projects/${projectId}/`);
 
   try {
@@ -171,6 +183,13 @@ export async function syncToGCS(sourceDir, metadata = {}) {
   } catch (error) {
     log.error(`Upload error: ${error.message}`);
     throw error;
+  } finally {
+    syncInProgress = false;
+    // Run the queued sync if one was requested while we were busy
+    if (syncQueued) {
+      syncQueued = false;
+      syncToGCS(sourceDir, metadata).catch(e => log.error(`Queued sync failed: ${e.message}`));
+    }
   }
 }
 
@@ -213,71 +232,48 @@ export async function syncFilesToGCS(baseDir, filePaths, metadata = {}) {
   let successCount = 0;
   let failedCount = 0;
 
-  // Process files with individual error handling
-  const results = await Promise.allSettled(filePaths.map(async (relativePath) => {
-    try {
-      // Normalize path separators for cross-platform compatibility
-      const normalizedPath = relativePath.replace(/\\/g, '/');
-      const fullPath = path.join(baseDir, relativePath);
+  // Upload in batches of BATCH_SIZE — prevents memory spikes from 100+ concurrent reads
+  for (let i = 0; i < filePaths.length; i += BATCH_SIZE) {
+    const batch = filePaths.slice(i, i + BATCH_SIZE);
+    const results = await Promise.allSettled(batch.map(async (relativePath) => {
+      try {
+        const normalizedPath = relativePath.replace(/\\/g, '/');
+        const fullPath = path.join(baseDir, relativePath);
 
-      // Check if file exists
-      const exists = await fs.pathExists(fullPath);
-      if (!exists) {
-        // File was deleted - remove from GCS
-        const gcsPath = `projects/${projectId}/files/${normalizedPath}`;
-        try {
-          await bucket.file(gcsPath).delete();
-          log.info(`Deleted from GCS: ${normalizedPath}`);
-        } catch (e) {
-          // File might not exist in GCS, that's OK
-          if (e.code !== 404) {
-            log.warn(`Could not delete ${normalizedPath}: ${e.message}`);
+        const exists = await fs.pathExists(fullPath);
+        if (!exists) {
+          const gcsPath = `projects/${projectId}/files/${normalizedPath}`;
+          try {
+            await bucket.file(gcsPath).delete();
+          } catch (e) {
+            if (e.code !== 404) log.warn(`Could not delete ${normalizedPath}: ${e.message}`);
           }
+          return { path: normalizedPath, action: 'deleted' };
         }
-        return { path: normalizedPath, action: 'deleted' };
+
+        const content = await fs.readFile(fullPath);
+        const gcsPath = `projects/${projectId}/files/${normalizedPath}`;
+        const gcsMetadata = { cacheControl: 'no-cache' };
+        if (metadata.conversationId) gcsMetadata['x-goog-meta-conversation-id'] = metadata.conversationId;
+        if (metadata.messageId) gcsMetadata['x-goog-meta-message-id'] = metadata.messageId;
+        if (metadata.timestamp) gcsMetadata['x-goog-meta-timestamp'] = metadata.timestamp;
+
+        await bucket.file(gcsPath).save(content, { contentType: getContentType(relativePath), metadata: gcsMetadata });
+        return { path: normalizedPath, action: 'uploaded' };
+      } catch (error) {
+        throw new Error(`${relativePath}: ${error.message}`);
       }
+    }));
 
-      // Read and upload file
-      const content = await fs.readFile(fullPath);
-      const gcsPath = `projects/${projectId}/files/${normalizedPath}`;
-      const contentType = getContentType(relativePath);
-
-      // Build GCS metadata
-      const gcsMetadata = {
-        cacheControl: 'no-cache'
-      };
-
-      // Add conversation metadata if provided
-      if (metadata.conversationId) {
-        gcsMetadata['x-goog-meta-conversation-id'] = metadata.conversationId;
+    results.forEach((result, idx) => {
+      if (result.status === 'fulfilled') {
+        successCount++;
+      } else {
+        failedCount++;
+        log.error(`Failed to sync ${batch[idx]}: ${result.reason?.message || 'Unknown error'}`);
       }
-      if (metadata.messageId) {
-        gcsMetadata['x-goog-meta-message-id'] = metadata.messageId;
-      }
-      if (metadata.timestamp) {
-        gcsMetadata['x-goog-meta-timestamp'] = metadata.timestamp;
-      }
-
-      await bucket.file(gcsPath).save(content, {
-        contentType,
-        metadata: gcsMetadata
-      });
-
-      return { path: normalizedPath, action: 'uploaded' };
-    } catch (error) {
-      throw new Error(`${relativePath}: ${error.message}`);
-    }
-  }));
-
-  // Count successes and failures
-  results.forEach((result, index) => {
-    if (result.status === 'fulfilled') {
-      successCount++;
-    } else {
-      failedCount++;
-      log.error(`Failed to sync ${filePaths[index]}: ${result.reason?.message || 'Unknown error'}`);
-    }
-  });
+    });
+  }
 
   const elapsed = Date.now() - startTime;
 
@@ -685,7 +681,8 @@ async function downloadNodeModulesCache(bucket, targetDir) {
  * @private
  */
 async function uploadArchive(bucket, sourceDir, files, metadata = {}) {
-  const zipPath = path.join(sourceDir, 'files.zip');
+  // Write to /tmp/ not sourceDir — avoids Vite watching a large zip appear in the project
+  const zipPath = '/tmp/greta-files.zip';
 
   // Create archive
   await new Promise((resolve, reject) => {

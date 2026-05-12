@@ -11,11 +11,21 @@ export default defineConfig(({ mode }) => ({
     hmr: {
       overlay: false,
     },
+    watch: {
+      // Only watch src/ — ignore everything else so bulk writes to other dirs don't trigger HMR
+      ignored: [
+        '**/node_modules/**',
+        '**/.git/**',
+        '**/dist/**',
+        '**/dist-static/**',
+        '**/public/**',
+        '**/backend/**',
+      ],
+      // Wait 1s of file stability before triggering HMR — prevents storm from rapid bulk writes
+      stabilityThreshold: 1000,
+    },
   },
-  optimizeDeps: {
-    disabled: false,
-    force: false,
-  },
+
   plugins: [componentGretaTagger(), react()],
   resolve: {
     alias: {

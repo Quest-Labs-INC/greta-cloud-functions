@@ -29,6 +29,8 @@ const router = express.Router();
 
 const BLOCKED_PATTERNS = [
   /rm\s+-rf\s+\/(?!app)/i,      // Block rm -rf / but allow /app paths
+  /rm\s+-rf\s+.*node_modules\/\.vite/i, // Block deleting Vite cache (causes blank screen)
+  /rm\s+-rf\s+.*node_modules/i, // Block deleting node_modules entirely
   /mkfs/i,                        // Block filesystem creation
   /dd\s+if=/i,                    // Block disk dump
   /:(){ :|:& };:/,                // Fork bomb
@@ -371,6 +373,99 @@ router.post('/build', (req, res) => {
   });
 });
 
+
+
+/* ─────────────────────────────────────────────────────────────────────────────
+ * LINT PYTHON
+ * ───────────────────────────────────────────────────────────────────────────── */
+
+/**
+ * POST /lint-python - Lint Python files using ruff
+ *
+ * Runs ruff on the backend directory (or a specific path pattern).
+ * With fix=true, auto-fixes safe issues.
+ */
+router.post('/lint-python', async (req, res) => {
+  try {
+    const { path_pattern, fix = false, exclude_patterns = [] } = req.body;
+    const target = path_pattern
+      ? resolveSafePath(path_pattern)
+      : `${PROJECT_DIR}/backend`;
+
+    const excludeArgs = exclude_patterns.map(p => `--exclude ${p}`).join(' ');
+    const fixArg = fix ? '--fix' : '';
+    const command = `ruff check ${fixArg} ${excludeArgs} "${target}" 2>&1`;
+
+    const startTime = Date.now();
+    try {
+      const { stdout } = await execAsync(command, { timeout: 30000, maxBuffer: 1024 * 1024 });
+      return apiResponse(res, 200, { hasErrors: false, output: stdout || '', fixed: fix, duration: Date.now() - startTime });
+    } catch (execError) {
+      const output = execError.stdout || execError.stderr || '';
+      const lines = output.split('\n').filter(Boolean);
+      const errors = lines.filter(l => l.includes('error') || l.match(/\w+\.\py:\d+/));
+      return apiResponse(res, 200, {
+        hasErrors: errors.length > 0,
+        errorCount: errors.length,
+        errors: errors.slice(0, 20),
+        output: output.slice(0, 3000),
+        fixed: fix,
+        duration: Date.now() - startTime
+      });
+    }
+  } catch (error) {
+    return apiResponse(res, 500, { error: error.message });
+  }
+});
+
+
+/* ─────────────────────────────────────────────────────────────────────────────
+ * LINT JAVASCRIPT
+ * ───────────────────────────────────────────────────────────────────────────── */
+
+/**
+ * POST /lint-javascript - Lint JS/TS files using ESLint
+ *
+ * Runs eslint on the frontend directory (or a specific path pattern).
+ * With fix=true, auto-fixes safe issues.
+ */
+router.post('/lint-javascript', async (req, res) => {
+  try {
+    const { path_pattern, fix = false, exclude_patterns = [] } = req.body;
+    const target = path_pattern
+      ? resolveSafePath(path_pattern)
+      : `${PROJECT_DIR}/frontend/src`;
+
+    const fixArg = fix ? '--fix' : '';
+    const ignoreArgs = exclude_patterns.map(p => `--ignore-pattern "${p}"`).join(' ');
+    const command = `cd "${PROJECT_DIR}/frontend" && npx eslint ${fixArg} ${ignoreArgs} "${target}" --format json 2>&1`;
+
+    const startTime = Date.now();
+    try {
+      const { stdout } = await execAsync(command, { timeout: 60000, maxBuffer: 1024 * 1024 * 2 });
+      let results = [];
+      try { results = JSON.parse(stdout); } catch { /* not json */ }
+      const errorCount = results.reduce((n, f) => n + f.errorCount, 0);
+      const errors = results.flatMap(f => f.messages.filter(m => m.severity === 2).map(m => `${f.filePath}:${m.line} ${m.message}`));
+      return apiResponse(res, 200, { hasErrors: errorCount > 0, errorCount, errors: errors.slice(0, 20), fixed: fix, duration: Date.now() - startTime });
+    } catch (execError) {
+      const output = execError.stdout || execError.stderr || '';
+      let results = [];
+      try { results = JSON.parse(output); } catch { /* not json */ }
+      const errorCount = results.reduce((n, f) => n + (f.errorCount || 0), 0);
+      const errors = results.flatMap(f => (f.messages || []).filter(m => m.severity === 2).map(m => `${f.filePath}:${m.line} ${m.message}`));
+      return apiResponse(res, 200, {
+        hasErrors: errorCount > 0 || output.includes('error'),
+        errorCount,
+        errors: errors.length ? errors.slice(0, 20) : [output.slice(0, 500)],
+        fixed: fix,
+        duration: Date.now() - startTime
+      });
+    }
+  } catch (error) {
+    return apiResponse(res, 500, { error: error.message });
+  }
+});
 
 
 /* ─────────────────────────────────────────────────────────────────────────────
