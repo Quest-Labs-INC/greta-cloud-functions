@@ -2,10 +2,11 @@ const express = require('express');
 const axios = require('axios');
 const { AgentExecutor } = require('./lib/execution/agentExecutor');
 const { HumanMessage, SystemMessage, ToolMessage, AIMessage } = require('@langchain/core/messages');
-const { createOpenRouterLLM } = require('./lib/llm/openRouterService');
+const { createOpenRouterLLM, fetchTotalRunCost } = require('./lib/llm/openRouterService');
 const { createSelfConfigTools } = require('./lib/tools/selfConfigTools');
 const { getOnboardingPrompt } = require('./lib/tools/onboardingPrompt');
 const { createOrchestrationTools } = require('./lib/tools/agentOrchestrationTools');
+const { SUPPORTED_APPS } = require('./lib/tools/supportedApps');
 
 const app = express();
 app.use(express.json({ limit: '10mb' }));
@@ -29,6 +30,24 @@ const MCP_CACHE_TTL_MS = 10 * 60 * 1000; // 10 minutes
 
 let gatewaySignature = null;
 let signatureExpiry = null;
+
+// Apps catalog — fetched from backend on startup so no rebuild needed when apps change.
+// Falls back to supportedApps.js if the fetch fails.
+let supportedAppsList = SUPPORTED_APPS.slice();
+let appHints = {};
+
+async function loadAppsCatalog() {
+    try {
+        const res = await axios.get(`${BACKEND_GATEWAY_URL}/api/greta/gateway/apps`, { timeout: 5000 });
+        if (res.data.success) {
+            supportedAppsList = res.data.apps;
+            appHints = res.data.hints || {};
+            console.log(`[Container] Loaded apps catalog: ${supportedAppsList.length} apps from backend`);
+        }
+    } catch (e) {
+        console.warn(`[Container] Could not load apps catalog from backend (using fallback): ${e.message}`);
+    }
+}
 
 // Local tool: Create a scheduled task/trigger from chat
 const CREATE_TRIGGER_TOOL = {
@@ -54,12 +73,12 @@ Call this tool after gathering: what to monitor, what condition to check, what a
                 name: { type: 'string', description: 'Short descriptive name (e.g. "PR review alert")' },
                 description: { type: 'string', description: 'Human-readable description of what this task does' },
                 type: { type: 'string', enum: ['SCHEDULED', 'WEBHOOK_RECEIVED'], description: 'SCHEDULED for time-based polling, WEBHOOK_RECEIVED for webhook-triggered' },
-                cronExpression: { type: 'string', description: 'Cron expression for SCHEDULED tasks (e.g. "*/5 * * * *" = every 5 min, "0 9 * * 1" = Monday 9am). REQUIRED for SCHEDULED type.' },
-                timezone: { type: 'string', description: 'Timezone for SCHEDULED tasks (e.g. "America/New_York", "UTC"). Default UTC.' },
-                runPrompt: { type: 'string', description: 'The agentic instruction the agent will follow at runtime. Be detailed and specific: what to fetch, what condition to check, what action to take, and how to avoid duplicate notifications using watch_set/watch_get.' },
+                cronExpression: { type: 'string', description: 'Cron expression. REQUIRED for SCHEDULED type. Examples: "0 9 * * *" = every day 9am, "0 9 * * 1-5" = weekdays 9am, "*/5 * * * *" = every 5 min, "0 9 * * 1" = Monday 9am. Use empty string for WEBHOOK_RECEIVED.' },
+                timezone: { type: 'string', description: 'Timezone for SCHEDULED tasks (e.g. "America/New_York", "Asia/Kolkata", "UTC"). Default UTC.' },
+                runPrompt: { type: 'string', description: 'Natural language instruction the agent will follow at runtime. MUST be plain English — NEVER code, scripts, or pseudocode. Be specific: what to fetch, what condition to check, what action to take. Example: "Fetch today\'s Google Calendar events. Send an email to user@example.com with the subject \'Daily Meeting Reminder\' listing each meeting\'s time and title."' },
                 composioApps: { type: 'array', items: { type: 'string' }, description: 'Apps this task needs. CRITICAL: only list apps from your "Connected apps" section. If an app is not connected, do NOT include it here — the task will still be created and the runPrompt can still reference that app.' },
             },
-            required: ['name', 'type', 'runPrompt'],
+            required: ['name', 'type', 'runPrompt', 'cronExpression'],
         },
     },
 };
@@ -302,23 +321,17 @@ app.post('/chat', async (req, res) => {
 
         // Build base prompt sections used by both Phase 1 and Phase 3
         const memorySection = currentMemory ? `\n\n## What you remember about this user\n${currentMemory}` : '';
-        const appCapabilityHints = {
-            GOOGLECALENDAR: 'create/read/update/delete calendar events',
-            GMAIL:          'send/read/search/draft emails',
-            SLACK:          'send messages, read channels',
-            NOTION:         'read/write pages and databases',
-            GITHUB:         'read repos, issues, PRs, create issues',
-            GOOGLESHEETS:   'read/write spreadsheet data',
-            GOOGLEDRIVE:    'read/list files',
-            HUBSPOT:        'read/write CRM contacts and deals',
-            LINEAR:         'read/write issues and projects',
-        };
         const appsSection = composioApps.length > 0
             ? `\n\n## Connected apps (tools available)\n` +
               composioApps.map(a => {
-                  const hint = appCapabilityHints[a.toUpperCase()];
+                  const hint = appHints[a.toUpperCase()];
                   return hint ? `- ${a}: ${hint}` : `- ${a}`;
               }).join('\n')
+            : '';
+
+        const notConnectedApps = supportedAppsList.filter(a => !composioApps.map(x => x.toUpperCase()).includes(a.toUpperCase()));
+        const connectableSection = notConnectedApps.length > 0
+            ? `\n\n## Apps available to connect (not yet connected)\n${notConnectedApps.join(', ')}\n\nCRITICAL — "connect X" rule: If the user says "connect [app]", "add [app]", "I want to use [app]", or asks to do ANYTHING that requires one of the apps above, output TOOLS_NEEDED:APPNAME on the FIRST line. You MAY add one optional sentence on the next line telling the user what you will do after they connect (especially if they described a specific task). Nothing else.\nFormat:\nTOOLS_NEEDED:APPNAME\n[Optional: one sentence about what happens after connecting]\n\nUse the exact uppercase name from the list. Examples:\n- "connect stripe" → TOOLS_NEEDED:STRIPE\n- "add Stripe for invoice reminders" → TOOLS_NEEDED:STRIPE\\nConnect Stripe below — once authorized, I'll set up your invoice reminder task.\n- "add hubspot" → TOOLS_NEEDED:HUBSPOT\n- "I want to use zoom" → TOOLS_NEEDED:ZOOM\nDo NOT say you cannot connect it. Do NOT explain at length. Just TOOLS_NEEDED:APPNAME and one optional follow-up line.`
             : '';
         const enabledMcpServers = mcpServers.filter(s => s.enabled !== false);
         const mcpSection = mcpEnabled && enabledMcpServers.length > 0
@@ -328,7 +341,7 @@ app.post('/chat', async (req, res) => {
         const baseGuidance = `## How to handle missing information — read this carefully
 Your goal is to take action with minimal back-and-forth.
 
-**When all required info is present:** Act immediately. No confirmation needed.
+**When all required info is present:** Act immediately. No confirmation needed. Exception: for creating scheduled tasks, always confirm with the user first (see task creation rules).
 
 **When optional/inferable info is missing:** Infer a sensible value from context and proceed. Tell the user what you chose in your reply. Do not ask.
 
@@ -358,14 +371,19 @@ You are ${agentName}, from Greta. When asked who you are or what you can do, int
             systemPrompt = `You are ${agentName}.
 
 ${coreInstructions}
-${memorySection}${appsSection}${mcpSection}
+${memorySection}${appsSection}${connectableSection}${mcpSection}
 
 ${identityRule}
 
-## Built-in tool available at all times
-- **get_current_time**: Returns current date/time. Call this FIRST when you need to know "today", "now", or calculate relative dates like "next week", "tomorrow", "next Monday". Critical for calendar queries.
-
 ${baseGuidance}
+
+## CRITICAL — Scheduled tasks / automations
+If the user asks to create a task, automation, reminder, schedule, recurring job, daily digest, weekly report, OR any "monitor X and notify Y" workflow → output TOOLS_NEEDED:CREATE_TRIGGER on the FIRST line. No other text. Do NOT describe what you will do. Do NOT say "I have created". Do NOT confirm anything. Just output TOOLS_NEEDED:CREATE_TRIGGER and nothing else.
+Examples that ALL require TOOLS_NEEDED:CREATE_TRIGGER:
+- "Daily email digest at 9am" → TOOLS_NEEDED:CREATE_TRIGGER
+- "Remind me every Monday" → TOOLS_NEEDED:CREATE_TRIGGER
+- "Send a weekly report" → TOOLS_NEEDED:CREATE_TRIGGER
+- "Monitor my PRs and alert me" → TOOLS_NEEDED:CREATE_TRIGGER
 
 ## How you work
 You run in two phases. In the first phase no tools are available.
@@ -377,7 +395,7 @@ You run in two phases. In the first phase no tools are available.
   CRITICAL: You have access to tools from TWO sources:
 
   1. **Composio apps** (direct integrations with external services):
-     ${composioApps.length > 0 ? composioApps.map(app => `- ${app}: ${appCapabilityHints[app.toUpperCase()] || 'various actions'}`).join('\n     ') : '(none)'}
+     ${composioApps.length > 0 ? composioApps.map(app => `- ${app}: ${appHints[app.toUpperCase()] || 'various actions'}`).join('\n     ') : '(none)'}
 
   2. **MCP servers** (custom tools via Model Context Protocol):
      ${mcpEnabled && enabledMcpServers.length > 0 ? enabledMcpServers.map(s => `- ${s.name}: ${s.description || 'custom tools'}`).join('\n     ') : '(none)'}
@@ -398,9 +416,7 @@ You run in two phases. In the first phase no tools are available.
 - NEVER output TOOLS_NEEDED for greetings, casual chat, or questions you can answer directly.
 - Never ask "Would you like me to...?", "Shall I...?", "Should I...?". Either answer or output TOOLS_NEEDED.
 - CRITICAL: If the user asks for MULTIPLE things from MULTIPLE apps, list ALL the apps needed, separated by commas.
-
-## Creating scheduled tasks
-If the user wants to create a task, automation, reminder, schedule, recurring job, OR any "monitor X and notify Y" workflow → output TOOLS_NEEDED:CREATE_TRIGGER immediately. NEVER explain limitations, hedge, or say it's impossible. Everything is achievable via scheduled polling. Just ask for missing details and create it.
+- CRITICAL — Follow-up actions: If the conversation shows you were working with a tool (drafting email, fetching data, etc.) and the user now says "send it", "do it", "yes", "go ahead", "please send", "submit", "proceed", "send", "confirm" or any similar confirmation — output TOOLS_NEEDED for the relevant app immediately. NEVER respond with text claiming the action is done. The action has NOT happened until the tool is called.
 
 ${responseStyle}`;
 
@@ -418,9 +434,10 @@ ${identityRule}
 ${baseGuidance}
 
 ## Tool use rules
-- NEVER claim an action is done in text if you haven't called the tool for it. "I have drafted an email" without calling GMAIL_CREATE_EMAIL_DRAFT is a lie. If you say it happened, it must have happened via a tool call.
+- NEVER claim an action is done in text if you haven't called the tool for it. "I have sent an email" without calling GMAIL_SEND_EMAIL is a lie. "I drafted it" without calling GMAIL_CREATE_EMAIL_DRAFT is a lie. If you say it happened, a tool call for it MUST exist in this conversation.
+- NEVER say "I've sent", "I've created", "I've deleted", "Done!", "Sent!" unless the corresponding tool was called and returned successfully in THIS response. No exceptions.
 - When the user asks for multiple actions (email + calendar, message + event, etc.), call ALL required tools. You can include multiple tool calls in a single response — do it.
-- Call tools silently. Do not narrate what you are about to do before calling.
+- Call tools silently. Do not narrate what you are about to do before calling. Exception: for create_trigger, present a summary and ask for confirmation first (see RULE 6 below).
 - Use the exact tool name as provided. Never invent tool names.
 - After ALL tools in a step return results, write a single summary response to the user covering everything that was done.
 - After a tool returns, use the result to answer. Do not re-call the same tool unless the result was an error.
@@ -438,20 +455,29 @@ Use the **create_trigger** tool when the user wants to create a task, automation
 If create_trigger returns an error, diagnose and retry with corrected parameters in the SAME response. Do NOT tell the user "I encountered an error and cannot proceed." That is unacceptable. Common fixes: remove apps from composioApps that aren't in your connected apps list, fix the cronExpression format, ensure runPrompt is non-empty.
 
 **RULE 3 — The runPrompt is fully agentic.**
-When the trigger fires, this agent runs with ALL connected tools (GitHub MCP, Gmail, Slack, etc.). The runPrompt can: fetch live GitHub data, check review status, send conditional emails, track state with watch_set/watch_get to avoid duplicate alerts. Write it in detail.
+When the trigger fires, this agent runs with ALL connected tools (GitHub MCP, Gmail, Slack, etc.). The runPrompt MUST be plain English natural language — NEVER code, scripts, or pseudocode. Write it as a detailed instruction: what to fetch, what condition to check, what action to take.
 
 **RULE 4 — Use a fixed dedup key format.**
 In the runPrompt, always specify the exact watch key string, e.g. watch_get("notified_pr_{owner}_{repo}_{number}"). This prevents the agent from inventing different key names across runs.
 
-Before calling create_trigger: ask only truly missing info in ONE message. Then call the tool. After success, confirm to the user.
+**RULE 5 — Missing integration = connect it, not a workaround.**
+If the user asks for a task that needs an integration not in your connected apps list (e.g. they ask about Stripe but STRIPE is not connected), NEVER suggest workarounds like "export to Google Sheets" or "I cannot do this". Instead respond EXACTLY like this:
+"To set this up, you'll need to connect **[App Name]** to your agent. Click **Configure** (top right) → Integrations → connect [App Name]. Once connected, come back and I'll create this task for you immediately."
+Do NOT say it's impossible. Do NOT suggest alternatives. Just tell them to connect it.
+
+**RULE 6 — Always confirm before creating.**
+Before calling create_trigger, write a one-sentence summary of what you will create (name, schedule, what it does) and ask "Shall I set this up?" in a single short message. Do NOT call the tool yet — wait for the user to confirm.
+EXCEPTION: If the conversation history shows you already presented this summary and asked for confirmation, and the user's latest message is a confirmation ("yes", "go ahead", "create it", "do it", "sure", "ok", "please", "yeah") — then call create_trigger immediately without asking again.
 
 ${responseStyle}`;
         }
 
-        // Phase 1 uses NO history — prevents hallucinating action completions based on
-        // previous assistant messages (e.g. "I have drafted an email" without any tool call)
+        // Phase 1 includes last 4 messages (2 turns) so follow-up actions like
+        // "send it", "go ahead", "yes please" are understood in context.
+        // Without history, "Please send" looks conversational and never loads tools.
         const phase1Messages = [
             { role: 'system', content: systemPrompt },
+            ...history.slice(-4).map(m => ({ role: m.role, content: m.content })),
             { role: 'user', content: message }
         ];
 
@@ -549,6 +575,19 @@ ${responseStyle}`;
 
         let finalText = '';
         let toolsExecuted = false;
+        const generationIds = [];
+        // Token fallback — used when OpenRouter generation API returns null
+        const AGENT_MODEL_NAME = process.env.AGENT_MODEL || 'google/gemini-2.5-flash';
+        let totalPromptTokens = 0, totalCompletionTokens = 0;
+
+        function trackCall(msg) {
+            if (!msg) return;
+            if (msg.id) generationIds.push(msg.id);
+            const u = msg.usage_metadata || msg.response_metadata?.tokenUsage || msg.response_metadata?.usage;
+            if (!u) return;
+            totalPromptTokens     += u.input_tokens  || u.promptTokens  || u.prompt_tokens  || 0;
+            totalCompletionTokens += u.output_tokens || u.completionTokens || u.completion_tokens || 0;
+        }
 
         if (isOnboarding) {
             // ── Onboarding: LangChain path unchanged ─────────────────────────────
@@ -589,10 +628,14 @@ ${responseStyle}`;
                 p1msg = await llm.invoke(phase1Messages);
             } catch (e) { console.error('[Chat] Phase 1 failed:', e.message); }
 
+            trackCall(p1msg);
             const p1text = p1msg ? extractText(p1msg).trim() : '';
             console.log(`[Chat] Phase 1 — "${p1text.slice(0, 100)}"`);
 
-            const sentinelMatch = p1text.match(/^TOOLS_NEEDED(?::([A-Z0-9_,]+))?$/i);
+            // Parse sentinel from the first line only; any remaining lines = context message
+            const p1lines = p1text.split('\n');
+            const sentinelMatch = p1lines[0].trim().match(/^TOOLS_NEEDED(?::([A-Z0-9_,]+))?$/i);
+            const sentinelContext = p1lines.slice(1).join('\n').trim();
             if (sentinelMatch) {
                 if (sentinelMatch[1]) {
                     const parsed = sentinelMatch[1].split(',').map(s => s.trim().toUpperCase()).filter(Boolean);
@@ -600,7 +643,24 @@ ${responseStyle}`;
                     needsMcp = parsed.includes('MCP');
                     needsCreateTrigger = parsed.includes('CREATE_TRIGGER');
                 }
-                console.log(`[Chat] Phase 1 sentinel — apps: [${requestedApps.join(',')}], mcp: ${needsMcp}, createTrigger: ${needsCreateTrigger}`);
+                console.log(`[Chat] Phase 1 sentinel — apps: [${requestedApps.join(',')}], mcp: ${needsMcp}, createTrigger: ${needsCreateTrigger}, context: "${sentinelContext.slice(0,80)}"`);
+
+                // Check if any requested apps are not yet connected — show connect card instead of failing
+                const unconnected = requestedApps.filter(a => !composioApps.map(x => x.toUpperCase()).includes(a));
+                if (unconnected.length > 0) {
+                    const integrationRequests = unconnected.map(app => ({
+                        app,
+                        reason: `Connect ${app} to let your agent use it`,
+                        status: 'pending',
+                    }));
+                    const appNames = unconnected.map(a => a.charAt(0) + a.slice(1).toLowerCase()).join(', ');
+                    const fallbackText = `Connecting ${appNames} — use the button${unconnected.length > 1 ? 's' : ''} below to authorize.`;
+                    const responseText = sentinelContext || fallbackText;
+                    emit({ type: 'chunk', content: responseText });
+                    emit({ type: 'done', response: responseText, conversationId: null, pendingIntegrations: integrationRequests });
+                    console.log(`[Chat] Emitted pendingIntegrations for: [${unconnected.join(',')}]`);
+                    return res.end();
+                }
                 // CRITICAL: Do NOT set finalText here! We need to load tools and run Phase 3.
             } else if (p1text) {
                 // Direct answer — re-run with full history for context-aware response
@@ -608,6 +668,7 @@ ${responseStyle}`;
                 console.log(`[Chat] Phase 1 direct — re-running with history for context`);
                 try {
                     const histMsg = await llm.invoke(messagesWithHistory);
+                    trackCall(histMsg);
                     finalText = extractText(histMsg).trim();
                 } catch (e) {
                     finalText = p1text;
@@ -726,6 +787,7 @@ ${responseStyle}`;
                         break;
                     }
 
+                    trackCall(msg);
                     const text = extractText(msg).trim();
                     // LangChain tool call format: { name, args, id } (not function.name/arguments)
                     const toolCalls = msg.tool_calls || [];
@@ -774,6 +836,7 @@ ${responseStyle}`;
                                 { role: 'system', content: 'Summarize these tool results as a clear helpful response. Be direct, no filler.' },
                                 { role: 'user', content: `User said: "${message}"\n\nTool results:\n${toolResultsText}` }
                             ]);
+                            trackCall(synthMsg);
                             finalText = extractText(synthMsg).trim();
                         } catch (e) { console.error('[Chat] Synthesis failed:', e.message); }
                     }
@@ -793,6 +856,7 @@ ${responseStyle}`;
                     { role: 'system', content: safeFallbackPrompt },
                     { role: 'user', content: message }
                 ]);
+                trackCall(fallbackMsg);
                 finalText = extractText(fallbackMsg).trim();
                 console.log(`[Chat] Fallback response: "${finalText.slice(0, 100)}"`);
             } catch (e) {
@@ -807,15 +871,26 @@ ${responseStyle}`;
             .replace(/```tool_code[\s\S]*?```/g, '')
             .trim();
 
+        // Fetch exact USD cost from OpenRouter before sending done — runs in background
+        // after response text is already streamed, so user sees no delay.
+        const actualCostUSD = await fetchTotalRunCost(generationIds);
+        console.log(`[Chat] Cost: $${actualCostUSD} (OpenRouter) | tokens: ${totalPromptTokens}in/${totalCompletionTokens}out | genIds: ${generationIds.length}`);
+
         console.log(`[Chat] Sending done — cancelled:${cancelled} finalText:"${cleanText.slice(0, 100)}" (${cleanText.length} chars)`);
         if (cleanText) emit({ type: 'chunk', content: cleanText });
-        emit({ type: 'done', response: cleanText, conversationId });
+        emit({
+            type: 'done',
+            response: cleanText,
+            conversationId,
+            actualCostUSD,
+            tokenUsage: { promptTokens: totalPromptTokens, completionTokens: totalCompletionTokens, model: AGENT_MODEL_NAME },
+        });
         res.end();
 
-        // Consolidate memory every 10 messages — not every turn.
+        // Consolidate memory every 4 turns so facts are captured early in short conversations.
         // history.length is the number of prior messages before this turn.
         // Adding 2 (user + assistant) gives total turns after this message.
-        if (!isOnboarding && (history.length + 2) % 10 === 0) {
+        if (!isOnboarding && (history.length + 2) % 8 === 0) {
             const conversationTurns = [
                 ...history.slice(-12),
                 { role: 'user', content: message },
@@ -837,6 +912,9 @@ async function start() {
         console.log(`[Container] Agent ${AGENT_ID} ready on port ${PORT}`);
         console.log(`[Container] Endpoints: GET /health  POST /chat  POST /execute`);
     });
+
+    // Load apps catalog from backend (non-blocking — falls back to local list if it fails)
+    loadAppsCatalog();
 
     try {
         await initializeAgent();

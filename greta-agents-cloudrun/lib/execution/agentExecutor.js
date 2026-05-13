@@ -1,5 +1,5 @@
 const axios = require('axios');
-const { createOpenRouterLLM } = require('../llm/openRouterService');
+const { createOpenRouterLLM, fetchTotalRunCost } = require('../llm/openRouterService');
 const { MongoClient } = require('mongodb');
 const { createMongoQueryTool } = require('../tools/mongoQueryTool');
 const { createOrchestrationTools } = require('../tools/agentOrchestrationTools');
@@ -91,11 +91,11 @@ class AgentExecutor {
             console.log(`[AgentExecutor] ${toolDefs.length} tools ready (incl. ${mcpToolDefs.length} MCP, ${orchestration.toolDefs.length} orchestration)`);
 
             const systemPrompt = this.buildSystemPrompt(agent, { projectMongoUrl });
-            const output = await this.runAgentLoop({ systemPrompt, userPrompt, toolDefs, localTools });
+            const { output, actualCostUSD, tokenUsage } = await this.runAgentLoop({ systemPrompt, userPrompt, toolDefs, localTools });
 
             const executionTime = Date.now() - startTime;
-            console.log(`[AgentExecutor] ✅ Completed in ${executionTime}ms`);
-            return { output, executionTime, success: true };
+            console.log(`[AgentExecutor] ✅ Completed in ${executionTime}ms — cost: $${actualCostUSD}`);
+            return { output, executionTime, success: true, actualCostUSD, tokenUsage };
 
         } catch (error) {
             const executionTime = Date.now() - startTime;
@@ -159,6 +159,18 @@ class AgentExecutor {
         const llm = createOpenRouterLLM({ temperature: 0 });
         const allTools = [GET_CURRENT_TIME_TOOL, ...toolDefs];
         const llmWithTools = allTools.length > 0 ? llm.bindTools(allTools) : llm;
+        const AGENT_MODEL_NAME = process.env.AGENT_MODEL || 'google/gemini-2.5-flash';
+        const generationIds = [];
+        // Token fallback — used when OpenRouter generation API returns null
+        let totalPromptTokens = 0, totalCompletionTokens = 0;
+        function trackCall(msg) {
+            if (!msg) return;
+            if (msg.id) generationIds.push(msg.id);
+            const u = msg.usage_metadata || msg.response_metadata?.tokenUsage || msg.response_metadata?.usage;
+            if (!u) return;
+            totalPromptTokens     += u.input_tokens  || u.promptTokens  || u.prompt_tokens  || 0;
+            totalCompletionTokens += u.output_tokens || u.completionTokens || u.completion_tokens || 0;
+        }
 
         const messages = [
             new SystemMessage(systemPrompt),
@@ -203,6 +215,7 @@ class AgentExecutor {
 
         for (let step = 0; step < 10; step++) {
             const msg = await llmWithTools.invoke(messages);
+            trackCall(msg);
             messages.push(msg);
 
             const text = typeof msg.content === 'string' ? msg.content : '';
@@ -220,7 +233,10 @@ class AgentExecutor {
                     continue;
                 }
 
-                return text || 'Task completed.';
+                const actualCostUSD = await fetchTotalRunCost(generationIds);
+                const tokenUsage = { promptTokens: totalPromptTokens, completionTokens: totalCompletionTokens, model: AGENT_MODEL_NAME };
+                console.log(`[AgentExecutor] Cost: $${actualCostUSD} (OpenRouter) | tokens: ${totalPromptTokens}in/${totalCompletionTokens}out | genIds: ${generationIds.length}`);
+                return { output: text || 'Task completed.', actualCostUSD, tokenUsage };
             }
 
             console.log(`[AgentExecutor] Executing:`, toolCalls.map(t => t.name).join(', '));
@@ -244,7 +260,10 @@ class AgentExecutor {
             toolsCalledCount++;
         }
 
-        return 'Task completed.';
+        const actualCostUSD = await fetchTotalRunCost(generationIds);
+        const tokenUsage = { promptTokens: totalPromptTokens, completionTokens: totalCompletionTokens, model: AGENT_MODEL_NAME };
+        console.log(`[AgentExecutor] Cost: $${actualCostUSD} (OpenRouter) | tokens: ${totalPromptTokens}in/${totalCompletionTokens}out | genIds: ${generationIds.length}`);
+        return { output: 'Task completed.', actualCostUSD, tokenUsage };
     }
 
     buildPrompt(trigger, payload, headers) {
