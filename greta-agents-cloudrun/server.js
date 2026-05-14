@@ -21,8 +21,12 @@ const PORT = process.env.PORT || 8080;
 console.log(`[Container] Starting container for Agent ID: ${AGENT_ID}`);
 console.log(`[Container] Backend Gateway: ${BACKEND_GATEWAY_URL}`);
 
-let toolsCache = null;
-let toolsCacheKey = null;
+// CACHE STRATEGY CHANGE:
+// - OLD: Cache by apps only → same tools for "send email" and "search emails"
+// - NEW: Cache by apps + useCase hash → different tools for different requests
+// - TTL: 5 minutes (tools can change as conversation evolves)
+const toolsCacheMap = new Map(); // key: "GMAIL|SLACK|abc123" → { tools, expiresAt }
+const TOOLS_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
 
 let mcpToolsCache = null;
 let mcpToolsCacheTime = null;
@@ -56,17 +60,31 @@ const CREATE_TRIGGER_TOOL = {
         name: 'create_trigger',
         description: `Create a scheduled task or webhook trigger for this agent.
 
-CRITICAL: The runPrompt is NOT a static message — it is an AGENTIC instruction. When the trigger fires, this agent runs autonomously with ALL connected tools (GitHub, Gmail, Slack, etc.) and executes the runPrompt as a full AI task. This means the runPrompt CAN:
-- Fetch live data from GitHub (list PRs, check review status, filter by author, check age)
-- Send conditional emails or Slack messages based on what it finds
-- Track "already notified" state across runs using watch_set/watch_get (prevents duplicate alerts)
-- Make decisions: "if PR has no reviews after 5 minutes, send email; otherwise skip"
+CRITICAL: The runPrompt is NOT a static message — it is a FULL AGENTIC INSTRUCTION. When the trigger fires, this agent runs autonomously with ALL connected tools and executes the runPrompt as a complete AI task.
 
-ANY monitoring + conditional notification workflow IS achievable as a SCHEDULED trigger that polls on a schedule. For example:
-- "Every 5 min: check GitHub for PRs by DhaanuI with no reviews older than 5 min. For each not yet notified (check watch_get), send email to x@y.com and watch_set the PR as notified."
-- "Every 30 min: check Gmail unread > 24h, send Slack digest"
+## Two patterns for the runPrompt:
 
-Call this tool after gathering: what to monitor, what condition to check, what action to take, how often to run.`,
+### Pattern 1 — Simple polling (one-shot per run)
+Use when: each run is independent. Check condition → act → done.
+Example: "Every 30 min: check Gmail unread > 24h, send Slack digest"
+
+### Pattern 2 — Async multi-turn workflow (use create_task for "wait" steps)
+Use when: the workflow spans multiple time windows (e.g. send email → wait for reply → book meeting).
+The agent has a built-in create_task tool to schedule a follow-up execution of itself.
+
+EXAMPLE — "email negative tone → send meeting request → wait for reply → book calendar":
+runPrompt: "Check Gmail for new emails from user@example.com (only emails received after the [Run context] timestamp). For each new email: analyze the tone. If negative: (a) check watch_get('meeting_req_'+messageId) — if exists:true, skip. (b) Send a reply asking for their availability. (c) watch_set('meeting_req_'+messageId, the threadId, ttlHours=168). (d) create_task with instruction 'Check Gmail thread [threadId] for a reply from user@example.com. If they gave a time: reply confirming, then create a Google Calendar event. If still no reply: create_task again to check in 30 minutes.' and delayMinutes=30, context={threadId, messageId}."
+
+EXAMPLE — "PR review alert after 2 hours":
+runPrompt: "Check GitHub for PRs where I am a requested reviewer (only PRs opened after [Run context] timestamp). For each new PR: check watch_get('pr_alerted_'+prNumber) — if exists:true skip. Otherwise: create_task with instruction 'Check if PR #[number] at [url] still needs review. If review is still pending: send email to [owner] with the PR link. If already reviewed: done.' and delayMinutes=120, context={prNumber, prUrl, owner}. Then watch_set('pr_alerted_'+prNumber, true, ttlHours=48)."
+
+KEY RULES:
+- Use create_task (not watch_get polling) for any "wait N hours/minutes then check" workflow
+- Use watch_get/watch_set only for dedup: "have I already acted on this item?"
+- Always reference item IDs (message ID, thread ID, PR number) in watch keys so they're unique
+- The [Run context] timestamp is automatically injected — reference it as "after [Run context] timestamp" to filter to new items only
+
+Call this tool after gathering: what to monitor, what condition triggers action, what action to take, how often to poll.`,
         parameters: {
             type: 'object',
             properties: {
@@ -81,6 +99,31 @@ Call this tool after gathering: what to monitor, what condition to check, what a
             required: ['name', 'type', 'runPrompt', 'cronExpression'],
         },
     },
+};
+
+const COMPOSIO_SEARCH_TOOL_DEF = {
+    type: 'function',
+    function: {
+        name: 'COMPOSIO_SEARCH_TOOLS',
+        description: 'Find additional tools not in your current tool set. Use when you need a specific action that is not available in the tools you already have. Composio AI searches semantically and returns matching tool schemas — you can call them immediately after.',
+        parameters: {
+            type: 'object',
+            properties: {
+                queries: {
+                    type: 'array',
+                    description: 'One entry per action you need to find.',
+                    items: {
+                        type: 'object',
+                        properties: {
+                            use_case: { type: 'string', description: 'What you want to do, e.g. "list all repositories for the authenticated user"' }
+                        },
+                        required: ['use_case']
+                    }
+                }
+            },
+            required: ['queries']
+        }
+    }
 };
 
 // Local tool: Always available to help agent understand current date/time
@@ -690,40 +733,8 @@ ${responseStyle}`;
 
                 console.log(`[Chat] Loading tools for: [${appsToLoad.join(', ')}]${shouldLoadMcp ? ' + MCP' : ''}`);
 
-                if (appsToLoad.length > 0) {
-                    // Per-app cache: key is the sorted list of apps actually being loaded
-                    const cacheKey = appsToLoad.slice().sort().join(',');
-                    if (toolsCache && toolsCacheKey === cacheKey) {
-                        toolDefs.push(...toolsCache);
-                        console.log(`[Chat] Using cached Composio tools (${toolsCache.length})`);
-                    } else {
-                        try {
-                            const composioDefs = [];
-                            const toolResults = await Promise.allSettled(
-                                appsToLoad.map(app =>
-                                    axios.post(
-                                        `${BACKEND_GATEWAY_URL}/api/greta/gateway/composio/tools`,
-                                        { agentId: AGENT_ID, userId, apps: [app] },
-                                        { headers: { 'x-gateway-signature': gatewaySignature } }
-                                    )
-                                )
-                            );
-                            for (let i = 0; i < toolResults.length; i++) {
-                                if (toolResults[i].status === 'fulfilled' && toolResults[i].value.data.success) {
-                                    composioDefs.push(...toolResults[i].value.data.tools);
-                                    console.log(`[Chat] Loaded ${toolResults[i].value.data.tools.length} tools for ${appsToLoad[i]}`);
-                                } else {
-                                    console.error(`[Chat] Failed tools for ${appsToLoad[i]}:`, toolResults[i].reason?.message);
-                                }
-                            }
-                            toolsCache = composioDefs;
-                            toolsCacheKey = cacheKey;
-                            toolDefs.push(...composioDefs);
-                        } catch (e) {
-                            console.error('[Chat] Failed to load Composio tools:', e.message);
-                        }
-                    }
-                }
+                // Pure on-demand: Composio tools are discovered at runtime via COMPOSIO_SEARCH_TOOLS.
+                // No pre-load — the LLM calls COMPOSIO_SEARCH_TOOLS first, then uses the returned schemas.
 
                 if (shouldLoadMcp) {
                     const mcpCacheValid = mcpToolsCache && mcpToolsCacheTime && (Date.now() - mcpToolsCacheTime < MCP_CACHE_TTL_MS);
@@ -754,6 +765,10 @@ ${responseStyle}`;
 
                 // Add create_trigger — lets agent create scheduled tasks from chat
                 toolDefs.push(CREATE_TRIGGER_TOOL);
+
+                // COMPOSIO_SEARCH_TOOLS: AI search for tools not in the pre-loaded set
+                // Uses session.search() (real AI) not composio.tools.get({ search }) (keyword filter)
+                toolDefs.push(COMPOSIO_SEARCH_TOOL_DEF);
 
                 // Add self-orchestration tools — watch_set/get/clear + create_task
                 const orchestration = createOrchestrationTools({
@@ -809,12 +824,37 @@ ${responseStyle}`;
                         emit({ type: 'status', content: toolStatusLabel(tc.name) });
                         try {
                             let result;
-                            // Handle local tool: get_current_time
                             if (tc.name === 'get_current_time') {
                                 result = executeGetCurrentTime();
                                 console.log(`[Chat] get_current_time result: ${result}`);
+                            } else if (tc.name === 'COMPOSIO_SEARCH_TOOLS') {
+                                // session.search() → slugs → schemas → inject into live tool set
+                                const searchRes = await axios.post(
+                                    `${BACKEND_GATEWAY_URL}/api/greta/gateway/composio/meta/search`,
+                                    { agentId: AGENT_ID, userId, queries: tc.args?.queries || [] },
+                                    { headers: { 'x-gateway-signature': gatewaySignature } }
+                                );
+                                const newSchemas = searchRes.data.success ? (searchRes.data.tools || []) : [];
+                                const added = [];
+                                for (const schema of newSchemas) {
+                                    const tName = schema.function?.name || schema.name;
+                                    if (tName && !toolDefs.find(d => (d.function?.name || d.name) === tName)) {
+                                        toolDefs.push(schema);
+                                        added.push(tName);
+                                    }
+                                }
+                                if (added.length > 0) {
+                                    llmWithTools = llm.bindTools(toolDefs);
+                                    console.log(`[Chat] COMPOSIO_SEARCH_TOOLS injected ${added.length} tools: ${added.slice(0, 5).join(', ')}`);
+                                }
+                                result = JSON.stringify({
+                                    found: newSchemas.length,
+                                    tools: newSchemas.map(t => t.function?.name || t.name),
+                                    message: newSchemas.length > 0
+                                        ? `Found ${newSchemas.length} tools. They are now available — call them directly.`
+                                        : 'No tools found. Try using the tools already in your tool set.'
+                                });
                             } else {
-                                // External tool: Composio or MCP
                                 result = await executeExternalTool(tc);
                             }
                             phase3Messages.push({ role: 'tool', tool_call_id: tc.id, content: result });

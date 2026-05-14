@@ -14,6 +14,34 @@ const GET_CURRENT_TIME_TOOL = {
     },
 };
 
+// COMPOSIO_SEARCH_TOOLS: AI-powered semantic search via Composio's session.search() API.
+// Use when the pre-loaded tools don't include what you need (e.g. a specific GitHub action
+// beyond the top-50 pre-loaded). Returns additional tool schemas injected into the active tool set.
+const COMPOSIO_SEARCH_TOOL_DEF = {
+    type: 'function',
+    function: {
+        name: 'COMPOSIO_SEARCH_TOOLS',
+        description: 'Find additional tools not in your current tool set. Use when you need a specific action that is not available in the tools you already have. Composio AI searches semantically and returns the matching tool schemas — you can call them immediately after.',
+        parameters: {
+            type: 'object',
+            properties: {
+                queries: {
+                    type: 'array',
+                    description: 'One entry per action you need to find.',
+                    items: {
+                        type: 'object',
+                        properties: {
+                            use_case: { type: 'string', description: 'What you want to do, e.g. "list all repositories for the authenticated user"' }
+                        },
+                        required: ['use_case']
+                    }
+                }
+            },
+            required: ['queries']
+        }
+    }
+};
+
 function executeGetCurrentTime() {
     const now = new Date();
     return JSON.stringify({
@@ -23,8 +51,9 @@ function executeGetCurrentTime() {
     });
 }
 
-let triggerToolsCache = null;
-let triggerToolsCacheKey = null;
+const triggerToolsCacheMap = new Map();
+const TRIGGER_TOOLS_CACHE_TTL_MS = 30 * 60 * 1000;
+const AGENT_CONFIG_TTL_MS = 5 * 60 * 1000; // 5 minutes — picks up new integrations without restart
 
 let db = null;
 async function getMongoConnection() {
@@ -62,7 +91,8 @@ class AgentExecutor {
             // Prefer trigger-level app list (only apps this task actually needs).
             // Fall back to agent-level list for older triggers that predate this field.
             const appsToLoad = (trigger.composioApps?.length > 0) ? trigger.composioApps : (agent.composioApps || []);
-            const cachedToolDefs = await this.loadTools(appsToLoad);
+            // Pure on-demand: no Composio pre-load. COMPOSIO_SEARCH_TOOLS is injected into
+            // the tool list so the LLM discovers and loads tool schemas at runtime.
             const mcpToolDefs = await this.loadMCPTools(agent);
 
             // Self-orchestration tools — always available for trigger execution
@@ -73,8 +103,7 @@ class AgentExecutor {
                 getSignature: () => this.gatewaySignature,
             });
 
-            // Build final tool list without mutating the cache
-            const toolDefs = [...cachedToolDefs, ...mcpToolDefs, ...orchestration.toolDefs];
+            const toolDefs = [...mcpToolDefs, ...orchestration.toolDefs];
 
             const localTools = new Map();
             for (const td of orchestration.toolDefs) {
@@ -90,7 +119,8 @@ class AgentExecutor {
 
             console.log(`[AgentExecutor] ${toolDefs.length} tools ready (incl. ${mcpToolDefs.length} MCP, ${orchestration.toolDefs.length} orchestration)`);
 
-            const systemPrompt = this.buildSystemPrompt(agent, { projectMongoUrl });
+            // Pass appsToLoad so system prompt reflects the actual tools available this run
+            const systemPrompt = this.buildSystemPrompt(agent, { projectMongoUrl, appsToLoad });
             const { output, actualCostUSD, tokenUsage } = await this.runAgentLoop({ systemPrompt, userPrompt, toolDefs, localTools });
 
             const executionTime = Date.now() - startTime;
@@ -125,9 +155,12 @@ class AgentExecutor {
         if (!composioApps.length) return [];
 
         const cacheKey = composioApps.slice().sort().join(',');
-        if (triggerToolsCache && triggerToolsCacheKey === cacheKey) {
-            console.log(`[AgentExecutor] Using cached tools (${triggerToolsCache.length})`);
-            return [...triggerToolsCache];
+        const cached = triggerToolsCacheMap.get(cacheKey);
+        const now = Date.now();
+
+        if (cached && now < cached.expiresAt) {
+            console.log(`[AgentExecutor] Using cached tools (${cached.tools.length}) for [${cacheKey}]`);
+            return [...cached.tools];
         }
 
         const results = await Promise.allSettled(
@@ -150,15 +183,20 @@ class AgentExecutor {
             }
         }
 
-        triggerToolsCache = toolDefs;
-        triggerToolsCacheKey = cacheKey;
+        triggerToolsCacheMap.set(cacheKey, { tools: toolDefs, expiresAt: now + TRIGGER_TOOLS_CACHE_TTL_MS });
+        if (triggerToolsCacheMap.size > 10) {
+            const oldest = [...triggerToolsCacheMap.entries()].sort((a, b) => a[1].expiresAt - b[1].expiresAt)[0];
+            triggerToolsCacheMap.delete(oldest[0]);
+        }
+
         return toolDefs;
     }
 
     async runAgentLoop({ systemPrompt, userPrompt, toolDefs, localTools = new Map() }) {
         const llm = createOpenRouterLLM({ temperature: 0 });
-        const allTools = [GET_CURRENT_TIME_TOOL, ...toolDefs];
-        const llmWithTools = allTools.length > 0 ? llm.bindTools(allTools) : llm;
+        // Mutable: COMPOSIO_SEARCH_TOOLS injects discovered schemas at runtime and rebinds
+        let dynamicTools = [GET_CURRENT_TIME_TOOL, ...toolDefs, COMPOSIO_SEARCH_TOOL_DEF];
+        let llmWithTools = dynamicTools.length > 0 ? llm.bindTools(dynamicTools) : llm;
         const AGENT_MODEL_NAME = process.env.AGENT_MODEL || 'google/gemini-2.5-flash';
         const generationIds = [];
         // Token fallback — used when OpenRouter generation API returns null
@@ -183,6 +221,38 @@ class AgentExecutor {
             const args = tc.args || {};
 
             if (name === 'get_current_time') return executeGetCurrentTime();
+
+            // COMPOSIO_SEARCH_TOOLS: session.search() → slugs → load schemas → inject into tool set
+            if (name === 'COMPOSIO_SEARCH_TOOLS') {
+                try {
+                    const res = await axios.post(
+                        `${this.backendGatewayUrl}/api/greta/gateway/composio/meta/search`,
+                        { agentId: this.agentId, userId: this.userId, queries: args.queries || [] },
+                        { headers: { 'x-gateway-signature': this.gatewaySignature } }
+                    );
+                    if (!res.data.success) return `Search failed: ${res.data.error}`;
+                    const newSchemas = res.data.tools || [];
+                    const added = [];
+                    for (const schema of newSchemas) {
+                        const toolName = schema.function?.name || schema.name;
+                        if (toolName && !dynamicTools.find(d => (d.function?.name || d.name) === toolName)) {
+                            dynamicTools.push(schema);
+                            added.push(toolName);
+                        }
+                    }
+                    if (added.length > 0) {
+                        llmWithTools = llm.bindTools(dynamicTools);
+                        console.log(`[AgentExecutor] COMPOSIO_SEARCH_TOOLS injected ${added.length} tools: ${added.slice(0, 5).join(', ')}`);
+                    }
+                    return JSON.stringify({
+                        found: newSchemas.length,
+                        tools: newSchemas.map(t => t.function?.name || t.name),
+                        message: newSchemas.length > 0
+                            ? `Found ${newSchemas.length} tools. They are now available — call them directly by name.`
+                            : 'No tools found for this query. Try the tools already in your tool set.'
+                    });
+                } catch (e) { return `COMPOSIO_SEARCH_TOOLS failed: ${e.message}`; }
+            }
 
             if (localTools.has(name)) {
                 try { return JSON.stringify(await localTools.get(name)(args)); }
@@ -210,10 +280,13 @@ class AgentExecutor {
             } catch (e) { return `Tool failed: ${e.message}`; }
         };
 
-        let nudgedOnce = false;
+        let nudgeCount = 0;
         let toolsCalledCount = 0;
 
-        for (let step = 0; step < 10; step++) {
+        // 20 steps for trigger execution — complex multi-step workflows (e.g. check email
+        // thread state → decide action → send reply → update watch state → schedule follow-up)
+        // routinely need 12-15 steps when processing multiple items.
+        for (let step = 0; step < 20; step++) {
             const msg = await llmWithTools.invoke(messages);
             trackCall(msg);
             messages.push(msg);
@@ -226,9 +299,11 @@ class AgentExecutor {
                 const isFailureReport = /payload too large|tool response.*too large|413.*payload/i.test(text);
                 if (isFailureReport) throw new Error(text);
 
-                if (!nudgedOnce && toolsCalledCount > 0 && step < 9) {
-                    nudgedOnce = true;
-                    console.log(`[AgentExecutor] Step ${step + 1} — LLM stopped mid-task, nudging to continue`);
+                // Allow up to 3 nudges — complex workflows (check new emails + check all pending
+                // reply threads + schedule calendar) can legitimately pause multiple times.
+                if (nudgeCount < 3 && toolsCalledCount > 0 && step < 19) {
+                    nudgeCount++;
+                    console.log(`[AgentExecutor] Step ${step + 1} — LLM paused mid-task, nudging (${nudgeCount}/3)`);
                     messages.push(new HumanMessage('Continue with any remaining tasks.'));
                     continue;
                 }
@@ -268,8 +343,16 @@ class AgentExecutor {
 
     buildPrompt(trigger, payload, headers) {
         switch (trigger.type) {
-            case 'SCHEDULED':
-                return trigger.schedule?.runPrompt || `Execute scheduled task: ${trigger.name}`;
+            case 'SCHEDULED': {
+                const basePrompt = trigger.schedule?.runPrompt || `Execute scheduled task: ${trigger.name}`;
+                // Inject the last-run timestamp so the agent knows what counts as "new".
+                // Without this, every run would re-process all historical emails/records.
+                const lastRunAt = trigger.lastRunAt ? new Date(trigger.lastRunAt) : null;
+                const sinceNote = lastRunAt
+                    ? `\n\n[Run context: This trigger last completed at ${lastRunAt.toISOString()}. Only process emails, messages, events, or records created/received AFTER that timestamp. Use this as your "since" filter to avoid reprocessing data from previous runs.]`
+                    : `\n\n[Run context: This is the first run of this trigger. Process all relevant recent data (e.g. last 24 hours or last 7 days as appropriate for the task).]`;
+                return basePrompt + sinceNote;
+            }
 
             case 'DB_EVENT': {
                 const template = trigger.dbEvent?.runPromptTemplate || `New {{event}} in {{collection}}:\n{{record}}`;
@@ -298,19 +381,32 @@ class AgentExecutor {
                     .replace(/\{\{headers\}\}/g, JSON.stringify(headers, null, 2));
             }
 
-            case 'FOLLOWUP':
-                // Agent-created delayed task — instruction is the exact thing to do now
-                return `${trigger.instruction || trigger.name}\n\nContext from when this follow-up was scheduled:\n${JSON.stringify(payload, null, 2)}`;
+            case 'FOLLOWUP': {
+                // Agent-created delayed task — instruction is the exact thing to do now.
+                // The payload contains everything the agent stored in context when it called create_task.
+                const ctx = { ...payload };
+                delete ctx.followup; // internal flag — not useful to the agent
+                delete ctx.timestamp;
+                const ctxStr = Object.keys(ctx).length > 0
+                    ? `\n\nContext you stored when scheduling this follow-up:\n${JSON.stringify(ctx, null, 2)}`
+                    : '';
+                return `${trigger.instruction || trigger.name}${ctxStr}
+
+[Follow-up rules: Complete the specific task above using the context data. If you are waiting for a condition that is not yet met (e.g. no reply received yet), you MAY call create_task again to check later — include the same context so future follow-ups have the same data. Once the full workflow is complete (meeting booked, PR reviewed, etc.), do NOT create another follow-up.]`;
+            }
 
             default:
                 return `Trigger "${trigger.name}" fired.\nPayload: ${JSON.stringify(payload, null, 2)}`;
         }
     }
 
-    buildSystemPrompt(agent, { projectMongoUrl = null } = {}) {
+    buildSystemPrompt(agent, { projectMongoUrl = null, appsToLoad = null } = {}) {
         // Timestamp removed — use get_current_time tool instead so system prompt stays stable for caching.
         const memorySection = agent.memory ? `\n\n## What you remember about this user\n${agent.memory}` : '';
-        const appsSection = (agent.composioApps || []).length > 0 ? `\n\n## Connected apps\n${agent.composioApps.join(', ')}` : '';
+        // Use appsToLoad (the actual tools loaded for this run) so the agent isn't told it has
+        // apps it can't actually call. Falls back to the full agent list if not specified.
+        const displayApps = (appsToLoad?.length > 0) ? appsToLoad : (agent.composioApps || []);
+        const appsSection = displayApps.length > 0 ? `\n\n## Connected apps\n${displayApps.join(', ')}` : '';
         const projectSection = projectMongoUrl
             ? `\n\n## Linked project database\nThis task is connected to a Greta v2 project database. You have the \`mongo_query\` tool to read data from it directly.\n- "the app", "signups", "users", "orders", "the database" → use \`mongo_query\`\n- For totals: operation="count". For breakdowns: operation="groupBy". For trends over time: operation="timeSeries". For lists: operation="find". For unique values: operation="distinct".\n- Always call \`mongo_query\` to get real numbers before writing any summary. Never invent or estimate data.`
             : '';
@@ -321,12 +417,12 @@ ${agent.coreInstructions || 'You are a helpful assistant.'}
 ${memorySection}${appsSection}${projectSection}
 
 ## Self-orchestration tools always available
-- **watch_set(key, value, ttlHours?)** — persist state between runs (track what you're monitoring)
-- **watch_get(key)** — retrieve previously stored state
-- **watch_clear(key)** — delete state when done monitoring
-- **create_task(instruction, delayMinutes, context?)** — schedule a delayed follow-up execution of yourself
+- **watch_set(key, value, ttlHours?)** — persist state between runs. Use descriptive keys that include item IDs: "handled_email_abc123", "notified_pr_42". Always set ttlHours for time-bounded state (e.g. 72h for email threads).
+- **watch_get(key)** — retrieve previously stored state. Returns {exists: false, value: null} if key was never set or expired.
+- **watch_clear(key)** — delete a stored value when a workflow is fully complete (e.g. meeting booked, ticket resolved).
+- **create_task(instruction, delayMinutes, context?)** — schedule a ONE-TIME delayed follow-up (e.g. "check back in 24h if they replied to my meeting request email"). NEVER use this to re-schedule the current task — you are already running on a schedule managed externally.
 
-Use these when you need to: remember something across runs, avoid duplicate actions, or check a condition after a time delay.
+Use watch_set/watch_get to track which items you've already processed. Use create_task only for conditional one-time follow-ups (e.g. waiting for a reply), never to recreate the recurring schedule.
 
 ## AUTONOMOUS TASK — CRITICAL RULES
 You are running as a background job. There is NO USER present. No one will see your questions or reply to them.
@@ -341,11 +437,14 @@ You are running as a background job. There is NO USER present. No one will see y
 8. After all tools return, write a clear summary of what was found/done. That summary is the task output.
 9. Zero results from a tool is a valid outcome — include it in your summary and keep going. Never abort the whole task because one data source was empty.
 10. Only respond with "Task could not complete: [reason]" if a hard infrastructure error (auth failure, API down) makes it impossible to proceed at all.
-11. If you have no tools connected and the task requires external integrations, respond with "Task could not complete: no integrations connected for this agent."`;
+11. If you have no tools connected and the task requires external integrations, respond with "Task could not complete: no integrations connected for this agent."
+12. DEDUPLICATION — for tasks that process items across runs (emails, tickets, records): call watch_get("handled_{type}_{id}") BEFORE acting on each item. If it returns exists:true, skip that item. After successfully acting, immediately call watch_set("handled_{type}_{id}", true, ttlHours?) so future runs don't reprocess it. The [Run context] above tells you what's "new" since the last run — use it as your primary filter, then use watch_get as a safety net for items that fall near the boundary.`;
     }
 
     async loadAgentConfig() {
-        if (this.agentConfig) return this.agentConfig;
+        if (this.agentConfig && this.agentConfigExpiresAt && Date.now() < this.agentConfigExpiresAt) {
+            return this.agentConfig;
+        }
 
         const db = await getMongoConnection();
         const agent = await db.collection('gretaagents').findOne({
@@ -356,6 +455,7 @@ You are running as a background job. There is NO USER present. No one will see y
         if (!agent) throw new Error(`Agent ${this.agentId} not found`);
         agent.composioApps = agent.composioApps || [];
         this.agentConfig = agent;
+        this.agentConfigExpiresAt = Date.now() + AGENT_CONFIG_TTL_MS;
         console.log(`[AgentExecutor] Loaded agent config: ${agent.name}`);
         return agent;
     }
