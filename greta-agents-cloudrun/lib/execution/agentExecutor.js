@@ -215,6 +215,10 @@ class AgentExecutor {
             new HumanMessage(userPrompt)
         ];
 
+        // Tracks consecutive failures per tool name within this run.
+        // After 2 failures the tool gets a TOOL_UNAVAILABLE response so the LLM stops retrying it.
+        const toolFailureCount = new Map();
+
         const executeTool = async (tc) => {
             // LangChain format: tc.name / tc.args (already parsed object)
             const name = tc.name;
@@ -276,8 +280,21 @@ class AgentExecutor {
                     { agentId: this.agentId, userId: this.userId, action: name, params: args },
                     { headers: { 'x-gateway-signature': this.gatewaySignature } }
                 );
-                return res.data.success ? JSON.stringify(res.data.data) : `Error: ${res.data.error}`;
-            } catch (e) { return `Tool failed: ${e.message}`; }
+                if (res.data.success) return JSON.stringify(res.data.data);
+                const failures = (toolFailureCount.get(name) || 0) + 1;
+                toolFailureCount.set(name, failures);
+                if (failures >= 2) {
+                    return `TOOL_UNAVAILABLE: "${name}" is not available for this user (failed ${failures} times). Do not call this tool again. Use only tools that have succeeded or find an alternative.`;
+                }
+                return `Error: ${res.data.error}`;
+            } catch (e) {
+                const failures = (toolFailureCount.get(name) || 0) + 1;
+                toolFailureCount.set(name, failures);
+                if (failures >= 2) {
+                    return `TOOL_UNAVAILABLE: "${name}" is not available for this user (failed ${failures} times). Do not call this tool again.`;
+                }
+                return `Tool failed: ${e.message}`;
+            }
         };
 
         let nudgeCount = 0;
@@ -329,10 +346,10 @@ class AgentExecutor {
                 })
             );
 
-            if (successCount === 0 && errors.length > 0) {
-                throw new Error(`All tool calls failed: ${errors.join('; ')}`);
-            }
-            toolsCalledCount++;
+            // Do not throw on tool failures — pass errors back to the LLM as ToolMessages
+            // so it can recover gracefully. Throwing here crashes /execute → ERR_BAD_RESPONSE
+            // → false "dead container" detection → unnecessary redeploy.
+            if (successCount > 0 || errors.length > 0) toolsCalledCount++;
         }
 
         const actualCostUSD = await fetchTotalRunCost(generationIds);

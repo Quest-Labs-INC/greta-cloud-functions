@@ -401,70 +401,14 @@ The user expects action, not a checklist conversation. Bias heavily toward actin
 - Never end with "Is there anything else I can help you with?" or similar.`;
 
         let systemPrompt;
-        let phase3SystemPrompt; // Separate prompt for Phase 3 (no TOOLS_NEEDED instructions!)
 
         if (isOnboarding) {
             systemPrompt = getOnboardingPrompt();
-            phase3SystemPrompt = systemPrompt; // Onboarding uses same prompt
         } else {
             const identityRule = `## Identity
 You are ${agentName}, from Greta. When asked who you are or what you can do, introduce yourself as "${agentName}, from Greta" and describe what you can do based on your purpose and connected apps listed above. Never mention or reveal the underlying AI model, company, or technology (do not say "I am a large language model", "trained by Google", "powered by Gemini", etc.).`;
 
-            // Phase 1 prompt: includes TOOLS_NEEDED sentinel instructions
             systemPrompt = `You are ${agentName}.
-
-${coreInstructions}
-${memorySection}${appsSection}${connectableSection}${mcpSection}
-
-${identityRule}
-
-${baseGuidance}
-
-## CRITICAL — Scheduled tasks / automations
-If the user asks to create a task, automation, reminder, schedule, recurring job, daily digest, weekly report, OR any "monitor X and notify Y" workflow → output TOOLS_NEEDED:CREATE_TRIGGER on the FIRST line. No other text. Do NOT describe what you will do. Do NOT say "I have created". Do NOT confirm anything. Just output TOOLS_NEEDED:CREATE_TRIGGER and nothing else.
-Examples that ALL require TOOLS_NEEDED:CREATE_TRIGGER:
-- "Daily email digest at 9am" → TOOLS_NEEDED:CREATE_TRIGGER
-- "Remind me every Monday" → TOOLS_NEEDED:CREATE_TRIGGER
-- "Send a weekly report" → TOOLS_NEEDED:CREATE_TRIGGER
-- "Monitor my PRs and alert me" → TOOLS_NEEDED:CREATE_TRIGGER
-
-## How you work
-You run in two phases. In the first phase no tools are available.
-- If you can answer from knowledge or memory alone — answer directly. This includes: greetings ("hey", "hi", "hello"), casual conversation, questions about yourself or your capabilities, general knowledge questions, anything that does NOT require reading or writing data from a connected app.
-- If the user explicitly asks you to DO something with a connected app (send email, create event, check calendar, read emails, post to Slack, check repos, etc.) — respond with ONLY this format and nothing else:
-  TOOLS_NEEDED:APP1,APP2
-  Where APP1,APP2 are the exact app names from "Connected apps" above that you need.
-
-  CRITICAL: You have access to tools from TWO sources:
-
-  1. **Composio apps** (direct integrations with external services):
-     ${composioApps.length > 0 ? composioApps.map(app => `- ${app}: ${appHints[app.toUpperCase()] || 'various actions'}`).join('\n     ') : '(none)'}
-
-  2. **MCP servers** (custom tools via Model Context Protocol):
-     ${mcpEnabled && enabledMcpServers.length > 0 ? enabledMcpServers.map(s => `- ${s.name}: ${s.description || 'custom tools'}`).join('\n     ') : '(none)'}
-
-  When you need tools, respond with TOOLS_NEEDED followed by a colon and the app/server names:
-
-  FORMAT: TOOLS_NEEDED:APP1,APP2,MCP
-
-  Rules for choosing which apps to list:
-  - If the request needs a Composio app listed above, include its EXACT name (e.g., GMAIL, GOOGLECALENDAR, SLACK)
-  - If the request needs MCP tools (for ${mcpEnabled && enabledMcpServers.length > 0 ? enabledMcpServers.map(s => s.name).join(', ') : 'custom integrations'}), include "MCP"
-  - List ALL apps/servers needed for the request, separated by commas
-  - Match keywords to the app descriptions above to determine what's needed
-
-  Examples:
-  ${composioApps.includes('GOOGLECALENDAR') ? '- "Create a meeting" → TOOLS_NEEDED:GOOGLECALENDAR\n  ' : ''}${composioApps.includes('GMAIL') && composioApps.includes('GOOGLECALENDAR') ? '- "Draft email and create calendar event" → TOOLS_NEEDED:GMAIL,GOOGLECALENDAR\n  ' : ''}${mcpEnabled && enabledMcpServers.length > 0 ? `- "Use ${enabledMcpServers[0].name}" → TOOLS_NEEDED:MCP\n  ` : ''}${mcpEnabled && composioApps.includes('GMAIL') ? '- "Check MCP tools and latest email" → TOOLS_NEEDED:MCP,GMAIL\n  ' : ''}- If user asks for multiple things from multiple sources, list them all: TOOLS_NEEDED:APP1,APP2,MCP
-
-- NEVER output TOOLS_NEEDED for greetings, casual chat, or questions you can answer directly.
-- Never ask "Would you like me to...?", "Shall I...?", "Should I...?". Either answer or output TOOLS_NEEDED.
-- CRITICAL: If the user asks for MULTIPLE things from MULTIPLE apps, list ALL the apps needed, separated by commas.
-- CRITICAL — Follow-up actions: If the conversation shows you were working with a tool (drafting email, fetching data, etc.) and the user now says "send it", "do it", "yes", "go ahead", "please send", "submit", "proceed", "send", "confirm" or any similar confirmation — output TOOLS_NEEDED for the relevant app immediately. NEVER respond with text claiming the action is done. The action has NOT happened until the tool is called.
-
-${responseStyle}`;
-
-            // Phase 3 prompt: NO TOOLS_NEEDED instructions (tools already loaded!)
-            phase3SystemPrompt = `You are ${agentName}.
 
 ${coreInstructions}
 ${memorySection}${appsSection}${mcpSection}
@@ -474,67 +418,52 @@ ${identityRule}
 ## Built-in tool available at all times
 - **get_current_time**: Returns current date/time. Call this FIRST when you need to know "today", "now", or calculate relative dates like "next week", "tomorrow", "next Monday". Critical for calendar queries.
 
-${baseGuidance}
+${composioApps.length > 0 ? `## Finding integration tools
+You have access to **COMPOSIO_SEARCH_TOOLS** — call this to find the right tool before using any integration.
+- Always call COMPOSIO_SEARCH_TOOLS first when you need to use a connected app.
+- Never guess tool names — search and use what comes back.
+- Split multi-step tasks into separate queries (e.g. "fetch emails" and "send reply" = 2 queries).
+- Connected apps you can search: ${composioApps.join(', ')}
+
+` : ''}${baseGuidance}
 
 ## Tool use rules
-- NEVER claim an action is done in text if you haven't called the tool for it. "I have sent an email" without calling GMAIL_SEND_EMAIL is a lie. "I drafted it" without calling GMAIL_CREATE_EMAIL_DRAFT is a lie. If you say it happened, a tool call for it MUST exist in this conversation.
+- NEVER claim an action is done in text if you haven't called the tool for it.
 - NEVER say "I've sent", "I've created", "I've deleted", "Done!", "Sent!" unless the corresponding tool was called and returned successfully in THIS response. No exceptions.
-- When the user asks for multiple actions (email + calendar, message + event, etc.), call ALL required tools. You can include multiple tool calls in a single response — do it.
+- When the user asks for multiple actions, call ALL required tools in one response.
 - Call tools silently. Do not narrate what you are about to do before calling. Exception: for create_trigger, present a summary and ask for confirmation first (see RULE 6 below).
-- Use the exact tool name as provided. Never invent tool names.
-- After ALL tools in a step return results, write a single summary response to the user covering everything that was done.
+- After ALL tools in a step return results, write a single summary response to the user.
 - After a tool returns, use the result to answer. Do not re-call the same tool unless the result was an error.
 - If a tool fails, report the error in one sentence and stop.
-- If you need an external integration and have no tools for it, tell the user clearly in one sentence.
 
 ## Creating scheduled tasks — MANDATORY RULES
 
 Use the **create_trigger** tool when the user wants to create a task, automation, reminder, or any "monitor X and do Y" workflow.
 
 **RULE 1 — NEVER say something is impossible.**
-"Check for new PRs every 5 minutes and email if unreviewed" = SCHEDULED trigger running every 5 min (cron: "*/5 * * * *") that fetches PRs created in the last 10 minutes and checks review count. This IS possible. ANY monitoring + conditional notification task is achievable via scheduled polling. If you catch yourself saying "I cannot", stop — you are wrong. Reframe as a polling approach and proceed.
+ANY monitoring + conditional notification task is achievable via scheduled polling. If you catch yourself saying "I cannot", stop — you are wrong. Reframe as a polling approach and proceed.
 
 **RULE 2 — On create_trigger error, fix and retry immediately.**
-If create_trigger returns an error, diagnose and retry with corrected parameters in the SAME response. Do NOT tell the user "I encountered an error and cannot proceed." That is unacceptable. Common fixes: remove apps from composioApps that aren't in your connected apps list, fix the cronExpression format, ensure runPrompt is non-empty.
+If create_trigger returns an error, diagnose and retry with corrected parameters in the SAME response. Common fixes: remove apps from composioApps that aren't in your connected apps list, fix the cronExpression format, ensure runPrompt is non-empty.
 
 **RULE 3 — The runPrompt is fully agentic.**
-When the trigger fires, this agent runs with ALL connected tools (GitHub MCP, Gmail, Slack, etc.). The runPrompt MUST be plain English natural language — NEVER code, scripts, or pseudocode. Write it as a detailed instruction: what to fetch, what condition to check, what action to take.
+The runPrompt MUST be plain English natural language — NEVER code, scripts, or pseudocode.
 
 **RULE 4 — Use a fixed dedup key format.**
-In the runPrompt, always specify the exact watch key string, e.g. watch_get("notified_pr_{owner}_{repo}_{number}"). This prevents the agent from inventing different key names across runs.
+In the runPrompt, always specify the exact watch key string, e.g. watch_get("notified_pr_{owner}_{repo}_{number}").
 
 **RULE 5 — Missing integration = connect it, not a workaround.**
-If the user asks for a task that needs an integration not in your connected apps list (e.g. they ask about Stripe but STRIPE is not connected), NEVER suggest workarounds like "export to Google Sheets" or "I cannot do this". Instead respond EXACTLY like this:
-"To set this up, you'll need to connect **[App Name]** to your agent. Click **Configure** (top right) → Integrations → connect [App Name]. Once connected, come back and I'll create this task for you immediately."
-Do NOT say it's impossible. Do NOT suggest alternatives. Just tell them to connect it.
+If a needed integration is not connected, respond EXACTLY: "To set this up, you'll need to connect **[App Name]** to your agent. Click **Configure** (top right) → Integrations → connect [App Name]. Once connected, come back and I'll create this task for you immediately."
 
 **RULE 6 — Always confirm before creating.**
-Before calling create_trigger, write a one-sentence summary of what you will create (name, schedule, what it does) and ask "Shall I set this up?" in a single short message. Do NOT call the tool yet — wait for the user to confirm.
-EXCEPTION: If the conversation history shows you already presented this summary and asked for confirmation, and the user's latest message is a confirmation ("yes", "go ahead", "create it", "do it", "sure", "ok", "please", "yeah") — then call create_trigger immediately without asking again.
+Before calling create_trigger, write a one-sentence summary and ask "Shall I set this up?" — wait for confirmation before calling the tool.
+EXCEPTION: If history shows you already asked and the user's latest message confirms ("yes", "go ahead", "do it", "sure", "ok") — call create_trigger immediately.
 
 ${responseStyle}`;
         }
 
-        // Phase 1 includes last 4 messages (2 turns) so follow-up actions like
-        // "send it", "go ahead", "yes please" are understood in context.
-        // Without history, "Please send" looks conversational and never loads tools.
-        const phase1Messages = [
-            { role: 'system', content: systemPrompt },
-            ...history.slice(-4).map(m => ({ role: m.role, content: m.content })),
-            { role: 'user', content: message }
-        ];
-
-        // Phase 3 (full ReAct loop) uses phase3SystemPrompt (NO TOOLS_NEEDED instructions!)
-        // and complete history for context
         const phase3Messages = [
-            { role: 'system', content: phase3SystemPrompt },
-            ...history.map(m => ({ role: m.role, content: m.content })),
-            { role: 'user', content: message }
-        ];
-
-        // History re-run also uses phase3SystemPrompt (for context-aware follow-ups)
-        const messagesWithHistory = [
-            { role: 'system', content: phase3SystemPrompt },
+            { role: 'system', content: systemPrompt },
             ...history.map(m => ({ role: m.role, content: m.content })),
             { role: 'user', content: message }
         ];
@@ -659,227 +588,137 @@ ${responseStyle}`;
                 }
             }
         } else {
-            // ── Phase 1: classification only — no tools, no history ─────────────────
-            // Mirrors main backend exactly: single llm.invoke call, no tool binding.
-            // LLM outputs TOOLS_NEEDED:APP1,APP2 or answers directly.
-            let requestedApps = [];
-            let needsMcp = false;
-            let needsCreateTrigger = false;
+            // ── Direct Phase 3 — no sentinel, no pre-load ───────────────────────
+            // Phase 1 removed: the sentinel approach was fragile with conversation history.
+            // The LLM now decides tool use naturally — COMPOSIO_SEARCH_TOOLS handles discovery.
 
-            let p1msg;
-            try {
-                p1msg = await llm.invoke(phase1Messages);
-            } catch (e) { console.error('[Chat] Phase 1 failed:', e.message); }
-
-            trackCall(p1msg);
-            const p1text = p1msg ? extractText(p1msg).trim() : '';
-            console.log(`[Chat] Phase 1 — "${p1text.slice(0, 100)}"`);
-
-            // Parse sentinel from the first line only; any remaining lines = context message
-            const p1lines = p1text.split('\n');
-            const sentinelMatch = p1lines[0].trim().match(/^TOOLS_NEEDED(?::([A-Z0-9_,]+))?$/i);
-            const sentinelContext = p1lines.slice(1).join('\n').trim();
-            if (sentinelMatch) {
-                if (sentinelMatch[1]) {
-                    const parsed = sentinelMatch[1].split(',').map(s => s.trim().toUpperCase()).filter(Boolean);
-                    requestedApps = parsed.filter(a => a !== 'MCP' && a !== 'CREATE_TRIGGER');
-                    needsMcp = parsed.includes('MCP');
-                    needsCreateTrigger = parsed.includes('CREATE_TRIGGER');
-                }
-                console.log(`[Chat] Phase 1 sentinel — apps: [${requestedApps.join(',')}], mcp: ${needsMcp}, createTrigger: ${needsCreateTrigger}, context: "${sentinelContext.slice(0,80)}"`);
-
-                // Check if any requested apps are not yet connected — show connect card instead of failing
-                const unconnected = requestedApps.filter(a => !composioApps.map(x => x.toUpperCase()).includes(a));
-                if (unconnected.length > 0) {
-                    const integrationRequests = unconnected.map(app => ({
-                        app,
-                        reason: `Connect ${app} to let your agent use it`,
-                        status: 'pending',
-                    }));
-                    const appNames = unconnected.map(a => a.charAt(0) + a.slice(1).toLowerCase()).join(', ');
-                    const fallbackText = `Connecting ${appNames} — use the button${unconnected.length > 1 ? 's' : ''} below to authorize.`;
-                    const responseText = sentinelContext || fallbackText;
-                    emit({ type: 'chunk', content: responseText });
-                    emit({ type: 'done', response: responseText, conversationId: null, pendingIntegrations: integrationRequests });
-                    console.log(`[Chat] Emitted pendingIntegrations for: [${unconnected.join(',')}]`);
-                    return res.end();
-                }
-                // CRITICAL: Do NOT set finalText here! We need to load tools and run Phase 3.
-            } else if (p1text) {
-                // Direct answer — re-run with full history for context-aware response
-                // Use phase3SystemPrompt (NO TOOLS_NEEDED instructions!) to prevent sentinel leakage
-                console.log(`[Chat] Phase 1 direct — re-running with history for context`);
-                try {
-                    const histMsg = await llm.invoke(messagesWithHistory);
-                    trackCall(histMsg);
-                    finalText = extractText(histMsg).trim();
-                } catch (e) {
-                    finalText = p1text;
+            // Load MCP tools if enabled
+            if (mcpEnabled && mcpServers.filter(s => s.enabled !== false).length > 0) {
+                const mcpCacheValid = mcpToolsCache && mcpToolsCacheTime && (Date.now() - mcpToolsCacheTime < MCP_CACHE_TTL_MS);
+                if (mcpCacheValid) {
+                    toolDefs.push(...mcpToolsCache);
+                    console.log(`[Chat] Using cached MCP tools (${mcpToolsCache.length})`);
+                } else {
+                    try {
+                        const mcpRes = await axios.post(
+                            `${BACKEND_GATEWAY_URL}/api/greta/gateway/mcp/tools`,
+                            { agentId: AGENT_ID, userId },
+                            { headers: { 'x-gateway-signature': gatewaySignature } }
+                        );
+                        const mcpDefs = mcpRes.data.success ? (mcpRes.data.tools || []) : [];
+                        mcpToolsCache = mcpDefs;
+                        mcpToolsCacheTime = Date.now();
+                        toolDefs.push(...mcpDefs);
+                        console.log(`[Chat] Loaded ${mcpDefs.length} MCP tools`);
+                    } catch (e) {
+                        console.error('[Chat] Failed to load MCP tools:', e.message);
+                    }
                 }
             }
 
-            const hasToolsConfigured = composioApps.length > 0 || (mcpEnabled && mcpServers.filter(s => s.enabled !== false).length > 0);
+            toolDefs.push(GET_CURRENT_TIME_TOOL);
+            toolDefs.push(CREATE_TRIGGER_TOOL);
+            if (composioApps.length > 0) toolDefs.push(COMPOSIO_SEARCH_TOOL_DEF);
 
-            console.log(`[Chat] After Phase 1 — finalText:"${finalText.slice(0, 50)}", finalText.length:${finalText.length}, hasToolsConfigured:${hasToolsConfigured}, needsCreateTrigger:${needsCreateTrigger}`);
+            const orchestration = createOrchestrationTools({
+                agentId: AGENT_ID,
+                userId,
+                backendGatewayUrl: BACKEND_GATEWAY_URL,
+                getSignature: () => gatewaySignature,
+            });
+            toolDefs.push(...orchestration.toolDefs);
+            console.log(`[Chat] ${toolDefs.length} tools ready — entering ReAct loop`);
 
-            if (!finalText && (hasToolsConfigured || needsCreateTrigger)) {
-                // ── Phase 2: Smart tool loading — only apps the LLM asked for ────
-                // If sentinel specified apps, load only those. Else load all (fallback).
-                const appsToLoad = requestedApps.length > 0
-                    ? composioApps.filter(a => requestedApps.includes(a.toUpperCase()))
-                    : composioApps;
-                const shouldLoadMcp = mcpEnabled && mcpServers.filter(s => s.enabled !== false).length > 0 &&
-                    (needsMcp || requestedApps.length === 0); // load MCP in fallback mode too
+            let llmWithTools;
+            try {
+                llmWithTools = toolDefs.length > 0 ? llm.bindTools(toolDefs) : llm;
+            } catch (bindErr) {
+                console.error('[Chat] bindTools failed:', bindErr.message);
+                llmWithTools = llm;
+            }
 
-                console.log(`[Chat] Loading tools for: [${appsToLoad.join(', ')}]${shouldLoadMcp ? ' + MCP' : ''}`);
+            for (let step = 0; step < 8 && !cancelled; step++) {
+                console.log(`[Chat] Step ${step + 1}: invoking LLM...`);
+                let msg;
+                try {
+                    msg = await llmWithTools.invoke(phase3Messages);
+                } catch (e) {
+                    console.error('[Chat] LLM invoke failed:', e.message, e.stack?.slice(0, 300));
+                    break;
+                }
 
-                // Pure on-demand: Composio tools are discovered at runtime via COMPOSIO_SEARCH_TOOLS.
-                // No pre-load — the LLM calls COMPOSIO_SEARCH_TOOLS first, then uses the returned schemas.
+                trackCall(msg);
+                const text = extractText(msg).trim();
+                const toolCalls = msg.tool_calls || [];
 
-                if (shouldLoadMcp) {
-                    const mcpCacheValid = mcpToolsCache && mcpToolsCacheTime && (Date.now() - mcpToolsCacheTime < MCP_CACHE_TTL_MS);
-                    if (mcpCacheValid) {
-                        toolDefs.push(...mcpToolsCache);
-                        console.log(`[Chat] Using cached MCP tools (${mcpToolsCache.length})`);
-                    } else {
-                        try {
-                            const mcpRes = await axios.post(
-                                `${BACKEND_GATEWAY_URL}/api/greta/gateway/mcp/tools`,
-                                { agentId: AGENT_ID, userId },
+                const isHallucinatedAction = toolCalls.length > 0 && text &&
+                    /\b(i have|i've|i sent|i created|i drafted|i scheduled|i added|i deleted|i updated)\b/i.test(text);
+                if (isHallucinatedAction) {
+                    console.warn(`[Chat] Step ${step + 1} — discarding hallucinated action text: "${text.slice(0, 80)}"`);
+                }
+
+                console.log(`[Chat] Step ${step + 1} — "${text.slice(0, 100)}", tool_calls: ${toolCalls.length}`);
+                phase3Messages.push(msg);
+
+                if (toolCalls.length === 0) { finalText = text; break; }
+
+                console.log(`[Chat] Executing:`, toolCalls.map(t => t.name).join(', '));
+                await Promise.all(toolCalls.map(async (tc) => {
+                    emit({ type: 'status', content: toolStatusLabel(tc.name) });
+                    try {
+                        let result;
+                        if (tc.name === 'get_current_time') {
+                            result = executeGetCurrentTime();
+                        } else if (tc.name === 'COMPOSIO_SEARCH_TOOLS') {
+                            const searchRes = await axios.post(
+                                `${BACKEND_GATEWAY_URL}/api/greta/gateway/composio/meta/search`,
+                                { agentId: AGENT_ID, userId, queries: tc.args?.queries || [] },
                                 { headers: { 'x-gateway-signature': gatewaySignature } }
                             );
-                            const mcpDefs = mcpRes.data.success ? (mcpRes.data.tools || []) : [];
-                            mcpToolsCache = mcpDefs;
-                            mcpToolsCacheTime = Date.now();
-                            toolDefs.push(...mcpDefs);
-                            console.log(`[Chat] Loaded ${mcpDefs.length} MCP tools (cached)`);
-                        } catch (e) {
-                            console.error('[Chat] Failed to load MCP tools:', e.message);
-                        }
-                    }
-                }
-                console.log(`[Chat] ${toolDefs.length} external tools loaded`);
-
-                // Add get_current_time as a local tool — always available in Phase 3
-                toolDefs.push(GET_CURRENT_TIME_TOOL);
-
-                // Add create_trigger — lets agent create scheduled tasks from chat
-                toolDefs.push(CREATE_TRIGGER_TOOL);
-
-                // COMPOSIO_SEARCH_TOOLS: AI search for tools not in the pre-loaded set
-                // Uses session.search() (real AI) not composio.tools.get({ search }) (keyword filter)
-                toolDefs.push(COMPOSIO_SEARCH_TOOL_DEF);
-
-                // Add self-orchestration tools — watch_set/get/clear + create_task
-                const orchestration = createOrchestrationTools({
-                    agentId: AGENT_ID,
-                    userId,
-                    backendGatewayUrl: BACKEND_GATEWAY_URL,
-                    getSignature: () => gatewaySignature,
-                });
-                toolDefs.push(...orchestration.toolDefs);
-                console.log(`[Chat] ${toolDefs.length} total tools (incl. orchestration)`);
-
-                // ── Phase 3: ReAct loop — mirrors main backend exactly ───────────────
-                // Uses LangChain bindTools + invoke — same approach as gretaAgentFunctions.js
-                // CRITICAL: Use phase3Messages (with phase3SystemPrompt that has NO TOOLS_NEEDED instructions!)
-                console.log(`[Chat] Phase 3 ENTER — cancelled:${cancelled} tools:${toolDefs.length} finalText.length:${finalText.length}`);
-                let llmWithTools;
-                try {
-                    llmWithTools = toolDefs.length > 0 ? llm.bindTools(toolDefs) : llm;
-                    console.log('[Chat] Phase 3: tools bound OK');
-                } catch (bindErr) {
-                    console.error('[Chat] Phase 3 bindTools failed:', bindErr.message);
-                    llmWithTools = llm;
-                }
-                for (let step = 0; step < 8 && !cancelled; step++) {
-                    console.log(`[Chat] Phase 3 step ${step + 1}: invoking LLM...`);
-                    let msg;
-                    try {
-                        msg = await llmWithTools.invoke(phase3Messages);
-                    } catch (e) {
-                        console.error('[Chat] LLM invoke failed:', e.message, e.stack?.slice(0, 300));
-                        break;
-                    }
-
-                    trackCall(msg);
-                    const text = extractText(msg).trim();
-                    // LangChain tool call format: { name, args, id } (not function.name/arguments)
-                    const toolCalls = msg.tool_calls || [];
-
-                    // Detect hallucinated action text alongside tool calls
-                    const isHallucinatedAction = toolCalls.length > 0 && text &&
-                        /\b(i have|i've|i sent|i created|i drafted|i scheduled|i added|i deleted|i updated)\b/i.test(text);
-                    if (isHallucinatedAction) {
-                        console.warn(`[Chat] Step ${step + 1} — discarding hallucinated action text: "${text.slice(0, 80)}"`);
-                    }
-
-                    console.log(`[Chat] Step ${step + 1} — "${text.slice(0, 100)}", tool_calls: ${toolCalls.length}`);
-                    phase3Messages.push(msg);
-
-                    if (toolCalls.length === 0) { finalText = text; break; }
-
-                    console.log(`[Chat] Executing:`, toolCalls.map(t => t.name).join(', '));
-                    await Promise.all(toolCalls.map(async (tc) => {
-                        emit({ type: 'status', content: toolStatusLabel(tc.name) });
-                        try {
-                            let result;
-                            if (tc.name === 'get_current_time') {
-                                result = executeGetCurrentTime();
-                                console.log(`[Chat] get_current_time result: ${result}`);
-                            } else if (tc.name === 'COMPOSIO_SEARCH_TOOLS') {
-                                // session.search() → slugs → schemas → inject into live tool set
-                                const searchRes = await axios.post(
-                                    `${BACKEND_GATEWAY_URL}/api/greta/gateway/composio/meta/search`,
-                                    { agentId: AGENT_ID, userId, queries: tc.args?.queries || [] },
-                                    { headers: { 'x-gateway-signature': gatewaySignature } }
-                                );
-                                const newSchemas = searchRes.data.success ? (searchRes.data.tools || []) : [];
-                                const added = [];
-                                for (const schema of newSchemas) {
-                                    const tName = schema.function?.name || schema.name;
-                                    if (tName && !toolDefs.find(d => (d.function?.name || d.name) === tName)) {
-                                        toolDefs.push(schema);
-                                        added.push(tName);
-                                    }
+                            const newSchemas = searchRes.data.success ? (searchRes.data.tools || []) : [];
+                            const added = [];
+                            for (const schema of newSchemas) {
+                                const tName = schema.function?.name || schema.name;
+                                if (tName && !toolDefs.find(d => (d.function?.name || d.name) === tName)) {
+                                    toolDefs.push(schema);
+                                    added.push(tName);
                                 }
-                                if (added.length > 0) {
-                                    llmWithTools = llm.bindTools(toolDefs);
-                                    console.log(`[Chat] COMPOSIO_SEARCH_TOOLS injected ${added.length} tools: ${added.slice(0, 5).join(', ')}`);
-                                }
-                                result = JSON.stringify({
-                                    found: newSchemas.length,
-                                    tools: newSchemas.map(t => t.function?.name || t.name),
-                                    message: newSchemas.length > 0
-                                        ? `Found ${newSchemas.length} tools. They are now available — call them directly.`
-                                        : 'No tools found. Try using the tools already in your tool set.'
-                                });
-                            } else {
-                                result = await executeExternalTool(tc);
                             }
-                            phase3Messages.push({ role: 'tool', tool_call_id: tc.id, content: result });
-                            toolsExecuted = true;
-                        } catch (e) {
-                            phase3Messages.push({ role: 'tool', tool_call_id: tc.id, content: `Tool failed: ${e.message}` });
+                            if (added.length > 0) {
+                                llmWithTools = llm.bindTools(toolDefs);
+                                console.log(`[Chat] COMPOSIO_SEARCH_TOOLS injected ${added.length} tools: ${added.slice(0, 5).join(', ')}`);
+                            }
+                            result = JSON.stringify({
+                                found: newSchemas.length,
+                                tools: newSchemas.map(t => t.function?.name || t.name),
+                                message: newSchemas.length > 0
+                                    ? `Found ${newSchemas.length} tools. They are now available — call them directly.`
+                                    : 'No tools found. Try using the tools already in your tool set.'
+                            });
+                        } else {
+                            result = await executeExternalTool(tc);
                         }
-                    }));
-                    // Loop continues — LLM sees all tool results and decides next action
-                }
-
-                // Synthesis fallback — if LLM went silent after tools
-                if ((!finalText || /^done\.?$/i.test(finalText.trim())) && !cancelled) {
-                    const toolMsgs = phase3Messages.filter(m => m.role === 'tool');
-                    if (toolMsgs.length > 0) {
-                        try {
-                            const toolResultsText = toolMsgs.map(m => String(m.content)).join('\n---\n');
-                            const synthMsg = await llm.invoke([
-                                { role: 'system', content: 'Summarize these tool results as a clear helpful response. Be direct, no filler.' },
-                                { role: 'user', content: `User said: "${message}"\n\nTool results:\n${toolResultsText}` }
-                            ]);
-                            trackCall(synthMsg);
-                            finalText = extractText(synthMsg).trim();
-                        } catch (e) { console.error('[Chat] Synthesis failed:', e.message); }
+                        phase3Messages.push({ role: 'tool', tool_call_id: tc.id, content: result });
+                        toolsExecuted = true;
+                    } catch (e) {
+                        phase3Messages.push({ role: 'tool', tool_call_id: tc.id, content: `Tool failed: ${e.message}` });
                     }
+                }));
+            }
+
+            // Synthesis fallback — if LLM went silent after tools
+            if ((!finalText || /^done\.?$/i.test(finalText.trim())) && !cancelled) {
+                const toolMsgs = phase3Messages.filter(m => m.role === 'tool');
+                if (toolMsgs.length > 0) {
+                    try {
+                        const toolResultsText = toolMsgs.map(m => String(m.content)).join('\n---\n');
+                        const synthMsg = await llm.invoke([
+                            { role: 'system', content: 'Summarize these tool results as a clear helpful response. Be direct, no filler.' },
+                            { role: 'user', content: `User said: "${message}"\n\nTool results:\n${toolResultsText}` }
+                        ]);
+                        trackCall(synthMsg);
+                        finalText = extractText(synthMsg).trim();
+                    } catch (e) { console.error('[Chat] Synthesis failed:', e.message); }
                 }
             }
         }
