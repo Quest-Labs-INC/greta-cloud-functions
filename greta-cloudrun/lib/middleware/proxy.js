@@ -96,12 +96,31 @@ export const backendProxy = createProxyMiddleware({
 export const viteProxy = createProxyMiddleware({
   target: `http://localhost:${VITE_PORT}`,
   changeOrigin: true,
-  ws: true, // Enable WebSocket for HMR
+  ws: true,
+  proxyTimeout: 60000,
+  timeout: 60000,
 
   logLevel: 'warn',
 
+  onProxyReq: (proxyReq, req) => {
+    req._viteProxyStart = Date.now();
+    if (req.url?.includes('node_modules/.vite') || req.url?.includes('.tsx') || req.url?.includes('.ts')) {
+      console.log(`[Vite] → ${req.method} ${req.url}`);
+    }
+  },
+
+  onProxyRes: (proxyRes, req) => {
+    if (req._viteProxyStart) {
+      const duration = Date.now() - req._viteProxyStart;
+      if (duration > 3000) {
+        console.warn(`[Vite] ⚠️ SLOW response: ${req.url} took ${duration}ms (status ${proxyRes.statusCode})`);
+      }
+    }
+  },
+
   onError: (err, req, res) => {
-    console.error('Vite proxy error:', err.message);
+    const duration = req._viteProxyStart ? Date.now() - req._viteProxyStart : 0;
+    console.error(`[Vite] ❌ PROXY ERROR after ${duration}ms: ${req.url} — ${err.message}`);
     if (res.writeHead) {
       res.writeHead(503, { 'Content-Type': 'text/html' });
       res.end(`<!DOCTYPE html>

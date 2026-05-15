@@ -2,53 +2,28 @@
  * ═══════════════════════════════════════════════════════════════════════════════
  * VITE DEV SERVER MANAGEMENT
  * ═══════════════════════════════════════════════════════════════════════════════
- * 
+ *
  * Manages the Vite development server lifecycle with hot module replacement.
  * Uses Bun as the package manager for improved performance.
- * 
- * Features:
- * - Auto-restart on unexpected shutdown
- * - Log capture for debugging
- * - Graceful shutdown support
- * 
+ *
  * @module services/processes/vite
  */
 
 import { spawn } from 'child_process';
+import { rm } from 'fs/promises';
+import path from 'path';
 import { VITE_PORT, FRONTEND_DIR } from '../../core/config.js';
 import { state, addLog } from '../../core/state.js';
 import { viteLogger as log } from '../../core/logger.js';
 
 
-/* ─────────────────────────────────────────────────────────────────────────────
- * STATE
- * ───────────────────────────────────────────────────────────────────────────── */
-
 /** Flag to prevent restart during graceful shutdown */
 let shuttingDown = false;
 
-
-/* ─────────────────────────────────────────────────────────────────────────────
- * PUBLIC API
- * ───────────────────────────────────────────────────────────────────────────── */
-
-/**
- * Mark Vite as shutting down (prevents auto-restart)
- * Call this before graceful shutdown
- */
 export function setShuttingDown() {
   shuttingDown = true;
 }
 
-/**
- * Start the Vite development server
- * 
- * Uses Bun for faster startup. The server runs with:
- * - Host: 0.0.0.0 (accessible from outside container)
- * - Port: Configured via VITE_PORT
- * 
- * @returns {Promise<void>}
- */
 export async function startVite() {
   if (state.viteProcess) {
     log.info('Vite already running');
@@ -73,11 +48,21 @@ export async function startVite() {
     addLog('vite', message);
   });
 
-  // Capture stderr
+  // Capture stderr — filter known noise
+  const VITE_STDERR_NOISE = [
+    'Browserslist', 'caniuse-lite', 'update-browserslist-db',
+    'ExperimentalWarning', 'vite --host', 'VITE v', 'ready in',
+    'Local:', 'Network:', 'press h + enter',
+  ];
   state.viteProcess.stderr.on('data', (data) => {
     const message = data.toString().trim();
-    log.error(message);
-    addLog('viteErrors', message);
+    const isNoise = VITE_STDERR_NOISE.some(p => message.includes(p));
+    if (isNoise) {
+      addLog('vite', message);
+    } else {
+      log.error(message);
+      addLog('viteErrors', message);
+    }
   });
 
   // Handle process exit
@@ -85,7 +70,6 @@ export async function startVite() {
     log.info(`Process exited with code ${code}`);
     state.viteProcess = null;
 
-    // Auto-restart unless we're shutting down
     if (!shuttingDown) {
       log.warn('Vite stopped unexpectedly, auto-restarting in 2 seconds...');
       setTimeout(() => {
@@ -96,14 +80,10 @@ export async function startVite() {
     }
   });
 
-  // Wait for Vite to initialize
   await new Promise(resolve => setTimeout(resolve, 3000));
   log.success('Vite dev server started');
 }
 
-/**
- * Stop the Vite development server
- */
 export function stopVite() {
   if (state.viteProcess) {
     state.viteProcess.kill();
@@ -112,23 +92,16 @@ export function stopVite() {
   }
 }
 
-/**
- * Restart the Vite development server
- * 
- * Useful after adding dependencies to ensure clean module resolution
- * and avoid multiple React copies issue.
- * 
- * @returns {Promise<void>}
- */
 export async function restartVite() {
   log.emoji('restart', 'Restarting Vite to pick up new dependencies...');
-  
   stopVite();
-  
-  // Wait for process to fully terminate
+
+  // Clear Vite dep cache so new hash is generated — prevents browser 504 on stale hash
+  const viteCacheDir = path.join(FRONTEND_DIR, 'node_modules', '.vite');
+  await rm(viteCacheDir, { recursive: true, force: true }).catch(() => {});
+  log.info('Cleared Vite dep cache');
+
   await new Promise(resolve => setTimeout(resolve, 1000));
-  
   await startVite();
   log.success('Vite restarted');
 }
-

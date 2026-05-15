@@ -11,10 +11,18 @@ export default defineConfig(({ mode }) => ({
     hmr: {
       overlay: false,
     },
-  },
-  optimizeDeps: {
-    disabled: false,
-    force: false,
+    watch: {
+      ignored: [
+        '**/node_modules/**',
+        '**/.git/**',
+        '**/dist/**',
+        '**/dist-static/**',
+        '**/public/**',
+        '**/backend/**',
+      ],
+      // Wait 1s of file stability before triggering HMR — prevents storm from rapid bulk writes
+      stabilityThreshold: 1000,
+    },
   },
   plugins: [componentGretaTagger(), react()],
   resolve: {

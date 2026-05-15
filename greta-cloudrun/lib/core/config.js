@@ -24,7 +24,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
  * Used for tracking deployed container versions
  */
 
-export const IMAGE_VERSION = 'v67';
+export const IMAGE_VERSION = 'v76';
 
 
 /* ─────────────────────────────────────────────────────────────────────────────
@@ -163,7 +163,7 @@ export const EXPRESS_API_ENDPOINTS = [
 
   // Logs & debugging
   '/_greta/console-logs', '/_greta/clear-logs', '/_greta/backend-logs', '/_greta/vite-errors', '/_greta/browser-error',
-  '/_greta/typescript-check',
+  '/_greta/typescript-check', '/_greta/python-lint',
 
   // Storage & Versioning
   '/_greta/sync-to-gcs',
