@@ -1,6 +1,5 @@
 const axios = require('axios');
 const { createOpenRouterLLM, fetchTotalRunCost } = require('../llm/openRouterService');
-const { MongoClient } = require('mongodb');
 const { createMongoQueryTool } = require('../tools/mongoQueryTool');
 const { createOrchestrationTools } = require('../tools/agentOrchestrationTools');
 const { SystemMessage, HumanMessage, ToolMessage, AIMessage } = require('@langchain/core/messages');
@@ -55,20 +54,8 @@ const triggerToolsCacheMap = new Map();
 const TRIGGER_TOOLS_CACHE_TTL_MS = 30 * 60 * 1000;
 const AGENT_CONFIG_TTL_MS = 5 * 60 * 1000; // 5 minutes — picks up new integrations without restart
 
-let db = null;
-async function getMongoConnection() {
-    if (!db) {
-        const url = process.env.MONGO_URL || process.env.MONGO_CONNECTION_STRING;
-        if (!url) throw new Error('MONGO_URL not configured');
-        const client = await MongoClient.connect(url);
-        db = client.db();
-        console.log('[AgentExecutor] MongoDB connected');
-    }
-    return db;
-}
-
 class AgentExecutor {
-    constructor({ agentId, userId, backendGatewayUrl, gatewaySignature, mongoConnectionString }) {
+    constructor({ agentId, userId, backendGatewayUrl, gatewaySignature }) {
         this.agentId = agentId;
         this.userId = userId;
         this.backendGatewayUrl = backendGatewayUrl;
@@ -463,13 +450,14 @@ You are running as a background job. There is NO USER present. No one will see y
             return this.agentConfig;
         }
 
-        const db = await getMongoConnection();
-        const agent = await db.collection('gretaagents').findOne({
-            agentId: this.agentId,
-            isDeleted: { $ne: true },
-        });
+        const res = await axios.post(
+            `${this.backendGatewayUrl}/api/greta/gateway/agent/config`,
+            { agentId: this.agentId, userId: this.userId },
+            { headers: { 'x-gateway-signature': this.gatewaySignature } }
+        );
 
-        if (!agent) throw new Error(`Agent ${this.agentId} not found`);
+        if (!res.data.success) throw new Error(`Failed to load agent config: ${res.data.error}`);
+        const agent = res.data.agent;
         agent.composioApps = agent.composioApps || [];
         this.agentConfig = agent;
         this.agentConfigExpiresAt = Date.now() + AGENT_CONFIG_TTL_MS;

@@ -14,7 +14,6 @@ app.use(express.json({ limit: '10mb' }));
 const AGENT_ID = process.env.AGENT_ID;
 const USER_ID = process.env.USER_ID;
 const BACKEND_GATEWAY_URL = process.env.BACKEND_GATEWAY_URL || 'https://addons-staging-v2.questera.ai';
-const MONGO_CONNECTION_STRING = process.env.MONGO_CONNECTION_STRING;
 const POD_TOKEN = process.env.POD_TOKEN;
 const PORT = process.env.PORT || 8080;
 
@@ -181,7 +180,6 @@ async function initializeAgent() {
         userId: USER_ID,
         backendGatewayUrl: BACKEND_GATEWAY_URL,
         gatewaySignature,
-        mongoConnectionString: MONGO_CONNECTION_STRING,
     });
     console.log('[Agent] Executor initialized');
 }
@@ -242,7 +240,6 @@ app.get('/health', (req, res) => {
         timestamp: new Date().toISOString(),
         uptime: process.uptime(),
         memory: process.memoryUsage(),
-        mongodbConfigured: !!MONGO_CONNECTION_STRING,
     });
 });
 
