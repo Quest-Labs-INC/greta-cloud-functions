@@ -13,7 +13,7 @@ import express from 'express';
 import { spawn } from 'child_process';
 import path from 'path';
 import fs from 'fs/promises';
-import { PROJECT_DIR, FRONTEND_DIR, GCS_BUCKET, projectId } from '../../core/config.js';
+import { PROJECT_DIR, FRONTEND_DIR, BACKEND_DIR, GCS_BUCKET, projectId } from '../../core/config.js';
 import { Storage } from '@google-cloud/storage';
 import { resolveSafePath, apiResponse, execAsync } from './helpers.js';
 import { restartVite } from '../../services/processes/vite.js';
@@ -433,6 +433,65 @@ router.get('/typescript-check', async (req, res) => {
     }
   } catch (error) {
     console.error('TypeScript check error:', error);
+    return apiResponse(res, 500, { error: error.message });
+  }
+});
+
+
+/* ─────────────────────────────────────────────────────────────────────────────
+ * PYTHON LINT CHECK
+ * ───────────────────────────────────────────────────────────────────────────── */
+
+/**
+ * GET /python-lint - Run flake8 on the backend directory.
+ * Returns errors, warnings, and a hasErrors flag.
+ */
+router.get('/python-lint', async (req, res) => {
+  try {
+    const startTime = Date.now();
+    console.log('🐍 Running Python lint (flake8)...');
+
+    try {
+      await execAsync('python -m flake8 . --max-line-length=120 --exclude=__pycache__,.venv,venv 2>&1', {
+        cwd: BACKEND_DIR,
+        timeout: 30000,
+        maxBuffer: 1024 * 1024 * 2
+      });
+
+      const duration = Date.now() - startTime;
+      console.log(`✅ Python lint passed in ${duration}ms`);
+      return apiResponse(res, 200, { hasErrors: false, errorCount: 0, errors: [], duration });
+    } catch (execError) {
+      const duration = Date.now() - startTime;
+      const output = execError.stdout || execError.stderr || execError.message || '';
+
+      const lines = output.split('\n').filter(Boolean);
+
+      // Separate errors (E/F) from warnings (W)
+      const errors = lines
+        .filter(l => /\s[EF]\d{3}/.test(l))
+        .map(l => l.replace(BACKEND_DIR, '').trim())
+        .slice(0, 20);
+
+      const warnings = lines
+        .filter(l => /\sW\d{3}/.test(l))
+        .map(l => l.replace(BACKEND_DIR, '').trim())
+        .slice(0, 10);
+
+      console.log(`❌ Python lint: ${errors.length} error(s), ${warnings.length} warning(s) in ${duration}ms`);
+
+      return apiResponse(res, 200, {
+        hasErrors: errors.length > 0,
+        errorCount: errors.length,
+        warningCount: warnings.length,
+        errors,
+        warnings,
+        rawOutput: output.slice(0, 2000),
+        duration
+      });
+    }
+  } catch (error) {
+    console.error('Python lint error:', error);
     return apiResponse(res, 500, { error: error.message });
   }
 });

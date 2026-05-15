@@ -24,6 +24,24 @@
     --input: 220 15% 88%;
     --ring: 220 60% 50%;
     --radius: 0.75rem;
+
+    /* Gradients */
+    --gradient-primary: linear-gradient(135deg, hsl(var(--primary)), hsl(220 80% 65%));
+    --gradient-subtle: linear-gradient(180deg, hsl(var(--background)), hsl(40 15% 94%));
+    --gradient-card: linear-gradient(145deg, hsl(var(--card)), hsl(40 20% 98%));
+
+    /* Shadows */
+    --shadow-sm: 0 1px 3px hsl(var(--foreground) / 0.06), 0 1px 2px hsl(var(--foreground) / 0.04);
+    --shadow-md: 0 4px 12px hsl(var(--foreground) / 0.08), 0 2px 4px hsl(var(--foreground) / 0.04);
+    --shadow-lg: 0 10px 30px hsl(var(--foreground) / 0.1), 0 4px 8px hsl(var(--foreground) / 0.06);
+    --shadow-glow: 0 0 24px hsl(var(--primary) / 0.25);
+    --shadow-elegant: 0 8px 32px hsl(var(--primary) / 0.12), 0 2px 8px hsl(var(--foreground) / 0.08);
+
+    /* Transitions */
+    --transition-fast: all 0.15s cubic-bezier(0.4, 0, 0.2, 1);
+    --transition-smooth: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+    --transition-spring: all 0.4s cubic-bezier(0.34, 1.56, 0.64, 1);
+
     --sidebar-background: 0 0% 98%;
     --sidebar-foreground: 240 5.3% 26.1%;
     --sidebar-primary: 240 5.9% 10%;
@@ -57,6 +75,17 @@
     --border: 220 15% 22%;
     --input: 220 15% 22%;
     --ring: 220 60% 60%;
+
+    /* Dark mode gradients & shadows */
+    --gradient-primary: linear-gradient(135deg, hsl(var(--primary)), hsl(220 70% 70%));
+    --gradient-subtle: linear-gradient(180deg, hsl(var(--background)), hsl(220 18% 12%));
+    --gradient-card: linear-gradient(145deg, hsl(var(--card)), hsl(220 20% 15%));
+    --shadow-sm: 0 1px 3px hsl(0 0% 0% / 0.2), 0 1px 2px hsl(0 0% 0% / 0.15);
+    --shadow-md: 0 4px 12px hsl(0 0% 0% / 0.25), 0 2px 4px hsl(0 0% 0% / 0.15);
+    --shadow-lg: 0 10px 30px hsl(0 0% 0% / 0.3), 0 4px 8px hsl(0 0% 0% / 0.2);
+    --shadow-glow: 0 0 24px hsl(var(--primary) / 0.4);
+    --shadow-elegant: 0 8px 32px hsl(var(--primary) / 0.2), 0 2px 8px hsl(0 0% 0% / 0.25);
+
     --sidebar-background: 240 5.9% 10%;
     --sidebar-foreground: 240 4.8% 95.9%;
     --sidebar-primary: 224.3 76.3% 48%;
@@ -77,6 +106,37 @@
   }
   body {
     @apply bg-background text-foreground;
-    font-family: 'Inter', system-ui, sans-serif;
+    font-family: var(--font-sans, 'Inter'), system-ui, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
   }
 }
+
+@layer utilities {
+  .shadow-sm { box-shadow: var(--shadow-sm); }
+  .shadow-md { box-shadow: var(--shadow-md); }
+  .shadow-lg { box-shadow: var(--shadow-lg); }
+  .shadow-glow { box-shadow: var(--shadow-glow); }
+  .shadow-elegant { box-shadow: var(--shadow-elegant); }
+  .gradient-primary { background: var(--gradient-primary); }
+  .gradient-subtle { background: var(--gradient-subtle); }
+  .gradient-card { background: var(--gradient-card); }
+  .transition-smooth { transition: var(--transition-smooth); }
+  .transition-spring { transition: var(--transition-spring); }
+}
+
+@keyframes fade-in {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+@keyframes slide-in {
+  from { opacity: 0; transform: translateX(-12px); }
+  to { opacity: 1; transform: translateX(0); }
+}
+@keyframes scale-in {
+  from { opacity: 0; transform: scale(0.95); }
+  to { opacity: 1; transform: scale(1); }
+}
+.animate-fade-in { animation: fade-in 0.4s cubic-bezier(0.4, 0, 0.2, 1) forwards; }
+.animate-slide-in { animation: slide-in 0.4s cubic-bezier(0.4, 0, 0.2, 1) forwards; }
+.animate-scale-in { animation: scale-in 0.3s cubic-bezier(0.34, 1.56, 0.64, 1) forwards; }

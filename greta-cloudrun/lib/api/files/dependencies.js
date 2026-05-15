@@ -16,6 +16,8 @@ import { exec } from 'child_process';
 import { PROJECT_DIR, FRONTEND_DIR, BACKEND_DIR, projectId } from '../../core/config.js';
 import { syncToGCS } from '../../services/storage/gcs-sync.js';
 import { ensureNodeModules, execAsync } from './helpers.js';
+import { restartVite } from '../../services/processes/vite.js';
+import { restartBackend } from '../../services/processes/backend.js';
 
 const router = express.Router();
 
@@ -50,10 +52,15 @@ router.post('/add-dependency', async (req, res) => {
     console.log('💾 Syncing package.json to GCS for persistence...');
     await syncToGCS(PROJECT_DIR);
 
+    // Vite MUST restart after new packages — HMR alone won't re-resolve new modules
+    console.log('🔄 Restarting Vite after package install...');
+    await restartVite().catch(err => console.error('⚠️ Vite restart failed:', err.message));
+    await new Promise(r => setTimeout(r, 6000));
+
     res.json({
       success: true,
       package: packageName,
-      message: `Installed ${packageName} via bun. Vite will auto-reload via HMR.`
+      message: `Installed ${packageName} via bun and restarted Vite.`
     });
   } catch (error) {
     console.error(`❌ Failed to install package:`, error.message);
@@ -87,10 +94,15 @@ router.post('/remove-dependency', async (req, res) => {
     console.log('💾 Syncing package.json to GCS for persistence...');
     await syncToGCS(PROJECT_DIR);
 
+    // Restart Vite after package removal
+    console.log('🔄 Restarting Vite after package removal...');
+    await restartVite().catch(err => console.error('⚠️ Vite restart failed:', err.message));
+    await new Promise(r => setTimeout(r, 3000));
+
     res.json({
       success: true,
       package: packageName,
-      message: `Successfully removed ${packageName} via bun and synced to GCS`
+      message: `Successfully removed ${packageName} via bun and restarted Vite`
     });
   } catch (error) {
     console.error(`❌ Failed to uninstall package:`, error.message);
@@ -164,9 +176,11 @@ router.post('/add-python-dependency', async (req, res) => {
             console.log(`📝 Updated requirements.txt with ${versionLine}`);
 
             res.json({ success: true, package: packageName, addedToRequirements: versionLine });
+            const t1 = setTimeout(() => { restartBackend().catch(e => console.error('⚠️ Backend restart failed:', e.message)); clearTimeout(t1); }, 3000);
           });
         } else {
           res.json({ success: true, package: packageName, addedToRequirements: false, message: 'Already in requirements.txt' });
+          const t2 = setTimeout(() => { restartBackend().catch(e => console.error('⚠️ Backend restart failed:', e.message)); clearTimeout(t2); }, 3000);
         }
       } catch (reqError) {
         console.error('Warning: Could not update requirements.txt:', reqError.message);
@@ -236,6 +250,7 @@ router.post('/remove-python-dependency', async (req, res) => {
         message: `Successfully removed ${packageName}`,
         removedFromRequirements
       });
+      const t3 = setTimeout(() => { restartBackend().catch(e => console.error('⚠️ Backend restart failed:', e.message)); clearTimeout(t3); }, 3000);
     });
   } catch (error) {
     res.status(500).json({ error: error.message });
