@@ -1,5 +1,5 @@
 const axios = require('axios');
-const { createOpenRouterLLM, fetchTotalRunCost } = require('../llm/openRouterService');
+const { createOpenRouterLLM } = require('../llm/openRouterService');
 const { createMongoQueryTool } = require('../tools/mongoQueryTool');
 const { createOrchestrationTools } = require('../tools/agentOrchestrationTools');
 const { SystemMessage, HumanMessage, ToolMessage, AIMessage } = require('@langchain/core/messages');
@@ -108,11 +108,11 @@ class AgentExecutor {
 
             // Pass appsToLoad so system prompt reflects the actual tools available this run
             const systemPrompt = this.buildSystemPrompt(agent, { projectMongoUrl, appsToLoad });
-            const { output, actualCostUSD, tokenUsage } = await this.runAgentLoop({ systemPrompt, userPrompt, toolDefs, localTools });
+            const { output, tokenUsage } = await this.runAgentLoop({ systemPrompt, userPrompt, toolDefs, localTools });
 
             const executionTime = Date.now() - startTime;
-            console.log(`[AgentExecutor] ✅ Completed in ${executionTime}ms — cost: $${actualCostUSD}`);
-            return { output, executionTime, success: true, actualCostUSD, tokenUsage };
+            console.log(`[AgentExecutor] ✅ Completed in ${executionTime}ms`);
+            return { output, executionTime, success: true, tokenUsage };
 
         } catch (error) {
             const executionTime = Date.now() - startTime;
@@ -185,12 +185,9 @@ class AgentExecutor {
         let dynamicTools = [GET_CURRENT_TIME_TOOL, ...toolDefs, COMPOSIO_SEARCH_TOOL_DEF];
         let llmWithTools = dynamicTools.length > 0 ? llm.bindTools(dynamicTools) : llm;
         const AGENT_MODEL_NAME = process.env.AGENT_MODEL || 'google/gemini-2.5-flash';
-        const generationIds = [];
-        // Token fallback — used when OpenRouter generation API returns null
         let totalPromptTokens = 0, totalCompletionTokens = 0;
         function trackCall(msg) {
             if (!msg) return;
-            if (msg.id) generationIds.push(msg.id);
             const u = msg.usage_metadata || msg.response_metadata?.tokenUsage || msg.response_metadata?.usage;
             if (!u) return;
             totalPromptTokens     += u.input_tokens  || u.promptTokens  || u.prompt_tokens  || 0;
@@ -312,10 +309,9 @@ class AgentExecutor {
                     continue;
                 }
 
-                const actualCostUSD = await fetchTotalRunCost(generationIds);
                 const tokenUsage = { promptTokens: totalPromptTokens, completionTokens: totalCompletionTokens, model: AGENT_MODEL_NAME };
-                console.log(`[AgentExecutor] Cost: $${actualCostUSD} (OpenRouter) | tokens: ${totalPromptTokens}in/${totalCompletionTokens}out | genIds: ${generationIds.length}`);
-                return { output: text || 'Task completed.', actualCostUSD, tokenUsage };
+                console.log(`[AgentExecutor] Tokens: ${totalPromptTokens}in/${totalCompletionTokens}out`);
+                return { output: text || 'Task completed.', tokenUsage };
             }
 
             console.log(`[AgentExecutor] Executing:`, toolCalls.map(t => t.name).join(', '));
@@ -339,10 +335,9 @@ class AgentExecutor {
             if (successCount > 0 || errors.length > 0) toolsCalledCount++;
         }
 
-        const actualCostUSD = await fetchTotalRunCost(generationIds);
         const tokenUsage = { promptTokens: totalPromptTokens, completionTokens: totalCompletionTokens, model: AGENT_MODEL_NAME };
-        console.log(`[AgentExecutor] Cost: $${actualCostUSD} (OpenRouter) | tokens: ${totalPromptTokens}in/${totalCompletionTokens}out | genIds: ${generationIds.length}`);
-        return { output: 'Task completed.', actualCostUSD, tokenUsage };
+        console.log(`[AgentExecutor] Tokens: ${totalPromptTokens}in/${totalCompletionTokens}out`);
+        return { output: 'Task completed.', tokenUsage };
     }
 
     buildPrompt(trigger, payload, headers) {

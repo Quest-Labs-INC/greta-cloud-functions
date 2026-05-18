@@ -2,7 +2,7 @@ const express = require('express');
 const axios = require('axios');
 const { AgentExecutor } = require('./lib/execution/agentExecutor');
 const { HumanMessage, SystemMessage, ToolMessage, AIMessage } = require('@langchain/core/messages');
-const { createOpenRouterLLM, fetchTotalRunCost } = require('./lib/llm/openRouterService');
+const { createOpenRouterLLM } = require('./lib/llm/openRouterService');
 const { createSelfConfigTools } = require('./lib/tools/selfConfigTools');
 const { getOnboardingPrompt } = require('./lib/tools/onboardingPrompt');
 const { createOrchestrationTools } = require('./lib/tools/agentOrchestrationTools');
@@ -544,14 +544,11 @@ ${responseStyle}`;
 
         let finalText = '';
         let toolsExecuted = false;
-        const generationIds = [];
-        // Token fallback — used when OpenRouter generation API returns null
         const AGENT_MODEL_NAME = process.env.AGENT_MODEL || 'google/gemini-2.5-flash';
         let totalPromptTokens = 0, totalCompletionTokens = 0;
 
         function trackCall(msg) {
             if (!msg) return;
-            if (msg.id) generationIds.push(msg.id);
             const u = msg.usage_metadata || msg.response_metadata?.tokenUsage || msg.response_metadata?.usage;
             if (!u) return;
             totalPromptTokens     += u.input_tokens  || u.promptTokens  || u.prompt_tokens  || 0;
@@ -747,18 +744,13 @@ ${responseStyle}`;
             .replace(/```tool_code[\s\S]*?```/g, '')
             .trim();
 
-        // Fetch exact USD cost from OpenRouter before sending done — runs in background
-        // after response text is already streamed, so user sees no delay.
-        const actualCostUSD = await fetchTotalRunCost(generationIds);
-        console.log(`[Chat] Cost: $${actualCostUSD} (OpenRouter) | tokens: ${totalPromptTokens}in/${totalCompletionTokens}out | genIds: ${generationIds.length}`);
-
         console.log(`[Chat] Sending done — cancelled:${cancelled} finalText:"${cleanText.slice(0, 100)}" (${cleanText.length} chars)`);
+        console.log(`[Chat] Tokens: ${totalPromptTokens}in/${totalCompletionTokens}out`);
         if (cleanText) emit({ type: 'chunk', content: cleanText });
         emit({
             type: 'done',
             response: cleanText,
             conversationId,
-            actualCostUSD,
             tokenUsage: { promptTokens: totalPromptTokens, completionTokens: totalCompletionTokens, model: AGENT_MODEL_NAME },
         });
         res.end();

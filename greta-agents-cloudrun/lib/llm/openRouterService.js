@@ -35,13 +35,13 @@ function createOpenRouterLLM({ model, temperature } = {}) {
  * OpenRouter generation data is usually available within ~2s after the call completes.
  * Pass the generation ID from msg.id (e.g. "gen-xxxxxxxx").
  */
-async function fetchGenerationCost(generationId) {
+async function fetchGenerationCost(generationId, { retryOn404 = true } = {}) {
     if (!generationId) return null;
     console.log(`[OpenRouter] Fetching cost for id: "${generationId}"`);
     try {
         const res = await axios.get(`${OPENROUTER_BASE_URL}/generation?id=${generationId}`, {
             headers: { Authorization: `Bearer ${OPEN_ROUTER_API_KEY}` },
-            timeout: 5000,
+            timeout: 8000,
         });
         const d = res.data?.data;
         // For BYOK accounts total_cost = 0 — actual cost is in byok_usage_inference
@@ -49,7 +49,13 @@ async function fetchGenerationCost(generationId) {
         console.log(`[OpenRouter] id:${generationId} cost:${cost} byok:${d?.byok_usage_inference} total:${d?.total_cost}`);
         return (typeof cost === 'number' && cost > 0) ? cost : null;
     } catch (e) {
-        console.warn(`[OpenRouter] fetchGenerationCost(${generationId}) failed: ${e.response?.status} ${e.message}`);
+        const status = e.response?.status;
+        console.warn(`[OpenRouter] fetchGenerationCost(${generationId}) failed: ${status} ${e.message}`);
+        // OpenRouter returns 404 if data isn't indexed yet — retry once after 3s
+        if (status === 404 && retryOn404) {
+            await new Promise(r => setTimeout(r, 3000));
+            return fetchGenerationCost(generationId, { retryOn404: false });
+        }
         return null;
     }
 }
@@ -62,7 +68,7 @@ async function fetchGenerationCost(generationId) {
 async function fetchTotalRunCost(generationIds) {
     const ids = generationIds.filter(Boolean);
     if (!ids.length) return null;
-    await new Promise(r => setTimeout(r, 2000));
+    await new Promise(r => setTimeout(r, 3000));
     const costs = await Promise.all(ids.map(fetchGenerationCost));
     const valid = costs.filter(c => c !== null);
     if (!valid.length) return null;
