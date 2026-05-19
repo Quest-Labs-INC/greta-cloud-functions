@@ -1,4 +1,5 @@
 const axios = require('axios');
+const Sentry = require('@sentry/node');
 const { createOpenRouterLLM } = require('../llm/openRouterService');
 const { createMongoQueryTool } = require('../tools/mongoQueryTool');
 const { createOrchestrationTools } = require('../tools/agentOrchestrationTools');
@@ -12,6 +13,80 @@ const GET_CURRENT_TIME_TOOL = {
         parameters: { type: 'object', properties: {}, required: [] },
     },
 };
+
+// task_complete is the ONLY way to end a task. Text without this tool call is ignored —
+// the loop will nudge once, then terminate. This eliminates "is it done?" guesswork.
+const TASK_COMPLETE_TOOL = {
+    type: 'function',
+    function: {
+        name: 'task_complete',
+        description: `Call this tool ONCE when the task is fully completed. This is the ONLY way to signal completion — plain text responses without this tool call will be treated as "paused" and you will be asked to continue.
+
+Call task_complete when:
+- All steps from the task prompt have been executed
+- All items have been processed (e.g. all unread emails handled, all PRs checked)
+- No more meaningful actions remain
+- An unrecoverable blocker means the task cannot proceed (explain in summary)
+
+Provide a brief 1-2 sentence summary of what was done.`,
+        parameters: {
+            type: 'object',
+            properties: {
+                summary: { type: 'string', description: 'Brief summary of work completed (1-2 sentences)' },
+                itemsProcessed: { type: 'number', description: 'Optional count of items processed (emails, messages, records, etc.)' }
+            },
+            required: ['summary']
+        }
+    }
+};
+
+// Strip noisy fields from tool responses (email headers, MIME parts, raw bodies, etc.)
+// before they enter the LLM context. Without this, Gmail/Slack tool results explode
+// the context to >1M tokens within a few iterations.
+const NOISY_FIELD_NAMES = new Set([
+    'headers', 'parts', 'raw', 'attachmentlist', 'mimetype', 'display_url',
+    'arc-seal', 'arc-message-signature', 'arc-authentication-results',
+    'dkim-signature', 'received', 'x-received', 'x-google-smtp-source',
+    'authentication-results', 'message-id', 'received-spf', 'x-gm-message-state'
+]);
+const MAX_STRING_LEN = 1500;
+const MAX_ARRAY_LEN = 10;
+const MAX_DEPTH = 5;
+const MAX_RESULT_LEN = 10000;
+
+function shapeToolResult(rawResult) {
+    if (typeof rawResult !== 'string') return rawResult;
+    if (rawResult.length < 3000) return rawResult;
+
+    let parsed;
+    try { parsed = JSON.parse(rawResult); }
+    catch { return rawResult.slice(0, MAX_RESULT_LEN) + '\n... [truncated]'; }
+
+    function clean(obj, depth = 0) {
+        if (depth > MAX_DEPTH) return '[depth limit]';
+        if (Array.isArray(obj)) {
+            const limited = obj.slice(0, MAX_ARRAY_LEN).map(v => clean(v, depth + 1));
+            if (obj.length > MAX_ARRAY_LEN) limited.push(`[+${obj.length - MAX_ARRAY_LEN} more items truncated]`);
+            return limited;
+        }
+        if (obj && typeof obj === 'object') {
+            const out = {};
+            for (const [k, v] of Object.entries(obj)) {
+                if (NOISY_FIELD_NAMES.has(k.toLowerCase())) continue;
+                if (typeof v === 'string' && v.length > MAX_STRING_LEN) {
+                    out[k] = v.slice(0, MAX_STRING_LEN) + '...[truncated]';
+                } else {
+                    out[k] = clean(v, depth + 1);
+                }
+            }
+            return out;
+        }
+        return obj;
+    }
+
+    const shaped = JSON.stringify(clean(parsed));
+    return shaped.length > MAX_RESULT_LEN ? shaped.slice(0, MAX_RESULT_LEN) + '...[truncated]' : shaped;
+}
 
 // COMPOSIO_SEARCH_TOOLS: AI-powered semantic search via Composio's session.search() API.
 // Use when the pre-loaded tools don't include what you need (e.g. a specific GitHub action
@@ -181,8 +256,9 @@ class AgentExecutor {
 
     async runAgentLoop({ systemPrompt, userPrompt, toolDefs, localTools = new Map() }) {
         const llm = createOpenRouterLLM({ temperature: 0 });
-        // Mutable: COMPOSIO_SEARCH_TOOLS injects discovered schemas at runtime and rebinds
-        let dynamicTools = [GET_CURRENT_TIME_TOOL, ...toolDefs, COMPOSIO_SEARCH_TOOL_DEF];
+        // Mutable: COMPOSIO_SEARCH_TOOLS injects discovered schemas at runtime and rebinds.
+        // task_complete is always present — the agent MUST call it to end the task.
+        let dynamicTools = [GET_CURRENT_TIME_TOOL, TASK_COMPLETE_TOOL, ...toolDefs, COMPOSIO_SEARCH_TOOL_DEF];
         let llmWithTools = dynamicTools.length > 0 ? llm.bindTools(dynamicTools) : llm;
         const AGENT_MODEL_NAME = 'google/gemini-3-flash-preview';
         let totalPromptTokens = 0, totalCompletionTokens = 0;
@@ -288,7 +364,26 @@ class AgentExecutor {
         // thread state → decide action → send reply → update watch state → schedule follow-up)
         // routinely need 12-15 steps when processing multiple items.
         for (let step = 0; step < 20; step++) {
-            const msg = await llmWithTools.invoke(messages);
+            // Fix 4: defensive wrap — LLM invocation must never crash the agent loop.
+            // Network errors, content filter, rate limits, and 400 token-limit errors all surface here.
+            let msg;
+            try {
+                msg = await llmWithTools.invoke(messages);
+            } catch (err) {
+                console.error(`[AgentExecutor] LLM invoke failed at step ${step + 1}:`, err.message);
+                Sentry.captureException(err, {
+                    tags: { agent_id: this.agentId, phase: 'llm_invoke_executor', step: step + 1 },
+                    user: { id: this.userId },
+                    extra: { model: AGENT_MODEL_NAME, totalPromptTokens, totalCompletionTokens }
+                });
+                const tokenUsage = { promptTokens: totalPromptTokens, completionTokens: totalCompletionTokens, model: AGENT_MODEL_NAME };
+                return { output: `Task failed at step ${step + 1}: ${err.message || 'LLM error'}`, tokenUsage, failed: true };
+            }
+            if (!msg || typeof msg !== 'object') {
+                console.error(`[AgentExecutor] LLM returned invalid response at step ${step + 1}`);
+                const tokenUsage = { promptTokens: totalPromptTokens, completionTokens: totalCompletionTokens, model: AGENT_MODEL_NAME };
+                return { output: `Task failed at step ${step + 1}: invalid LLM response`, tokenUsage, failed: true };
+            }
             trackCall(msg);
             messages.push(msg);
 
@@ -296,16 +391,27 @@ class AgentExecutor {
             const toolCalls = msg.tool_calls || [];
             console.log(`[AgentExecutor] Step ${step + 1} — tools:${toolCalls.length} text:"${text.substring(0, 80)}"`);
 
+            // Fix 3: task_complete is the explicit completion signal. If the agent calls it,
+            // we stop immediately and return its summary. No nudging, no guessing.
+            const completionCall = toolCalls.find(tc => tc.name === 'task_complete');
+            if (completionCall) {
+                const summary = completionCall.args?.summary || text || 'Task completed.';
+                const itemsProcessed = completionCall.args?.itemsProcessed;
+                console.log(`[AgentExecutor] ✓ task_complete called — ${summary.substring(0, 100)}`);
+                const tokenUsage = { promptTokens: totalPromptTokens, completionTokens: totalCompletionTokens, model: AGENT_MODEL_NAME };
+                return { output: summary, itemsProcessed, tokenUsage };
+            }
+
             if (toolCalls.length === 0) {
                 const isFailureReport = /payload too large|tool response.*too large|413.*payload/i.test(text);
                 if (isFailureReport) throw new Error(text);
 
-                // Allow up to 3 nudges — complex workflows (check new emails + check all pending
-                // reply threads + schedule calendar) can legitimately pause multiple times.
-                if (nudgeCount < 3 && toolsCalledCount > 0 && step < 19) {
+                // Fix 3: only ONE nudge — explicitly tell the agent to call task_complete.
+                // If it still won't, accept the text and stop. Eliminates the 3-nudge infinite loop.
+                if (nudgeCount < 1 && toolsCalledCount > 0 && step < 19) {
                     nudgeCount++;
-                    console.log(`[AgentExecutor] Step ${step + 1} — LLM paused mid-task, nudging (${nudgeCount}/3)`);
-                    messages.push(new HumanMessage('Continue with any remaining tasks.'));
+                    console.log(`[AgentExecutor] Step ${step + 1} — LLM gave text without task_complete, nudging once`);
+                    messages.push(new HumanMessage('You must signal completion explicitly. Call task_complete with a summary if you are done, or continue with the next action.'));
                     continue;
                 }
 
@@ -319,7 +425,10 @@ class AgentExecutor {
             const errors = [];
             await Promise.all(
                 toolCalls.map(async (tc) => {
-                    const result = await executeTool(tc);
+                    const rawResult = await executeTool(tc);
+                    // Fix 2: shape tool result before pushing to context.
+                    // Strips email headers, MIME parts, large arrays, etc. Prevents 1M-token explosion.
+                    const result = shapeToolResult(rawResult);
                     messages.push(new ToolMessage({ tool_call_id: tc.id, content: result }));
                     if (result.startsWith('Tool failed:') || result.startsWith('Error:')) {
                         errors.push(`${tc.name}: ${result}`);
@@ -433,11 +542,12 @@ You are running as a background job. There is NO USER present. No one will see y
 5. Call tools immediately. NEVER narrate or describe what you are about to do — just call the tool. Never say "Now I will fetch...", "Next I'll...", "I am going to...", etc. Call first, narrate never.
 6. If multiple independent tools are needed (e.g., fetch emails AND fetch calendar events), call ALL of them — you can call them in parallel in the same step.
 7. Only write a final response AFTER all tools have been called and all results received.
-8. After all tools return, write a clear summary of what was found/done. That summary is the task output.
-9. Zero results from a tool is a valid outcome — include it in your summary and keep going. Never abort the whole task because one data source was empty.
-10. Only respond with "Task could not complete: [reason]" if a hard infrastructure error (auth failure, API down) makes it impossible to proceed at all.
-11. If you have no tools connected and the task requires external integrations, respond with "Task could not complete: no integrations connected for this agent."
-12. DEDUPLICATION — for tasks that process items across runs (emails, tickets, records): call watch_get("handled_{type}_{id}") BEFORE acting on each item. If it returns exists:true, skip that item. After successfully acting, immediately call watch_set("handled_{type}_{id}", true, ttlHours?) so future runs don't reprocess it. The [Run context] above tells you what's "new" since the last run — use it as your primary filter, then use watch_get as a safety net for items that fall near the boundary.`;
+8. **Signal completion by calling the \`task_complete\` tool** — this is MANDATORY. Pass a brief summary (1-2 sentences). Plain text without calling task_complete will be treated as "paused" and the loop will ask you to continue. Once you're done, call task_complete — do not write a separate text summary.
+9. Zero results from a tool is a valid outcome — include it in your task_complete summary and stop. Never abort the whole task because one data source was empty.
+10. If a hard infrastructure error (auth failure, API down) makes it impossible to proceed, call task_complete with summary "Task could not complete: [reason]".
+11. If you have no tools connected and the task requires external integrations, call task_complete with summary "Task could not complete: no integrations connected for this agent."
+12. DEDUPLICATION — for tasks that process items across runs (emails, tickets, records): call watch_get("handled_{type}_{id}") BEFORE acting on each item. If it returns exists:true, skip that item. After successfully acting, immediately call watch_set("handled_{type}_{id}", true, ttlHours?) so future runs don't reprocess it. The [Run context] above tells you what's "new" since the last run — use it as your primary filter, then use watch_get as a safety net for items that fall near the boundary.
+13. STOP CONDITION — after processing the items you set out to handle in this run, call task_complete immediately. Do NOT re-fetch the same data source "to check if more arrived". The next scheduled run handles new items. Re-fetching wastes context and tokens.`;
     }
 
     async loadAgentConfig() {
@@ -461,4 +571,4 @@ You are running as a background job. There is NO USER present. No one will see y
     }
 }
 
-module.exports = { AgentExecutor };
+module.exports = { AgentExecutor, shapeToolResult };
