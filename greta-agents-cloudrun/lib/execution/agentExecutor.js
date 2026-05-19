@@ -184,7 +184,7 @@ class AgentExecutor {
         // Mutable: COMPOSIO_SEARCH_TOOLS injects discovered schemas at runtime and rebinds
         let dynamicTools = [GET_CURRENT_TIME_TOOL, ...toolDefs, COMPOSIO_SEARCH_TOOL_DEF];
         let llmWithTools = dynamicTools.length > 0 ? llm.bindTools(dynamicTools) : llm;
-        const AGENT_MODEL_NAME = process.env.AGENT_MODEL || 'google/gemini-2.5-flash';
+        const AGENT_MODEL_NAME = 'google/gemini-3-flash-preview';
         let totalPromptTokens = 0, totalCompletionTokens = 0;
         function trackCall(msg) {
             if (!msg) return;

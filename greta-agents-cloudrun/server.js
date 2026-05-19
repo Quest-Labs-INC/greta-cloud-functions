@@ -634,7 +634,7 @@ ${responseStyle}`;
 
         let finalText = '';
         let toolsExecuted = false;
-        const AGENT_MODEL_NAME = process.env.AGENT_MODEL || 'google/gemini-2.5-flash';
+        const AGENT_MODEL_NAME = 'google/gemini-3-flash-preview';
         let totalPromptTokens = 0, totalCompletionTokens = 0;
 
         function trackCall(msg) {
