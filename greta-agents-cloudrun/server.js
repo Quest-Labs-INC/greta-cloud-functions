@@ -1,3 +1,20 @@
+// Sentry must be imported and initialized BEFORE any other modules so it can
+// instrument them. The container image is single (always prod), but the
+// effective environment is determined by which gateway this agent is connected
+// to — staging URL → staging events, production URL → production events.
+// Comment out the init block below when running locally for development.
+const Sentry = require('@sentry/node');
+const _gatewayUrl = process.env.BACKEND_GATEWAY_URL || '';
+const _sentryEnv = _gatewayUrl.includes('staging') ? 'staging' : 'production';
+Sentry.init({
+    dsn: 'https://d91df330cafa79b9af927d35249cd695@o1016721.ingest.us.sentry.io/4511415161323520',
+    environment: _sentryEnv,
+    tracesSampleRate: 0.1,
+    ignoreErrors: ['ECONNRESET', 'ECONNABORTED', 'ETIMEDOUT'],
+});
+Sentry.setTag('agent_id', process.env.AGENT_ID);
+console.log(`[Container] Sentry initialized (env: ${_sentryEnv})`);
+
 const express = require('express');
 const axios = require('axios');
 const { AgentExecutor } = require('./lib/execution/agentExecutor');
@@ -121,6 +138,40 @@ const COMPOSIO_SEARCH_TOOL_DEF = {
                 }
             },
             required: ['queries']
+        }
+    }
+};
+
+const COMPOSIO_MULTI_EXECUTE_TOOL_DEF = {
+    type: 'function',
+    function: {
+        name: 'COMPOSIO_MULTI_EXECUTE_TOOL',
+        description: `Execute one or more Composio tools after finding them with COMPOSIO_SEARCH_TOOLS.
+
+**Independent steps** (no data dependency): include all in one call — they execute in order.
+
+**Dependent steps** (step 2 needs step 1's output): DO NOT chain in one call. Call this tool twice:
+1. First call: include step 1 only. Read the result to see actual field names and values.
+2. Second call: include step 2, passing the real values from step 1's result as plain hardcoded params.
+
+This two-call approach is reliable because you work with real data — no guessing field paths or field types.`,
+        parameters: {
+            type: 'object',
+            properties: {
+                steps: {
+                    type: 'array',
+                    description: 'Tools to execute. For dependent steps, call this tool twice instead of chaining.',
+                    items: {
+                        type: 'object',
+                        properties: {
+                            tool: { type: 'string', description: 'Tool name, e.g. GMAIL_FETCH_EMAILS' },
+                            params: { type: 'object', description: 'Tool parameters as plain values (no references).' }
+                        },
+                        required: ['tool', 'params']
+                    }
+                }
+            },
+            required: ['steps']
         }
     }
 };
@@ -283,6 +334,11 @@ app.post('/execute', async (req, res) => {
     } catch (error) {
         const executionTime = Date.now() - startTime;
         console.error('[Execute] Error:', error);
+        Sentry.captureException(error, {
+            tags: { agent_id: AGENT_ID, endpoint: 'execute', trigger_type: req.body?.trigger?.type },
+            user: { id: USER_ID },
+            extra: { triggerName: req.body?.trigger?.name, executionTime }
+        });
         res.status(500).json({ success: false, error: error.message, executionTime, timestamp: new Date().toISOString() });
     }
 });
@@ -415,12 +471,46 @@ ${identityRule}
 ## Built-in tool available at all times
 - **get_current_time**: Returns current date/time. Call this FIRST when you need to know "today", "now", or calculate relative dates like "next week", "tomorrow", "next Monday". Critical for calendar queries.
 
-${composioApps.length > 0 ? `## Finding integration tools
-You have access to **COMPOSIO_SEARCH_TOOLS** — call this to find the right tool before using any integration.
-- Always call COMPOSIO_SEARCH_TOOLS first when you need to use a connected app.
-- Never guess tool names — search and use what comes back.
-- Split multi-step tasks into separate queries (e.g. "fetch emails" and "send reply" = 2 queries).
-- Connected apps you can search: ${composioApps.join(', ')}
+${composioApps.length > 0 ? `## Connected-app workflow — STRICT contract
+
+For every request that touches a connected app, follow these steps IN ORDER. The runtime enforces this — if you skip search, your execution call will be rejected.
+
+**Step 1 — Decompose the request into sub-goals BEFORE searching**
+Most real requests need multiple tools chained together. Identify all sub-goals first:
+- Involves a **named person** ("messages from Paras", "email Jane") → add sub-goal: "find user by name in [app]"
+- Involves a **named resource** (channel, repo, project, board) → add sub-goal: "find [resource] by name in [app]"
+- Asks you to **act on a specific item** (reply, edit, update, delete, comment, forward, archive, mark) → add sub-goal: "find/fetch the item by [identifying detail]" to get its real ID first. NEVER act using a guessed, invented, or remembered ID — always fetch fresh in this turn.
+
+**Step 2 — Find tools via COMPOSIO_SEARCH_TOOLS (MANDATORY every turn)**
+- Always call this first, even if you "know" the tool from training or prior turns. Past conversation does NOT keep tools available — every turn starts fresh.
+- Pass each sub-goal as a separate query in the queries array.
+- After tools return: read each schema fully — parameter names, types, examples. Read planGuidance if present.
+- If a returned tool needs an ID/param you don't have, that's a missed sub-goal — search again for the lookup tool.
+
+**Step 3 — Execute via COMPOSIO_MULTI_EXECUTE_TOOL**
+- Only use tools discovered via COMPOSIO_SEARCH_TOOLS this turn. The runtime rejects undiscovered tool names.
+- Independent steps: include all in one call.
+- Dependent steps (step 2 needs step 1's output): call MULTI_EXECUTE_TOOL twice — first step 1 alone, then step 2 with real values from step 1's actual response.
+- Tools often return BOTH a system ID ("U07541GKVGS") AND a human-readable name ("paras.k"). For query modifiers like \`from:@\`, mentions, and search filters — use the name, NOT the system ID. Read the schema description to know which the tool expects.
+- Match parameter formats exactly: if the schema says \`recipient_email: string\`, never pass an array.
+
+**Step 4 — On error, recover autonomously (NEVER ask permission to retry)**
+When any tool returns an error:
+- Read the FULL error message — Composio errors often contain the exact fix ("use X tool first", "wrong format on Y param", "thread not accessible").
+- Immediately apply the fix and retry in the same response. **Do this silently — do not narrate "I will now try X" or "should I try Y?". Just do it.**
+- If the error names a different tool to use, call COMPOSIO_SEARCH_TOOLS for that tool, then retry.
+- **NEVER write phrases like "Would you like me to try X?", "Should I attempt Y?", "Do you want me to..." after a tool error.** If you know the next step, take it. Asking permission to do the obvious wastes the user's time.
+- Only tell the user something cannot be done AFTER at least 2 different approaches have failed in the SAME response.
+
+**Critical rule on IDs and identifiers**
+Any thread_id, message_id, channel_id, user_id, event_id, or similar identifier in your tool parameters MUST come from a tool response that executed earlier in THIS turn. Specifically:
+- ✅ Valid: an ID you read from a fetch/list/find tool result in this same response
+- ❌ Invalid: an ID you "remember" from a prior conversation turn
+- ❌ Invalid: an ID that pattern-matches the format (e.g. a 16-char hex string for Gmail) — formats can be guessed, real IDs cannot
+- ❌ Invalid: an ID inferred from the assistant's previous text response
+If you don't have a real, freshly-fetched ID — your FIRST action must be to fetch it. No exceptions.
+
+Connected apps: ${composioApps.join(', ')}
 
 ` : ''}${baseGuidance}
 
@@ -431,7 +521,7 @@ You have access to **COMPOSIO_SEARCH_TOOLS** — call this to find the right too
 - Call tools silently. Do not narrate what you are about to do before calling. Exception: for create_trigger, present a summary and ask for confirmation first (see RULE 6 below).
 - After ALL tools in a step return results, write a single summary response to the user.
 - After a tool returns, use the result to answer. Do not re-call the same tool unless the result was an error.
-- If a tool fails, report the error in one sentence and stop.
+- **Read tool errors carefully**: When a tool returns an error, read the full error message — it often tells you exactly how to fix it (e.g., "use X tool first to get Y", "invalid ID format", "missing required field"). Follow the guidance and retry with the corrected approach. Do not give up after the first error if the error explains the fix.
 
 ## Creating scheduled tasks — MANDATORY RULES
 
@@ -612,7 +702,10 @@ ${responseStyle}`;
 
             toolDefs.push(GET_CURRENT_TIME_TOOL);
             toolDefs.push(CREATE_TRIGGER_TOOL);
-            if (composioApps.length > 0) toolDefs.push(COMPOSIO_SEARCH_TOOL_DEF);
+            if (composioApps.length > 0) {
+                toolDefs.push(COMPOSIO_SEARCH_TOOL_DEF);
+                toolDefs.push(COMPOSIO_MULTI_EXECUTE_TOOL_DEF);
+            }
 
             const orchestration = createOrchestrationTools({
                 agentId: AGENT_ID,
@@ -631,6 +724,10 @@ ${responseStyle}`;
                 llmWithTools = llm;
             }
 
+            // Track Composio tools discovered via search this turn — used to validate MULTI_EXECUTE_TOOL calls.
+            // The LLM cannot bypass discovery by guessing tool names from training.
+            const discoveredComposioTools = new Set();
+
             for (let step = 0; step < 8 && !cancelled; step++) {
                 console.log(`[Chat] Step ${step + 1}: invoking LLM...`);
                 let msg;
@@ -638,6 +735,11 @@ ${responseStyle}`;
                     msg = await llmWithTools.invoke(phase3Messages);
                 } catch (e) {
                     console.error('[Chat] LLM invoke failed:', e.message, e.stack?.slice(0, 300));
+                    Sentry.captureException(e, {
+                        tags: { agent_id: AGENT_ID, phase: 'llm_invoke', step: step + 1 },
+                        user: { id: userId },
+                        extra: { conversationId, model: AGENT_MODEL_NAME }
+                    });
                     break;
                 }
 
@@ -673,22 +775,56 @@ ${responseStyle}`;
                             const added = [];
                             for (const schema of newSchemas) {
                                 const tName = schema.function?.name || schema.name;
-                                if (tName && !toolDefs.find(d => (d.function?.name || d.name) === tName)) {
-                                    toolDefs.push(schema);
-                                    added.push(tName);
+                                if (tName) {
+                                    discoveredComposioTools.add(tName);
+                                    if (!toolDefs.find(d => (d.function?.name || d.name) === tName)) {
+                                        toolDefs.push(schema);
+                                        added.push(tName);
+                                    }
                                 }
                             }
                             if (added.length > 0) {
                                 llmWithTools = llm.bindTools(toolDefs);
                                 console.log(`[Chat] COMPOSIO_SEARCH_TOOLS injected ${added.length} tools: ${added.slice(0, 5).join(', ')}`);
                             }
+                            const planGuidance = searchRes.data.planGuidance || [];
                             result = JSON.stringify({
                                 found: newSchemas.length,
                                 tools: newSchemas.map(t => t.function?.name || t.name),
+                                ...(planGuidance.length > 0 && { planGuidance }),
                                 message: newSchemas.length > 0
-                                    ? `Found ${newSchemas.length} tools. They are now available — call them directly.`
-                                    : 'No tools found. Try using the tools already in your tool set.'
+                                    ? (planGuidance.length > 0
+                                        ? `Found ${newSchemas.length} tools. Read planGuidance below — it shows the exact steps and pitfalls for this workflow. Follow it.`
+                                        : `Found ${newSchemas.length} tools. They are now available via COMPOSIO_MULTI_EXECUTE_TOOL.`)
+                                    : 'No tools found. Re-think the request, decompose into sub-goals, and search again with different terms.'
                             });
+                        } else if (tc.name === 'COMPOSIO_MULTI_EXECUTE_TOOL') {
+                            const steps = tc.args?.steps || [];
+                            // Validate: every step must reference a tool discovered via COMPOSIO_SEARCH_TOOLS this turn.
+                            // Prevents the LLM from guessing tool names from training memory.
+                            const undiscovered = steps
+                                .map((s, idx) => ({ idx: idx + 1, tool: s.tool }))
+                                .filter(s => s.tool && !discoveredComposioTools.has(s.tool));
+
+                            if (undiscovered.length > 0) {
+                                console.warn(`[Chat] COMPOSIO_MULTI_EXECUTE_TOOL rejected — undiscovered tools: ${undiscovered.map(u => u.tool).join(', ')}`);
+                                result = JSON.stringify({
+                                    rejected: true,
+                                    reason: 'One or more tools were not discovered via COMPOSIO_SEARCH_TOOLS in this turn.',
+                                    undiscoveredTools: undiscovered,
+                                    requiredAction: 'Call COMPOSIO_SEARCH_TOOLS first with queries describing what each undiscovered tool does. Read the returned schemas (parameter names and types) carefully, then retry COMPOSIO_MULTI_EXECUTE_TOOL using only discovered tools and schema-correct params.',
+                                    discoveredSoFar: [...discoveredComposioTools]
+                                });
+                            } else {
+                                const multiRes = await axios.post(
+                                    `${BACKEND_GATEWAY_URL}/api/greta/gateway/composio/multi-execute`,
+                                    { agentId: AGENT_ID, userId, steps },
+                                    { headers: { 'x-gateway-signature': gatewaySignature } }
+                                );
+                                result = multiRes.data.success
+                                    ? JSON.stringify(multiRes.data.results)
+                                    : `Error: ${multiRes.data.error}`;
+                            }
                         } else {
                             result = await executeExternalTool(tc);
                         }
@@ -770,6 +906,11 @@ ${responseStyle}`;
 
     } catch (error) {
         console.error('[Chat] Error:', error);
+        Sentry.captureException(error, {
+            tags: { agent_id: AGENT_ID, endpoint: 'chat' },
+            user: { id: userId },
+            extra: { conversationId, messagePreview: message?.slice(0, 200) }
+        });
         emit({ type: 'error', message: error.message });
         res.end();
     }
