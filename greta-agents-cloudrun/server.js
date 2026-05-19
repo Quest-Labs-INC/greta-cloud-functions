@@ -6,14 +6,14 @@
 const Sentry = require('@sentry/node');
 const _gatewayUrl = process.env.BACKEND_GATEWAY_URL || '';
 const _sentryEnv = _gatewayUrl.includes('staging') ? 'staging' : 'production';
-// Sentry.init({
-//     dsn: 'https://d91df330cafa79b9af927d35249cd695@o1016721.ingest.us.sentry.io/4511415161323520',
-//     environment: _sentryEnv,
-//     tracesSampleRate: 0.1,
-//     ignoreErrors: ['ECONNRESET', 'ECONNABORTED', 'ETIMEDOUT'],
-// });
-// Sentry.setTag('agent_id', process.env.AGENT_ID);
-// console.log(`[Container] Sentry initialized (env: ${_sentryEnv})`);
+Sentry.init({
+    dsn: 'https://d91df330cafa79b9af927d35249cd695@o1016721.ingest.us.sentry.io/4511415161323520',
+    environment: _sentryEnv,
+    tracesSampleRate: 0.1,
+    ignoreErrors: ['ECONNRESET', 'ECONNABORTED', 'ETIMEDOUT'],
+});
+Sentry.setTag('agent_id', process.env.AGENT_ID);
+console.log(`[Container] Sentry initialized (env: ${_sentryEnv})`);
 
 const express = require('express');
 const axios = require('axios');
