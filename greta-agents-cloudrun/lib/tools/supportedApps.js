@@ -6,6 +6,11 @@ const SUPPORTED_APPS = [
     'GITHUB',
     'GOOGLESHEETS',
     'JIRA',
+    'CALENDLY',
+    'DISCORD',
+    'GOOGLEDOCS',
+    'LINKEDIN',
+    'STRIPE',
 ];
 
 module.exports = { SUPPORTED_APPS };

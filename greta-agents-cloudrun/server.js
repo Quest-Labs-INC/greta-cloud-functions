@@ -1,19 +1,19 @@
-// Sentry must be imported and initialized BEFORE any other modules so it can
+﻿// Sentry must be imported and initialized BEFORE any other modules so it can
 // instrument them. The container image is single (always prod), but the
 // effective environment is determined by which gateway this agent is connected
-// to — staging URL → staging events, production URL → production events.
+// to ” staging URL ’ staging events, production URL ’ production events.
 // Comment out the init block below when running locally for development.
 const Sentry = require('@sentry/node');
 const _gatewayUrl = process.env.BACKEND_GATEWAY_URL || '';
 const _sentryEnv = _gatewayUrl.includes('staging') ? 'staging' : 'production';
-Sentry.init({
-    dsn: 'https://d91df330cafa79b9af927d35249cd695@o1016721.ingest.us.sentry.io/4511415161323520',
-    environment: _sentryEnv,
-    tracesSampleRate: 0.1,
-    ignoreErrors: ['ECONNRESET', 'ECONNABORTED', 'ETIMEDOUT'],
-});
-Sentry.setTag('agent_id', process.env.AGENT_ID);
-console.log(`[Container] Sentry initialized (env: ${_sentryEnv})`);
+// Sentry.init({
+//     dsn: 'https://d91df330cafa79b9af927d35249cd695@o1016721.ingest.us.sentry.io/4511415161323520',
+//     environment: _sentryEnv,
+//     tracesSampleRate: 0.1,
+//     ignoreErrors: ['ECONNRESET', 'ECONNABORTED', 'ETIMEDOUT'],
+// });
+// Sentry.setTag('agent_id', process.env.AGENT_ID);
+// console.log(`[Container] Sentry initialized (env: ${_sentryEnv})`);
 
 const express = require('express');
 const axios = require('axios');
@@ -38,10 +38,10 @@ console.log(`[Container] Starting container for Agent ID: ${AGENT_ID}`);
 console.log(`[Container] Backend Gateway: ${BACKEND_GATEWAY_URL}`);
 
 // CACHE STRATEGY CHANGE:
-// - OLD: Cache by apps only → same tools for "send email" and "search emails"
-// - NEW: Cache by apps + useCase hash → different tools for different requests
+// - OLD: Cache by apps only ’ same tools for "send email" and "search emails"
+// - NEW: Cache by apps + useCase hash ’ different tools for different requests
 // - TTL: 5 minutes (tools can change as conversation evolves)
-const toolsCacheMap = new Map(); // key: "GMAIL|SLACK|abc123" → { tools, expiresAt }
+const toolsCacheMap = new Map(); // key: "GMAIL|SLACK|abc123" ’ { tools, expiresAt }
 const TOOLS_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
 
 let mcpToolsCache = null;
@@ -109,8 +109,8 @@ Call this tool after gathering: what to monitor, what condition triggers action,
                 type: { type: 'string', enum: ['SCHEDULED', 'WEBHOOK_RECEIVED'], description: 'SCHEDULED for time-based polling, WEBHOOK_RECEIVED for webhook-triggered' },
                 cronExpression: { type: 'string', description: 'Cron expression. REQUIRED for SCHEDULED type. Examples: "0 9 * * *" = every day 9am, "0 9 * * 1-5" = weekdays 9am, "*/5 * * * *" = every 5 min, "0 9 * * 1" = Monday 9am. Use empty string for WEBHOOK_RECEIVED.' },
                 timezone: { type: 'string', description: 'Timezone for SCHEDULED tasks (e.g. "America/New_York", "Asia/Kolkata", "UTC"). Default UTC.' },
-                runPrompt: { type: 'string', description: 'Natural language instruction the agent will follow at runtime. MUST be plain English — NEVER code, scripts, or pseudocode. Be specific: what to fetch, what condition to check, what action to take. Example: "Fetch today\'s Google Calendar events. Send an email to user@example.com with the subject \'Daily Meeting Reminder\' listing each meeting\'s time and title."' },
-                composioApps: { type: 'array', items: { type: 'string' }, description: 'Apps this task needs. CRITICAL: only list apps from your "Connected apps" section. If an app is not connected, do NOT include it here — the task will still be created and the runPrompt can still reference that app.' },
+                runPrompt: { type: 'string', description: 'Natural language instruction the agent will follow at runtime. MUST be plain English ” NEVER code, scripts, or pseudocode. Be specific: what to fetch, what condition to check, what action to take. Example: "Fetch today\'s Google Calendar events. Send an email to user@example.com with the subject \'Daily Meeting Reminder\' listing each meeting\'s time and title."' },
+                composioApps: { type: 'array', items: { type: 'string' }, description: 'Apps this task needs. CRITICAL: only list apps from your "Connected apps" section. If an app is not connected, do NOT include it here ” the task will still be created and the runPrompt can still reference that app.' },
             },
             required: ['name', 'type', 'runPrompt', 'cronExpression'],
         },
@@ -121,7 +121,7 @@ const COMPOSIO_SEARCH_TOOL_DEF = {
     type: 'function',
     function: {
         name: 'COMPOSIO_SEARCH_TOOLS',
-        description: 'Find additional tools not in your current tool set. Use when you need a specific action that is not available in the tools you already have. Composio AI searches semantically and returns matching tool schemas — you can call them immediately after.',
+        description: 'Find additional tools not in your current tool set. Use when you need a specific action that is not available in the tools you already have. Composio AI searches semantically and returns matching tool schemas ” you can call them immediately after.',
         parameters: {
             type: 'object',
             properties: {
@@ -148,13 +148,13 @@ const COMPOSIO_MULTI_EXECUTE_TOOL_DEF = {
         name: 'COMPOSIO_MULTI_EXECUTE_TOOL',
         description: `Execute one or more Composio tools after finding them with COMPOSIO_SEARCH_TOOLS.
 
-**Independent steps** (no data dependency): include all in one call — they execute in order.
+**Independent steps** (no data dependency): include all in one call ” they execute in order.
 
 **Dependent steps** (step 2 needs step 1's output): DO NOT chain in one call. Call this tool twice:
 1. First call: include step 1 only. Read the result to see actual field names and values.
 2. Second call: include step 2, passing the real values from step 1's result as plain hardcoded params.
 
-This two-call approach is reliable because you work with real data — no guessing field paths or field types.`,
+This two-call approach is reliable because you work with real data ” no guessing field paths or field types.`,
         parameters: {
             type: 'object',
             properties: {
@@ -182,7 +182,7 @@ const GET_CURRENT_TIME_TOOL = {
     type: 'function',
     function: {
         name: 'get_current_time',
-        description: "Returns the current date and time. Call this FIRST when you need to know today's date, current time, day of the week, or to calculate relative dates (next week, tomorrow, etc.) — especially for calendar queries, scheduling, deadlines.",
+        description: "Returns the current date and time. Call this FIRST when you need to know today's date, current time, day of the week, or to calculate relative dates (next week, tomorrow, etc.) ” especially for calendar queries, scheduling, deadlines.",
         parameters: { type: 'object', properties: {}, required: [] },
     },
 };
@@ -243,7 +243,7 @@ async function consolidateMemory({ currentMemory, conversationTurns, agentName }
 Memory has two sections. Keep them clearly separated:
 
 ## Facts
-Permanent, stable facts about the user — name, preferences, account identifiers, recurring needs.
+Permanent, stable facts about the user ” name, preferences, account identifiers, recurring needs.
 Update only when something genuinely new is learned about the user.
 
 ## Recent context
@@ -261,7 +261,7 @@ ${conversationTurns.map(m => `${m.role}: ${m.content}`).join('\n')}
 
 Rules:
 - Facts: only user identity, preferences, account info (names, orgs, repos they own). One line each.
-- Recent context: a flowing summary of topics and outcomes — NOT a list of every message.
+- Recent context: a flowing summary of topics and outcomes ” NOT a list of every message.
 - NEVER store: tool names or parameters, tool errors/failures, "user is aware that..." statements, tool capabilities, one-time questions that won't recur.
 - If nothing new was learned about the user, return the current memory exactly as-is.
 - Keep total memory under 400 words.
@@ -304,7 +304,7 @@ app.post('/execute', async (req, res) => {
 
     try {
         if (!agentExecutor) {
-            console.log('[Execute] Agent not initialized — initializing now...');
+            console.log('[Execute] Agent not initialized ” initializing now...');
             await initializeAgent();
             if (!agentExecutor) {
                 return res.status(503).json({ success: false, error: 'Agent executor failed to initialize' });
@@ -381,7 +381,7 @@ app.post('/chat', async (req, res) => {
     const emit = (data) => res.write(`data: ${JSON.stringify(data)}\n\n`);
 
     let cancelled = false;
-    // Use res.on('close') not req.on('close') — on HTTP/2 (Cloud Run), req closes
+    // Use res.on('close') not req.on('close') ” on HTTP/2 (Cloud Run), req closes
     // immediately when the request body END_STREAM is received, which is before
     // Phase 3 starts. res closes only when the response is actually finished or
     // the client truly disconnects.
@@ -412,7 +412,7 @@ app.post('/chat', async (req, res) => {
         if (isOnboarding) {
             selfConfigToolInstances = createSelfConfigTools({ agentId: AGENT_ID, userId, gatewayUrl: BACKEND_GATEWAY_URL, composioApps });
             toolDefs = selfConfigToolInstances;
-            console.log(`[Chat] Onboarding mode — loaded ${toolDefs.length} self-config tools`);
+            console.log(`[Chat] Onboarding mode ” loaded ${toolDefs.length} self-config tools`);
         }
 
         // Build base prompt sections used by both Phase 1 and Phase 3
@@ -427,14 +427,14 @@ app.post('/chat', async (req, res) => {
 
         const notConnectedApps = supportedAppsList.filter(a => !composioApps.map(x => x.toUpperCase()).includes(a.toUpperCase()));
         const connectableSection = notConnectedApps.length > 0
-            ? `\n\n## Apps available to connect (not yet connected)\n${notConnectedApps.join(', ')}\n\nCRITICAL — "connect X" rule: If the user says "connect [app]", "add [app]", "I want to use [app]", or asks to do ANYTHING that requires one of the apps above, output TOOLS_NEEDED:APPNAME on the FIRST line. You MAY add one optional sentence on the next line telling the user what you will do after they connect (especially if they described a specific task). Nothing else.\nFormat:\nTOOLS_NEEDED:APPNAME\n[Optional: one sentence about what happens after connecting]\n\nUse the exact uppercase name from the list. Examples:\n- "connect stripe" → TOOLS_NEEDED:STRIPE\n- "add Stripe for invoice reminders" → TOOLS_NEEDED:STRIPE\\nConnect Stripe below — once authorized, I'll set up your invoice reminder task.\n- "add hubspot" → TOOLS_NEEDED:HUBSPOT\n- "I want to use zoom" → TOOLS_NEEDED:ZOOM\nDo NOT say you cannot connect it. Do NOT explain at length. Just TOOLS_NEEDED:APPNAME and one optional follow-up line.`
+            ? `\n\n## Apps available to connect (not yet connected)\n${notConnectedApps.join(', ')}\n\nCRITICAL ” "connect X" rule: If the user says "connect [app]", "add [app]", "I want to use [app]", or asks to do ANYTHING that requires one of the apps above, output TOOLS_NEEDED:APPNAME on the FIRST line. You MAY add one optional sentence on the next line telling the user what you will do after they connect (especially if they described a specific task). Nothing else.\nFormat:\nTOOLS_NEEDED:APPNAME\n[Optional: one sentence about what happens after connecting]\n\nUse the exact uppercase name from the list. Examples:\n- "connect stripe" ’ TOOLS_NEEDED:STRIPE\n- "add Stripe for invoice reminders" ’ TOOLS_NEEDED:STRIPE\\nConnect Stripe below ” once authorized, I'll set up your invoice reminder task.\n- "add hubspot" ’ TOOLS_NEEDED:HUBSPOT\n- "I want to use zoom" ’ TOOLS_NEEDED:ZOOM\nDo NOT say you cannot connect it. Do NOT explain at length. Just TOOLS_NEEDED:APPNAME and one optional follow-up line.`
             : '';
         const enabledMcpServers = mcpServers.filter(s => s.enabled !== false);
         const mcpSection = mcpEnabled && enabledMcpServers.length > 0
             ? `\n\n## MCP servers\n${enabledMcpServers.map(s => s.name).join(', ')}`
             : '';
 
-        const baseGuidance = `## How to handle missing information — read this carefully
+        const baseGuidance = `## How to handle missing information ” read this carefully
 Your goal is to take action with minimal back-and-forth.
 
 **When all required info is present:** Act immediately. No confirmation needed. Exception: for creating scheduled tasks, always confirm with the user first (see task creation rules).
@@ -443,7 +443,7 @@ Your goal is to take action with minimal back-and-forth.
 
 **When truly critical info is missing (you genuinely cannot proceed without it):** Ask for ALL missing critical items in ONE single message. Not one question at a time.
 
-**EXCEPTION — creating scheduled tasks / automations:** Inference does NOT apply. Tasks run autonomously with no chance to ask follow-up questions later. You MUST gather every critical runtime parameter (recipient, source account, trigger condition, content shape) before drafting the task. NEVER infer a recipient name (Slack user/channel, email address) — these are user choices, not defaults. See "Creating scheduled tasks" rules below.
+**EXCEPTION ” creating scheduled tasks / automations:** Inference does NOT apply. Tasks run autonomously with no chance to ask follow-up questions later. You MUST gather every critical runtime parameter (recipient, source account, trigger condition, content shape) before drafting the task. NEVER infer a recipient name (Slack user/channel, email address) ” these are user choices, not defaults. See "Creating scheduled tasks" rules below.
 
 **When the user has already answered a question:** Read the conversation history. Use their answer. Never ask the same thing twice.
 
@@ -454,31 +454,27 @@ The user expects action, not a checklist conversation. Bias heavily toward actin
 Be a thoughtful colleague, not a chatbot.
 
 **Don't:**
-- Open with filler ("Certainly!", "Of course!", "Great question!") — start with the answer.
+- Open with filler ("Certainly!", "Of course!", "Great question!") ” start with the answer.
 - End with trailing prompts ("Is there anything else I can help with?", "Let me know!").
-- Decorate with emoji or fake enthusiasm ("Done! 🎉✨", "Amazing!").
-- Dead-end refusals with "I can't do that." — always pivot.
+- Decorate with emoji or fake enthusiasm ("Done! "Amazing!").
+- Dead-end refusals with "I can't do that." ” always pivot.
 
 **Do:**
-- Match the user's register. Short → short. Detailed → thorough.
-- Use contractions ("I'll", "you're", "let's") — feels human, not stilted.
-- When you recognise the user by name or context from memory, weave it in naturally — not every message, only where it adds warmth.
-- On a repeated question, acknowledge it and reframe: "You asked earlier — here's another angle..." Never return the same sentence.
-- Format multi-item replies (inbox summaries, lists, comparisons) with structure — headers, categories, priority order. Flat lists feel lazy.
-
-**Emoji — only as functional state markers:**
-- ✅ confirmed action  •  ⚠️ warning  •  💡 tip  •  🎯 found
-- Never in errors or formal contexts. Never for decoration.
+- Match the user's register. Short ’ short. Detailed ’ thorough.
+- Use contractions ("I'll", "you're", "let's") ” feels human, not stilted.
+- When you recognise the user by name or context from memory, weave it in naturally ” not every message, only where it adds warmth.
+- On a repeated question, acknowledge it and reframe: "You asked earlier ” here's another angle..." Never return the same sentence.
+- Format multi-item replies (inbox summaries, lists, comparisons) with structure ” headers, categories, priority order. Flat lists feel lazy.
 
 **Proactive next step (sparingly):**
 After completing an action, offer ONE specific next step IF it would actually help. Not filler.
-- ✅ "Email sent. Want me to remind you in 24h if no reply?"
-- ❌ "Done. Let me know if you need anything else."
+-  "Email sent. Want me to remind you in 24h if no reply?"
+-  "Done. Let me know if you need anything else."
 
 **Refuse forward, not backward:**
 When you can't do something, pivot to what you CAN do.
-- ❌ "I can't tell you what model I run on."
-- ✅ "I'm [name] from Greta — the underlying model is kept under the hood so we can swap it. What can I help you with?"
+-  "I can't tell you what model I run on."
+-  "I'm [name] from Greta ” the underlying model is kept under the hood so we can swap it. What can I help you with?"
 
 **Markdown** when it adds clarity (lists, tables, code). Plain prose otherwise.`;
 
@@ -493,7 +489,7 @@ You are ${agentName}, an agent built on the Greta platform.
 
 When asked about yourself, what you do, or your capabilities:
 - Mention your name, that you're built on Greta, and what you can help with (based on your purpose and connected apps listed above).
-- **Vary your phrasing each time.** If the user asks a second time, reframe — don't repeat the same sentence. Pull a different angle (capabilities, purpose, what you're connected to, what makes this agent useful).
+- **Vary your phrasing each time.** If the user asks a second time, reframe ” don't repeat the same sentence. Pull a different angle (capabilities, purpose, what you're connected to, what makes this agent useful).
 - Keep introductions short the first time. Expand only if the user asks for more detail.
 
 When asked about the underlying AI model, technology, or "are you GPT/Claude/Gemini":
@@ -502,7 +498,7 @@ When asked about the underlying AI model, technology, or "are you GPT/Claude/Gem
 
 When the user asks to rename you or change your identity:
 - Be honest: this version doesn't support renaming. Don't fabricate a settings path.
-- Acknowledge the ask without rejecting it as a flaw: "I'm fixed as ${agentName} for now — renaming isn't something I support yet. What can I help you with in the meantime?"
+- Acknowledge the ask without rejecting it as a flaw: "I'm fixed as ${agentName} for now ” renaming isn't something I support yet. What can I help you with in the meantime?"
 - Never pretend it's possible.`;
 
             systemPrompt = `You are ${agentName}.
@@ -515,44 +511,69 @@ ${identityRule}
 ## Built-in tool available at all times
 - **get_current_time**: Returns current date/time. Call this FIRST when you need to know "today", "now", or calculate relative dates like "next week", "tomorrow", "next Monday". Critical for calendar queries.
 
-${composioApps.length > 0 ? `## Connected-app workflow — STRICT contract
+${composioApps.length > 0 ? `## Connected-app workflow
 
-For every request that touches a connected app, follow these steps IN ORDER. The runtime enforces this — if you skip search, your execution call will be rejected.
+**The most important thing: PLAN before you search.** Get planning wrong and every downstream step compounds the error. Bad plan ’ bad search query ’ wrong tools ’ wasted execution ’ wrong answer. Fix the plan, not the symptoms.
 
-**Step 1 — Decompose the request into sub-goals BEFORE searching**
-Most real requests need multiple tools chained together. Identify all sub-goals first:
-- Involves a **named person** ("messages from Paras", "email Jane") → add sub-goal: "find user by name in [app]"
-- Involves a **named resource** (channel, repo, project, board) → add sub-goal: "find [resource] by name in [app]"
-- Asks you to **act on a specific item** (reply, edit, update, delete, comment, forward, archive, mark) → add sub-goal: "find/fetch the item by [identifying detail]" to get its real ID first. NEVER act using a guessed, invented, or remembered ID — always fetch fresh in this turn.
+### 1. Plan
 
-**Step 2 — Find tools via COMPOSIO_SEARCH_TOOLS (MANDATORY every turn)**
-- Always call this first, even if you "know" the tool from training or prior turns. Past conversation does NOT keep tools available — every turn starts fresh.
-- Pass each sub-goal as a separate query in the queries array.
-- After tools return: read each schema fully — parameter names, types, examples. Read planGuidance if present.
-- If a returned tool needs an ID/param you don't have, that's a missed sub-goal — search again for the lookup tool.
+Answer two questions before doing anything:
 
-**Step 3 — Execute via COMPOSIO_MULTI_EXECUTE_TOOL**
-- Only use tools discovered via COMPOSIO_SEARCH_TOOLS this turn. The runtime rejects undiscovered tool names.
-- Independent steps: include all in one call.
-- Dependent steps (step 2 needs step 1's output): call MULTI_EXECUTE_TOOL twice — first step 1 alone, then step 2 with real values from step 1's actual response.
-- Tools often return BOTH a system ID ("U07541GKVGS") AND a human-readable name ("paras.k"). For query modifiers like \`from:@\`, mentions, and search filters — use the name, NOT the system ID. Read the schema description to know which the tool expects.
-- Match parameter formats exactly: if the schema says \`recipient_email: string\`, never pass an array.
+**A. What SHAPE is this request?**
+- Simple action with all info present ’ 1 tool, 1 execute
+- Action on an item referenced indirectly ("her email", "that PR") ’ fetch the item first to get its real ID, then act
+- List/query with filters ("last 5 emails from X") ’ 1 query tool with the right params
+- Aggregate across many items ("unread across all", "anyone who...", "summary of all...") ’ list parents ’ batch-fetch each ’ combine. No single tool gives an aggregate; you must compose.
+- Multi-app workflow ("check Gmail then post to Slack") ’ plan ALL sub-tasks upfront
 
-**Step 4 — On error, recover autonomously (NEVER ask permission to retry)**
-When any tool returns an error:
-- Read the FULL error message — Composio errors often contain the exact fix ("use X tool first", "wrong format on Y param", "thread not accessible").
-- Immediately apply the fix and retry in the same response. **Do this silently — do not narrate "I will now try X" or "should I try Y?". Just do it.**
-- If the error names a different tool to use, call COMPOSIO_SEARCH_TOOLS for that tool, then retry.
-- **NEVER write phrases like "Would you like me to try X?", "Should I attempt Y?", "Do you want me to..." after a tool error.** If you know the next step, take it. Asking permission to do the obvious wastes the user's time.
-- Only tell the user something cannot be done AFTER at least 2 different approaches have failed in the SAME response.
+**B. What CAPABILITIES do I need?**
 
-**Critical rule on IDs and identifiers**
-Any thread_id, message_id, channel_id, user_id, event_id, or similar identifier in your tool parameters MUST come from a tool response that executed earlier in THIS turn. Specifically:
-- ✅ Valid: an ID you read from a fetch/list/find tool result in this same response
-- ❌ Invalid: an ID you "remember" from a prior conversation turn
-- ❌ Invalid: an ID that pattern-matches the format (e.g. a 16-char hex string for Gmail) — formats can be guessed, real IDs cannot
-- ❌ Invalid: an ID inferred from the assistant's previous text response
-If you don't have a real, freshly-fetched ID — your FIRST action must be to fetch it. No exceptions.
+Composio tools follow the pattern \`APPNAME_VERB_OBJECT\` (e.g. \`SLACK_LIST_MEMBERS\`, \`GMAIL_FETCH_EMAILS\`). Your search queries must use verbs Composio understands: **list, fetch, send, search, get, create, update, delete**.
+
+Translate the user's outcome into those verbs:
+- ❌ "unread messages" → ✅ "list slack conversations" (returns unread_count per channel)
+- ❌ "anyone who replied" → ✅ "fetch slack thread replies"
+- ❌ "messages from Alice" → ✅ "search slack messages" (use name in the search query, not a user lookup)
+- ❌ "find slack user" → ✅ "list slack members" or just pass the name directly to send/fetch tools
+- ❌ "summary of emails" → ✅ "fetch gmail emails" or "list gmail messages"
+
+The rule: use the verb that matches what the tool physically does (list, fetch, send), NOT your end goal (find, summarize, check). Natural-language outcome phrases return 0 results.
+
+**Slack "unread" — no dedicated tool exists.** LIST_CONVERSATIONS returns \`unread_count\` per channel/DM. Filter for \`unread_count > 0\`, then fetch recent messages from those. Do NOT search for an "unread" tool — there isn't one.
+
+
+### 2. Search
+
+ONE call to COMPOSIO_SEARCH_TOOLS with ALL capability queries in the \`queries\` array.
+
+Multiple search rounds = you planned poorly. Fix the plan, don't keep searching.
+
+After tools return: read each schema fully (parameter names, types, examples). The schema is your contract ” if a param is \`string\`, never send array; if examples show \`from:@username\`, never send \`from:USER_ID\`.
+
+If a returned tool needs an ID/param you don't have, that's a missed sub-goal ” search once more with a \`list\` or \`find\` capability query.
+
+### 3. Execute
+
+Use COMPOSIO_MULTI_EXECUTE_TOOL only. The runtime rejects all other Composio tool names.
+
+**Batch parallel work in ONE call.** Processing N items = ONE MULTI_EXECUTE_TOOL call with N steps. Never N separate calls with 1 step each — that's serial, slow, wasteful. The whole point of MULTI_EXECUTE is to run independent steps concurrently.
+
+**Cap individual fetches at 10.** For “summarize all”, “list everything”, “check all unread” — fetch at most 10 items (most recent). Tell the user how many you sampled. Never send 20+ fetch steps in one call.
+
+**Sequential calls only when truly data-dependent.** Use a second MULTI_EXECUTE_TOOL call when step 2 needs step 1's actual response data (e.g., reply needs the thread_id from fetch). Only split the dependent steps ” never split steps that already have all the data they need.
+
+**Tools often return BOTH a system ID and a human-readable name.** For query modifiers like \`from:@\`, mentions, and search filters ” use the name, NOT the system ID.
+
+### 4. Be efficient ” don't over-work
+
+- **Trust your first result.** If the data you need is in hand, USE IT. Don't call "details for X" tools to verify what's already there.
+- **Commit to your plan.** Don't switch strategies mid-task. If you committed to "list + iterate", finish the iteration ” don't abandon halfway for a global search.
+- **Don't re-call tools from this turn.** Results don't change in 5 seconds.
+- **All IDs come from THIS turn's tool responses.** Never memory, never prior turns, never pattern-matching the format.
+
+### 5. On error
+
+Read the full error ” Composio errors often specify the exact fix. Apply the fix and retry silently. After 2 different failed approaches, tell the user briefly what blocked you. Never ask permission to retry an obvious next step.
 
 Connected apps: ${composioApps.join(', ')}
 
@@ -564,10 +585,6 @@ Connected apps: ${composioApps.join(', ')}
 - When the user asks for multiple actions, call ALL required tools in one response.
 - Call tools silently. Do not narrate what you are about to do before calling. Exception: for create_trigger, you must first complete the Discovery and Confirmation phases (see task creation rules below).
 - After ALL tools in a step return results, write a single summary response to the user.
-- **Trust your first result.** After any tool returns, scan it fully for the data you need. If it's there, use it — write the response. List and search tools typically return full item details (IDs, metadata, content, summaries) in one call.
-- **No defensive re-fetching.** Do not call a related tool (a "get by ID", "details for", or similar) to fetch data that already appeared in a prior result this turn. Looping a per-item fetch over items a list tool already returned wastes time, tokens, and money — and adds zero information.
-- Do not re-call the same tool unless it returned a hard error.
-- **Read tool errors carefully**: When a tool returns an error, read the full error message — it often tells you exactly how to fix it (e.g., "use X tool first to get Y", "invalid ID format", "missing required field"). Follow the guidance and retry with the corrected approach. Do not give up after the first error if the error explains the fix.
 
 ## Creating scheduled tasks — MANDATORY RULES
 
@@ -582,10 +599,10 @@ The task creation flow has THREE distinct phases. Follow them in order — do no
 
 A scheduled task runs autonomously. Once created, it has no chance to ask follow-up questions. Every parameter must be locked in at creation. Before you write a summary or call create_trigger:
 
-1. Enumerate every parameter the task will need at runtime. For a "monitor X → notify Y" workflow this ALWAYS includes:
-   - **Recipient/destination**: exact Slack user (e.g. "@dhaanu"), Slack channel (e.g. "#alerts"), email address, phone number — whichever the action needs
+1. Enumerate every parameter the task will need at runtime. For a "monitor X ’ notify Y" workflow this ALWAYS includes:
+   - **Recipient/destination**: exact destination ” a Slack user (e.g. "@username"), Slack channel (e.g. "#channel"), email address, phone number, etc. ” whichever the action needs
    - **Source identity**: which account/inbox/workspace if the user has multiple connections of the same type
-   - **Trigger condition**: what counts as "new" or "matching" — sender filter, subject keyword, label, priority, time window
+   - **Trigger condition**: what counts as "new" or "matching" ” sender filter, subject keyword, label, priority, time window
    - **Notification content**: subject + sender only / one-line summary / full body / formatted with markdown / etc.
    - **Schedule specifics**: exact frequency, timezone, working hours, day-of-week filter
    - **Dedup behavior**: process same item once, or every run, or N times?
@@ -615,7 +632,7 @@ Before calling create_trigger, present the complete task as a scannable spec so 
 > - **Frequency**: [exact schedule in plain English, e.g. "every 5 minutes" or "every weekday at 9 AM IST"]
 > - **Source**: [integration + which account, e.g. "Gmail (dhaanu.i@questlabs.biz)"]
 > - **Trigger condition**: [what counts as matching, e.g. "any unread email received since the last run"]
-> - **Recipient**: [exact destination, e.g. "Slack DM to @dhaanu" or "#alerts channel"]
+> - **Recipient**: [exact destination, e.g. "Slack DM to @username" or "#channel-name"]
 > - **Content**: [what the notification will contain, e.g. "subject + sender + one-line snippet"]
 > - **Dedup**: [how repeats are avoided, e.g. "won't notify the same email twice"]
 >
@@ -623,24 +640,24 @@ Before calling create_trigger, present the complete task as a scannable spec so 
 
 A one-sentence summary is NOT enough. Recipients and sources get glossed over and lead to messages going to the wrong person.
 
-EXCEPTION: If conversation history shows you already presented this spec and the user's latest message is a confirmation ("yes", "go ahead", "do it", "sure", "ok") — call create_trigger immediately without re-confirming.
+EXCEPTION: If conversation history shows you already presented this spec and the user's latest message is a confirmation ("yes", "go ahead", "do it", "sure", "ok") ” call create_trigger immediately without re-confirming.
 
 ---
 
-**RULE 3 — CREATION PHASE: NEVER say something is impossible.**
-ANY monitoring + conditional notification task is achievable via scheduled polling. If you catch yourself saying "I cannot", stop — you are wrong. Reframe as a polling approach and proceed.
+**RULE 3 - CREATION PHASE: NEVER say something is impossible.**
+ANY monitoring + conditional notification task is achievable via scheduled polling. If you catch yourself saying "I cannot", stop - you are wrong. Reframe as a polling approach and proceed.
 
-**RULE 4 — On create_trigger error, fix and retry immediately.**
+**RULE 4 - On create_trigger error, fix and retry immediately.**
 If create_trigger returns an error, diagnose and retry with corrected parameters in the SAME response. Common fixes: remove apps from composioApps that aren't in your connected apps list, fix the cronExpression format, ensure runPrompt is non-empty.
 
-**RULE 5 — The runPrompt is fully agentic.**
-The runPrompt MUST be plain English natural language — NEVER code, scripts, or pseudocode. Embed all discovered parameters (recipient, source, condition, content) explicitly in the runPrompt so the autonomous execution has everything it needs.
+**RULE 5 - The runPrompt is fully agentic.**
+The runPrompt MUST be plain English natural language - NEVER code, scripts, or pseudocode. Embed all discovered parameters (recipient, source, condition, content) explicitly in the runPrompt so the autonomous execution has everything it needs.
 
-**RULE 6 — Use a fixed dedup key format.**
+**RULE 6 - Use a fixed dedup key format.**
 In the runPrompt, always specify the exact watch key string, e.g. watch_get("notified_pr_{owner}_{repo}_{number}").
 
-**RULE 7 — Missing integration = connect it, not a workaround.**
-If a needed integration is not connected, respond EXACTLY: "To set this up, you'll need to connect **[App Name]** to your agent. Click **Configure** (top right) → Integrations → connect [App Name]. Once connected, come back and I'll create this task for you immediately."
+**RULE 7 - Missing integration = connect it, not a workaround.**
+If a needed integration is not connected, respond EXACTLY: "To set this up, you'll need to connect **[App Name]** to your agent. Click **Configure** (top right) ’ Integrations ’ connect [App Name]. Once connected, come back and I'll create this task for you immediately."
 
 ${responseStyle}`;
         }
@@ -651,7 +668,7 @@ ${responseStyle}`;
             { role: 'user', content: message }
         ];
 
-        // Both onboarding and chat use LangChain — consistent with main backend
+        // Both onboarding and chat use LangChain ” consistent with main backend
         const llm = createOpenRouterLLM({ temperature: 0.2 });
         const llmWithOnboarding = isOnboarding
             ? (toolDefs.length > 0 ? llm.bindTools(toolDefs) : llm)
@@ -662,7 +679,7 @@ ${responseStyle}`;
             const name = tc.name;
             const args = tc.args || {};
 
-            // Self-orchestration tools (watch_set/get/clear, create_task) — handled locally
+            // Self-orchestration tools (watch_set/get/clear, create_task) ” handled locally
             if (['watch_set', 'watch_get', 'watch_clear', 'create_task'].includes(name)) {
                 try {
                     const orchTools = createOrchestrationTools({
@@ -730,7 +747,7 @@ ${responseStyle}`;
 
         let finalText = '';
         let toolsExecuted = false;
-        const AGENT_MODEL_NAME = 'google/gemini-3-flash-preview';
+        const AGENT_MODEL_NAME = 'google/gemini-3.1-pro-preview';
         let totalPromptTokens = 0, totalCompletionTokens = 0;
 
         function trackCall(msg) {
@@ -742,7 +759,7 @@ ${responseStyle}`;
         }
 
         if (isOnboarding) {
-            // ── Onboarding: LangChain path unchanged ─────────────────────────────
+            //  Onboarding: LangChain path unchanged 
             const lcMessages = [
                 new SystemMessage(systemPrompt),
                 ...history.map(m => m.role === 'user' ? new HumanMessage(m.content) : new AIMessage(m.content)),
@@ -768,9 +785,9 @@ ${responseStyle}`;
                 }
             }
         } else {
-            // ── Direct Phase 3 — no sentinel, no pre-load ───────────────────────
+            //  Direct Phase 3 ” no sentinel, no pre-load 
             // Phase 1 removed: the sentinel approach was fragile with conversation history.
-            // The LLM now decides tool use naturally — COMPOSIO_SEARCH_TOOLS handles discovery.
+            // The LLM now decides tool use naturally ” COMPOSIO_SEARCH_TOOLS handles discovery.
 
             // Load MCP tools if enabled
             if (mcpEnabled && mcpServers.filter(s => s.enabled !== false).length > 0) {
@@ -810,7 +827,7 @@ ${responseStyle}`;
                 getSignature: () => gatewaySignature,
             });
             toolDefs.push(...orchestration.toolDefs);
-            console.log(`[Chat] ${toolDefs.length} tools ready — entering ReAct loop`);
+            console.log(`[Chat] ${toolDefs.length} tools ready ” entering ReAct loop`);
 
             let llmWithTools;
             try {
@@ -820,11 +837,20 @@ ${responseStyle}`;
                 llmWithTools = llm;
             }
 
-            // Track Composio tools discovered via search this turn — used to validate MULTI_EXECUTE_TOOL calls.
-            // The LLM cannot bypass discovery by guessing tool names from training.
-            const discoveredComposioTools = new Set();
+	            // Track Composio tools discovered via search this turn ” used to validate MULTI_EXECUTE_TOOL calls.
+	            // The LLM cannot bypass discovery by guessing tool names from training.
+	            const discoveredComposioTools = new Set();
+	            // Hard runtime guardrails for Composio tools to prevent thrashing:
+	            // - Limit COMPOSIO_SEARCH_TOOLS calls per turn
+	            // - Prevent identical COMPOSIO_MULTI_EXECUTE_TOOL calls from re-hitting the backend
+	            let composioSearchCount = 0;
+	            const executedMultiStepSignatures = new Set(); // key: JSON.stringify(steps)
+	            // Structured facts extracted from raw tool results for safer, grounded answers.
+	            // For now we track GitHub repository names explicitly so the final response
+	            // never needs to œinvent repo names ” it can rely on this list instead.
+	            const githubRepoNames = new Set();
 
-            for (let step = 0; step < 8 && !cancelled; step++) {
+	            for (let step = 0; step < 8 && !cancelled; step++) {
                 console.log(`[Chat] Step ${step + 1}: invoking LLM...`);
                 let msg;
                 try {
@@ -846,104 +872,173 @@ ${responseStyle}`;
                 const isHallucinatedAction = toolCalls.length > 0 && text &&
                     /\b(i have|i've|i sent|i created|i drafted|i scheduled|i added|i deleted|i updated)\b/i.test(text);
                 if (isHallucinatedAction) {
-                    console.warn(`[Chat] Step ${step + 1} — discarding hallucinated action text: "${text.slice(0, 80)}"`);
+                    console.warn(`[Chat] Step ${step + 1} ” discarding hallucinated action text: "${text.slice(0, 80)}"`);
                 }
 
-                console.log(`[Chat] Step ${step + 1} — "${text.slice(0, 100)}", tool_calls: ${toolCalls.length}`);
+                console.log(`[Chat] Step ${step + 1} ” "${text.slice(0, 100)}", tool_calls: ${toolCalls.length}`);
                 phase3Messages.push(msg);
 
                 if (toolCalls.length === 0) { finalText = text; break; }
 
                 console.log(`[Chat] Executing:`, toolCalls.map(t => t.name).join(', '));
-                await Promise.all(toolCalls.map(async (tc) => {
+	                await Promise.all(toolCalls.map(async (tc) => {
                     emit({ type: 'status', content: toolStatusLabel(tc.name) });
                     try {
                         let result;
                         if (tc.name === 'get_current_time') {
                             result = executeGetCurrentTime();
                         } else if (tc.name === 'COMPOSIO_SEARCH_TOOLS') {
-                            const searchRes = await axios.post(
-                                `${BACKEND_GATEWAY_URL}/api/greta/gateway/composio/meta/search`,
-                                { agentId: AGENT_ID, userId, queries: tc.args?.queries || [] },
-                                { headers: { 'x-gateway-signature': gatewaySignature } }
-                            );
-                            const newSchemas = searchRes.data.success ? (searchRes.data.tools || []) : [];
-                            // Track discovered tool names for MULTI_EXECUTE_TOOL validation.
-                            // Do NOT bind them as callable tools — the LLM can only execute Composio
-                            // tools via COMPOSIO_MULTI_EXECUTE_TOOL. This prevents bypass, keeps the
-                            // per-call tool definitions small, and forces a single validated path.
-                            for (const schema of newSchemas) {
-                                const tName = schema.function?.name || schema.name;
-                                if (tName) discoveredComposioTools.add(tName);
-                            }
-                            console.log(`[Chat] COMPOSIO_SEARCH_TOOLS found ${newSchemas.length} tools — schemas returned to LLM, not bound`);
-                            const planGuidance = searchRes.data.planGuidance || [];
-                            result = JSON.stringify({
-                                found: newSchemas.length,
-                                // Full schemas (name + description + parameters) so the LLM can build
-                                // schema-correct calls via COMPOSIO_MULTI_EXECUTE_TOOL.
-                                tools: newSchemas.map(t => ({
-                                    name: t.function?.name || t.name,
-                                    description: t.function?.description,
-                                    parameters: t.function?.parameters
-                                })),
-                                ...(planGuidance.length > 0 && { planGuidance }),
-                                message: newSchemas.length > 0
-                                    ? `Found ${newSchemas.length} tools. Each tool's name, description, and parameter schema is in the "tools" field. Call them via COMPOSIO_MULTI_EXECUTE_TOOL using the exact name and schema-correct params. Tools are NOT bound directly — MULTI_EXECUTE_TOOL is the only execution path.`
-                                    : 'No tools found. Re-think the request, decompose into sub-goals, and search again with different terms.'
-                            });
-                        } else if (tc.name === 'COMPOSIO_MULTI_EXECUTE_TOOL') {
-                            const steps = tc.args?.steps || [];
+	                            // Hard cap: avoid infinite/expensive search loops. After 2 searches in a
+	                            // single user turn, instruct the LLM to re-use already discovered tools
+	                            // instead of searching again.
+	                            if (composioSearchCount >= 2) {
+	                                console.warn('[Chat] COMPOSIO_SEARCH_TOOLS limit reached ” returning searchLimitReached stub');
+	                                result = JSON.stringify({
+	                                    searchLimitReached: true,
+	                                    message: 'COMPOSIO_SEARCH_TOOLS has already been used 2 times in this turn. Re-use the tools you have already discovered instead of searching again. Plan with the current tool set and call COMPOSIO_MULTI_EXECUTE_TOOL using those tools.',
+	                                    discoveredTools: [...discoveredComposioTools],
+	                                });
+	                            } else {
+	                                composioSearchCount += 1;
+	                                const searchRes = await axios.post(
+	                                    `${BACKEND_GATEWAY_URL}/api/greta/gateway/composio/meta/search`,
+	                                    { agentId: AGENT_ID, userId, queries: tc.args?.queries || [] },
+	                                    { headers: { 'x-gateway-signature': gatewaySignature } }
+	                                );
+	                                const newSchemas = searchRes.data.success ? (searchRes.data.tools || []) : [];
+	                                // Track discovered tool names for MULTI_EXECUTE_TOOL validation.
+	                                // Do NOT bind them as callable tools ” the LLM can only execute Composio
+	                                // tools via COMPOSIO_MULTI_EXECUTE_TOOL. This prevents bypass, keeps the
+	                                // per-call tool definitions small, and forces a single validated path.
+	                                for (const schema of newSchemas) {
+	                                    const tName = schema.function?.name || schema.name;
+	                                    if (tName) discoveredComposioTools.add(tName);
+	                                }
+	                                console.log(`[Chat] COMPOSIO_SEARCH_TOOLS found ${newSchemas.length} tools ” schemas returned to LLM, not bound`);
+	                                const planGuidance = searchRes.data.planGuidance || [];
+	                                result = JSON.stringify({
+	                                    found: newSchemas.length,
+	                                    // Full schemas (name + description + parameters) so the LLM can build
+	                                    // schema-correct calls via COMPOSIO_MULTI_EXECUTE_TOOL.
+	                                    tools: newSchemas.map(t => ({
+	                                        name: t.function?.name || t.name,
+	                                        description: t.function?.description,
+	                                        parameters: t.function?.parameters
+	                                    })),
+	                                    ...(planGuidance.length > 0 && { planGuidance }),
+	                                    message: newSchemas.length > 0
+	                                        ? `Found ${newSchemas.length} tools. Each tool's name, description, and parameter schema is in the "tools" field. Call them via COMPOSIO_MULTI_EXECUTE_TOOL using the exact name and schema-correct params. Tools are NOT bound directly ” MULTI_EXECUTE_TOOL is the only execution path.`
+	                                        : 'No tools found. Re-think the request, decompose into sub-goals, and search again with different terms.'
+	                                });
+	                            }
+	                        } else if (tc.name === 'COMPOSIO_MULTI_EXECUTE_TOOL') {
+	                            const steps = tc.args?.steps || [];
+	                            const stepSignature = JSON.stringify(steps || []);
+	                            // Prevent identical MULTI_EXECUTE calls from re-hitting the backend. If the
+	                            // exact same steps array (same tools + params) was already executed earlier
+	                            // in this user turn, return a lightweight stub instead of calling Composio
+	                            // again. The original full results are still in the conversation context.
+	                            if (executedMultiStepSignatures.has(stepSignature)) {
+	                                console.warn('[Chat] COMPOSIO_MULTI_EXECUTE_TOOL skipped ” identical steps already executed this turn');
+	                                result = JSON.stringify({
+	                                    duplicate: true,
+	                                    message: 'These COMPOSIO_MULTI_EXECUTE_TOOL steps were already executed earlier in this turn. Re-use the previous tool results in the context instead of calling this tool again.',
+	                                });
+	                            } else {
                             // Validate: every step must reference a tool discovered via COMPOSIO_SEARCH_TOOLS this turn.
                             // Prevents the LLM from guessing tool names from training memory.
                             const undiscovered = steps
                                 .map((s, idx) => ({ idx: idx + 1, tool: s.tool }))
                                 .filter(s => s.tool && !discoveredComposioTools.has(s.tool));
 
-                            if (undiscovered.length > 0) {
-                                console.warn(`[Chat] COMPOSIO_MULTI_EXECUTE_TOOL rejected — undiscovered tools: ${undiscovered.map(u => u.tool).join(', ')}`);
-                                result = JSON.stringify({
-                                    rejected: true,
-                                    reason: 'One or more tools were not discovered via COMPOSIO_SEARCH_TOOLS in this turn.',
-                                    undiscoveredTools: undiscovered,
-                                    requiredAction: 'Call COMPOSIO_SEARCH_TOOLS first with queries describing what each undiscovered tool does. Read the returned schemas (parameter names and types) carefully, then retry COMPOSIO_MULTI_EXECUTE_TOOL using only discovered tools and schema-correct params.',
-                                    discoveredSoFar: [...discoveredComposioTools]
-                                });
-                            } else {
-                                const multiRes = await axios.post(
-                                    `${BACKEND_GATEWAY_URL}/api/greta/gateway/composio/multi-execute`,
-                                    { agentId: AGENT_ID, userId, steps },
-                                    { headers: { 'x-gateway-signature': gatewaySignature } }
-                                );
-                                result = multiRes.data.success
-                                    ? JSON.stringify(multiRes.data.results)
-                                    : `Error: ${multiRes.data.error}`;
-                            }
-                        } else {
-                            result = await executeExternalTool(tc);
-                        }
-                        // Central shaping — strips email headers, MIME parts, ARC sigs, and other
-                        // tool-response bloat before the result enters the LLM context. Applies to
-                        // ALL paths (MULTI_EXECUTE_TOOL, direct Composio calls, MCP, orchestration).
-                        // shapeToolResult is a no-op for small results, so it's safe everywhere.
-                        phase3Messages.push({ role: 'tool', tool_call_id: tc.id, content: shapeToolResult(result) });
-                        toolsExecuted = true;
+	                            if (undiscovered.length > 0) {
+	                                console.warn(`[Chat] COMPOSIO_MULTI_EXECUTE_TOOL rejected ” undiscovered tools: ${undiscovered.map(u => u.tool).join(', ')}`);
+	                                result = JSON.stringify({
+	                                    rejected: true,
+	                                    reason: 'One or more tools were not discovered via COMPOSIO_SEARCH_TOOLS in this turn.',
+	                                    undiscoveredTools: undiscovered,
+	                                    requiredAction: 'Call COMPOSIO_SEARCH_TOOLS first with queries describing what each undiscovered tool does. Read the returned schemas (parameter names and types) carefully, then retry COMPOSIO_MULTI_EXECUTE_TOOL using only discovered tools and schema-correct params.',
+	                                    discoveredSoFar: [...discoveredComposioTools]
+	                                });
+	                            } else {
+	                                const multiRes = await axios.post(
+	                                    `${BACKEND_GATEWAY_URL}/api/greta/gateway/composio/multi-execute`,
+	                                    { agentId: AGENT_ID, userId, steps },
+	                                    { headers: { 'x-gateway-signature': gatewaySignature } }
+	                                );
+	                                result = multiRes.data.success
+	                                    ? JSON.stringify(multiRes.data.results)
+	                                    : `Error: ${multiRes.data.error}`;
+	                                if (multiRes.data.success) {
+	                                    executedMultiStepSignatures.add(stepSignature);
+	                                    // Extract GitHub repository names directly from the raw multi-execute
+	                                    // response so the final answer can list ONLY real repos, never
+	                                    // hallucinated names. This parsing happens BEFORE shapeToolResult
+	                                    // truncates or depth-limits the payload.
+	                                    try {
+	                                        const results = multiRes.data.results || [];
+	                                        for (const stepRes of results) {
+	                                            const payload = stepRes?.data?.data || stepRes?.data;
+	                                            if (!payload) continue;
+	                                            const repos = payload.repositories || payload.repos || [];
+	                                            if (!Array.isArray(repos)) continue;
+	                                            for (const repo of repos) {
+	                                                if (!repo || typeof repo !== 'object') continue;
+	                                                const ownerLogin = repo.owner?.login || repo.owner?.name;
+	                                                const simpleName = typeof repo.name === 'string' ? repo.name : null;
+	                                                const fullName = typeof repo.full_name === 'string'
+	                                                    ? repo.full_name
+	                                                    : (ownerLogin && simpleName ? `${ownerLogin}/${simpleName}` : simpleName);
+	                                                if (typeof fullName === 'string' && fullName.trim()) {
+	                                                    githubRepoNames.add(fullName.trim());
+	                                                }
+	                                            }
+	                                        }
+	                                    } catch (extractErr) {
+	                                        console.warn('[Chat] Failed to extract GitHub repo names from COMPOSIO_MULTI_EXECUTE_TOOL:', extractErr.message);
+	                                    }
+	                                }
+	                            }
+	                            }
+	                        } else {
+	                            result = await executeExternalTool(tc);
+	                        }
+	                        // Central shaping ” strips email headers, MIME parts, ARC sigs, and other
+	                        // tool-response bloat before the result enters the LLM context. Applies to
+	                        // ALL paths (MULTI_EXECUTE_TOOL, direct Composio calls, MCP, orchestration).
+	                        // shapeToolResult is a no-op for small results, so it's safe everywhere.
+	                        const shaped = shapeToolResult(result);
+	                        phase3Messages.push({ role: 'tool', tool_call_id: tc.id, content: shaped });
+	                        toolsExecuted = true;
                     } catch (e) {
                         phase3Messages.push({ role: 'tool', tool_call_id: tc.id, content: `Tool failed: ${e.message}` });
                     }
                 }));
             }
 
-            // Synthesis fallback — if LLM went silent after tools
-            if ((!finalText || /^done\.?$/i.test(finalText.trim())) && !cancelled) {
+	            // Always synthesize the final user-facing answer from tool results when tools
+	            // were executed. This keeps the final response tightly grounded in actual data
+	            // instead of whatever the last ReAct step happened to say.
+	            if (toolsExecuted && !cancelled) {
                 const toolMsgs = phase3Messages.filter(m => m.role === 'tool');
                 if (toolMsgs.length > 0) {
                     try {
-                        const toolResultsText = toolMsgs.map(m => String(m.content)).join('\n---\n');
-                        const synthMsg = await llm.invoke([
-                            { role: 'system', content: 'Summarize these tool results as a clear helpful response. Be direct, no filler.' },
-                            { role: 'user', content: `User said: "${message}"\n\nTool results:\n${toolResultsText}` }
-                        ]);
+	                        const toolResultsText = toolMsgs.map(m => String(m.content)).join('\n---\n');
+	                        let extractedContext = '';
+	                        if (githubRepoNames.size > 0) {
+	                            extractedContext += '\n\nExtracted GitHub repositories (from tools):\n' +
+	                                [...githubRepoNames].map(n => `- ${n}`).join('\n');
+	                        }
+	                        const synthMsg = await llm.invoke([
+	                            {
+	                                role: 'system',
+	                                content: 'Summarize these tool results as a clear helpful response. Be direct, no filler. When listing GitHub repositories, ONLY use repository names that appear in the tool results or in the "Extracted GitHub repositories" list provided. Do NOT invent or guess additional repository names.'
+	                            },
+	                            {
+	                                role: 'user',
+	                                content: `User said: "${message}"\n\nTool results:\n${toolResultsText}${extractedContext}`
+	                            }
+	                        ]);
                         trackCall(synthMsg);
                         finalText = extractText(synthMsg).trim();
                     } catch (e) { console.error('[Chat] Synthesis failed:', e.message); }
@@ -951,12 +1046,12 @@ ${responseStyle}`;
             }
         }
 
-        console.log(`[Chat] After all phases — finalText.length:${finalText.length}, toolsExecuted:${toolsExecuted}, cancelled:${cancelled}`);
+        console.log(`[Chat] After all phases ” finalText.length:${finalText.length}, toolsExecuted:${toolsExecuted}, cancelled:${cancelled}`);
 
-        // Last-resort fallback — tools loaded but LLM produced nothing at all.
+        // Last-resort fallback ” tools loaded but LLM produced nothing at all.
         // CRITICAL: Use a safe prompt that won't trigger sentinel values or tool hallucinations
         if (!finalText && !cancelled) {
-            console.warn('[Chat] ⚠️  FALLBACK TRIGGERED — Empty finalText after all phases');
+            console.warn('[Chat] âš ï¸  FALLBACK TRIGGERED ” Empty finalText after all phases');
             try {
                 const safeFallbackPrompt = `You are ${agentName}. ${coreInstructions}\n\nThe user sent a message but you produced no response. Apologize briefly and ask them to rephrase their request. Be concise and helpful.`;
                 const fallbackMsg = await llm.invoke([
@@ -978,7 +1073,7 @@ ${responseStyle}`;
             .replace(/```tool_code[\s\S]*?```/g, '')
             .trim();
 
-        console.log(`[Chat] Sending done — cancelled:${cancelled} finalText:"${cleanText.slice(0, 100)}" (${cleanText.length} chars)`);
+        console.log(`[Chat] Sending done ” cancelled:${cancelled} finalText:"${cleanText.slice(0, 100)}" (${cleanText.length} chars)`);
         console.log(`[Chat] Tokens: ${totalPromptTokens}in/${totalCompletionTokens}out`);
         if (cleanText) emit({ type: 'chunk', content: cleanText });
         emit({
@@ -1020,7 +1115,7 @@ async function start() {
         console.log(`[Container] Endpoints: GET /health  POST /chat  POST /execute`);
     });
 
-    // Load apps catalog from backend (non-blocking — falls back to local list if it fails)
+    // Load apps catalog from backend (non-blocking ” falls back to local list if it fails)
     loadAppsCatalog();
 
     try {
@@ -1031,7 +1126,7 @@ async function start() {
     }
 }
 
-process.on('SIGTERM', () => { console.log('[Container] SIGTERM — shutting down'); process.exit(0); });
-process.on('SIGINT', () => { console.log('[Container] SIGINT — shutting down'); process.exit(0); });
+process.on('SIGTERM', () => { console.log('[Container] SIGTERM ” shutting down'); process.exit(0); });
+process.on('SIGINT', () => { console.log('[Container] SIGINT ” shutting down'); process.exit(0); });
 
 start();
