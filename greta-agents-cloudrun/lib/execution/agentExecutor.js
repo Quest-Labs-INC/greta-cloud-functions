@@ -51,7 +51,7 @@ const NOISY_FIELD_NAMES = new Set([
 ]);
 const MAX_STRING_LEN = 1500;
 const MAX_ARRAY_LEN = 10;
-const MAX_DEPTH = 5;
+const MAX_DEPTH = 10;
 const MAX_RESULT_LEN = 10000;
 
 function shapeToolResult(rawResult) {
@@ -260,7 +260,7 @@ class AgentExecutor {
         // task_complete is always present — the agent MUST call it to end the task.
         let dynamicTools = [GET_CURRENT_TIME_TOOL, TASK_COMPLETE_TOOL, ...toolDefs, COMPOSIO_SEARCH_TOOL_DEF];
         let llmWithTools = dynamicTools.length > 0 ? llm.bindTools(dynamicTools) : llm;
-        const AGENT_MODEL_NAME = 'google/gemini-3-flash-preview';
+        const AGENT_MODEL_NAME = 'google/gemini-3.1-pro-preview';
         let totalPromptTokens = 0, totalCompletionTokens = 0;
         function trackCall(msg) {
             if (!msg) return;
@@ -523,6 +523,21 @@ class AgentExecutor {
 
 ${agent.coreInstructions || 'You are a helpful assistant.'}
 ${memorySection}${appsSection}${projectSection}
+
+## Tool discovery
+Use COMPOSIO_SEARCH_TOOLS when you need a specific action. After finding tools, call them directly by name.
+
+Composio tools follow the pattern \`APPNAME_VERB_OBJECT\` (e.g. \`SLACK_LIST_MEMBERS\`, \`GMAIL_FETCH_EMAILS\`). Use these verbs in your search queries: **list, fetch, send, search, get, create, update, delete**. Natural-language outcome phrases return 0 results.
+
+Translate outcomes into capabilities:
+- "unread messages" → "list slack conversations" (returns unread_count per channel/DM)
+- "messages from Alice" → "search slack messages" (pass name in query, no user lookup needed)
+- "find slack user" → "list slack members"
+- "summary of emails" → "fetch gmail emails" or "list gmail messages"
+
+**Slack "unread" — no dedicated tool.** \`LIST_CONVERSATIONS\` returns \`unread_count\` per channel/DM. Filter for \`unread_count > 0\`, then fetch messages from those channels.
+
+**Aggregation cap:** For "summarize all emails", "check all unread", "process all records" — cap at 10 items (most recent). Include the sample count in your task_complete summary.
 
 ## Self-orchestration tools always available
 - **watch_set(key, value, ttlHours?)** — persist state between runs. Use descriptive keys that include item IDs: "handled_email_abc123", "notified_pr_42". Always set ttlHours for time-bounded state (e.g. 72h for email threads).
