@@ -20,6 +20,7 @@ import {
   getAppStatus,
   getRecentLogs
 } from './helpers.js';
+import { restartVite } from '../../services/processes/vite.js';
 
 const router = express.Router();
 
@@ -79,15 +80,17 @@ router.post('/bulk-write-files', async (req, res) => {
 
     console.log(`✅ Bulk write: ${successCount}/${files.length} files written`);
 
-    // Incremental sync - only the files that were written
     results.filter(r => r.success).forEach(r => scheduleSyncToGCS(r.path));
+
+    const hasFrontendFiles = files.some(f => f.path?.includes('frontend/src'));
+    if (hasFrontendFiles) restartVite().catch(() => {});
 
     // Build response
     const response = {
       results,
       totalFiles: files.length,
       successCount,
-      failedCount: files.length - successCount
+      failedCount: files.length - successCount,
     };
 
     if (capture_logs_backend) {
