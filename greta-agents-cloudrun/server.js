@@ -1,4 +1,4 @@
-﻿// Sentry must be imported and initialized BEFORE any other modules so it can
+// Sentry must be imported and initialized BEFORE any other modules so it can
 // instrument them. The container image is single (always prod), but the
 // effective environment is determined by which gateway this agent is connected
 // to ” staging URL ’ staging events, production URL ’ production events.
@@ -837,20 +837,20 @@ ${responseStyle}`;
                 llmWithTools = llm;
             }
 
-	            // Track Composio tools discovered via search this turn ” used to validate MULTI_EXECUTE_TOOL calls.
-	            // The LLM cannot bypass discovery by guessing tool names from training.
-	            const discoveredComposioTools = new Set();
-	            // Hard runtime guardrails for Composio tools to prevent thrashing:
-	            // - Limit COMPOSIO_SEARCH_TOOLS calls per turn
-	            // - Prevent identical COMPOSIO_MULTI_EXECUTE_TOOL calls from re-hitting the backend
-	            let composioSearchCount = 0;
-	            const executedMultiStepSignatures = new Set(); // key: JSON.stringify(steps)
-	            // Structured facts extracted from raw tool results for safer, grounded answers.
-	            // For now we track GitHub repository names explicitly so the final response
-	            // never needs to œinvent repo names ” it can rely on this list instead.
-	            const githubRepoNames = new Set();
+                // Track Composio tools discovered via search this turn ” used to validate MULTI_EXECUTE_TOOL calls.
+                // The LLM cannot bypass discovery by guessing tool names from training.
+                const discoveredComposioTools = new Set();
+                // Hard runtime guardrails for Composio tools to prevent thrashing:
+                // - Limit COMPOSIO_SEARCH_TOOLS calls per turn
+                // - Prevent identical COMPOSIO_MULTI_EXECUTE_TOOL calls from re-hitting the backend
+                let composioSearchCount = 0;
+                const executedMultiStepSignatures = new Set(); // key: JSON.stringify(steps)
+                // Structured facts extracted from raw tool results for safer, grounded answers.
+                // For now we track GitHub repository names explicitly so the final response
+                // never needs to œinvent repo names ” it can rely on this list instead.
+                const githubRepoNames = new Set();
 
-	            for (let step = 0; step < 8 && !cancelled; step++) {
+                for (let step = 0; step < 8 && !cancelled; step++) {
                 console.log(`[Chat] Step ${step + 1}: invoking LLM...`);
                 let msg;
                 try {
@@ -881,164 +881,164 @@ ${responseStyle}`;
                 if (toolCalls.length === 0) { finalText = text; break; }
 
                 console.log(`[Chat] Executing:`, toolCalls.map(t => t.name).join(', '));
-	                await Promise.all(toolCalls.map(async (tc) => {
+                    await Promise.all(toolCalls.map(async (tc) => {
                     emit({ type: 'status', content: toolStatusLabel(tc.name) });
                     try {
                         let result;
                         if (tc.name === 'get_current_time') {
                             result = executeGetCurrentTime();
                         } else if (tc.name === 'COMPOSIO_SEARCH_TOOLS') {
-	                            // Hard cap: avoid infinite/expensive search loops. After 2 searches in a
-	                            // single user turn, instruct the LLM to re-use already discovered tools
-	                            // instead of searching again.
-	                            if (composioSearchCount >= 2) {
-	                                console.warn('[Chat] COMPOSIO_SEARCH_TOOLS limit reached ” returning searchLimitReached stub');
-	                                result = JSON.stringify({
-	                                    searchLimitReached: true,
-	                                    message: 'COMPOSIO_SEARCH_TOOLS has already been used 2 times in this turn. Re-use the tools you have already discovered instead of searching again. Plan with the current tool set and call COMPOSIO_MULTI_EXECUTE_TOOL using those tools.',
-	                                    discoveredTools: [...discoveredComposioTools],
-	                                });
-	                            } else {
-	                                composioSearchCount += 1;
-	                                const searchRes = await axios.post(
-	                                    `${BACKEND_GATEWAY_URL}/api/greta/gateway/composio/meta/search`,
-	                                    { agentId: AGENT_ID, userId, queries: tc.args?.queries || [] },
-	                                    { headers: { 'x-gateway-signature': gatewaySignature } }
-	                                );
-	                                const newSchemas = searchRes.data.success ? (searchRes.data.tools || []) : [];
-	                                // Track discovered tool names for MULTI_EXECUTE_TOOL validation.
-	                                // Do NOT bind them as callable tools ” the LLM can only execute Composio
-	                                // tools via COMPOSIO_MULTI_EXECUTE_TOOL. This prevents bypass, keeps the
-	                                // per-call tool definitions small, and forces a single validated path.
-	                                for (const schema of newSchemas) {
-	                                    const tName = schema.function?.name || schema.name;
-	                                    if (tName) discoveredComposioTools.add(tName);
-	                                }
-	                                console.log(`[Chat] COMPOSIO_SEARCH_TOOLS found ${newSchemas.length} tools ” schemas returned to LLM, not bound`);
-	                                const planGuidance = searchRes.data.planGuidance || [];
-	                                result = JSON.stringify({
-	                                    found: newSchemas.length,
-	                                    // Full schemas (name + description + parameters) so the LLM can build
-	                                    // schema-correct calls via COMPOSIO_MULTI_EXECUTE_TOOL.
-	                                    tools: newSchemas.map(t => ({
-	                                        name: t.function?.name || t.name,
-	                                        description: t.function?.description,
-	                                        parameters: t.function?.parameters
-	                                    })),
-	                                    ...(planGuidance.length > 0 && { planGuidance }),
-	                                    message: newSchemas.length > 0
-	                                        ? `Found ${newSchemas.length} tools. Each tool's name, description, and parameter schema is in the "tools" field. Call them via COMPOSIO_MULTI_EXECUTE_TOOL using the exact name and schema-correct params. Tools are NOT bound directly ” MULTI_EXECUTE_TOOL is the only execution path.`
-	                                        : 'No tools found. Re-think the request, decompose into sub-goals, and search again with different terms.'
-	                                });
-	                            }
-	                        } else if (tc.name === 'COMPOSIO_MULTI_EXECUTE_TOOL') {
-	                            const steps = tc.args?.steps || [];
-	                            const stepSignature = JSON.stringify(steps || []);
-	                            // Prevent identical MULTI_EXECUTE calls from re-hitting the backend. If the
-	                            // exact same steps array (same tools + params) was already executed earlier
-	                            // in this user turn, return a lightweight stub instead of calling Composio
-	                            // again. The original full results are still in the conversation context.
-	                            if (executedMultiStepSignatures.has(stepSignature)) {
-	                                console.warn('[Chat] COMPOSIO_MULTI_EXECUTE_TOOL skipped ” identical steps already executed this turn');
-	                                result = JSON.stringify({
-	                                    duplicate: true,
-	                                    message: 'These COMPOSIO_MULTI_EXECUTE_TOOL steps were already executed earlier in this turn. Re-use the previous tool results in the context instead of calling this tool again.',
-	                                });
-	                            } else {
+                                // Hard cap: avoid infinite/expensive search loops. After 2 searches in a
+                                // single user turn, instruct the LLM to re-use already discovered tools
+                                // instead of searching again.
+                                if (composioSearchCount >= 2) {
+                                    console.warn('[Chat] COMPOSIO_SEARCH_TOOLS limit reached ” returning searchLimitReached stub');
+                                    result = JSON.stringify({
+                                        searchLimitReached: true,
+                                        message: 'COMPOSIO_SEARCH_TOOLS has already been used 2 times in this turn. Re-use the tools you have already discovered instead of searching again. Plan with the current tool set and call COMPOSIO_MULTI_EXECUTE_TOOL using those tools.',
+                                        discoveredTools: [...discoveredComposioTools],
+                                    });
+                                } else {
+                                    composioSearchCount += 1;
+                                    const searchRes = await axios.post(
+                                        `${BACKEND_GATEWAY_URL}/api/greta/gateway/composio/meta/search`,
+                                        { agentId: AGENT_ID, userId, queries: tc.args?.queries || [] },
+                                        { headers: { 'x-gateway-signature': gatewaySignature } }
+                                    );
+                                    const newSchemas = searchRes.data.success ? (searchRes.data.tools || []) : [];
+                                    // Track discovered tool names for MULTI_EXECUTE_TOOL validation.
+                                    // Do NOT bind them as callable tools ” the LLM can only execute Composio
+                                    // tools via COMPOSIO_MULTI_EXECUTE_TOOL. This prevents bypass, keeps the
+                                    // per-call tool definitions small, and forces a single validated path.
+                                    for (const schema of newSchemas) {
+                                        const tName = schema.function?.name || schema.name;
+                                        if (tName) discoveredComposioTools.add(tName);
+                                    }
+                                    console.log(`[Chat] COMPOSIO_SEARCH_TOOLS found ${newSchemas.length} tools ” schemas returned to LLM, not bound`);
+                                    const planGuidance = searchRes.data.planGuidance || [];
+                                    result = JSON.stringify({
+                                        found: newSchemas.length,
+                                        // Full schemas (name + description + parameters) so the LLM can build
+                                        // schema-correct calls via COMPOSIO_MULTI_EXECUTE_TOOL.
+                                        tools: newSchemas.map(t => ({
+                                            name: t.function?.name || t.name,
+                                            description: t.function?.description,
+                                            parameters: t.function?.parameters
+                                        })),
+                                        ...(planGuidance.length > 0 && { planGuidance }),
+                                        message: newSchemas.length > 0
+                                            ? `Found ${newSchemas.length} tools. Each tool's name, description, and parameter schema is in the "tools" field. Call them via COMPOSIO_MULTI_EXECUTE_TOOL using the exact name and schema-correct params. Tools are NOT bound directly ” MULTI_EXECUTE_TOOL is the only execution path.`
+                                            : 'No tools found. Re-think the request, decompose into sub-goals, and search again with different terms.'
+                                    });
+                                }
+                            } else if (tc.name === 'COMPOSIO_MULTI_EXECUTE_TOOL') {
+                                const steps = tc.args?.steps || [];
+                                const stepSignature = JSON.stringify(steps || []);
+                                // Prevent identical MULTI_EXECUTE calls from re-hitting the backend. If the
+                                // exact same steps array (same tools + params) was already executed earlier
+                                // in this user turn, return a lightweight stub instead of calling Composio
+                                // again. The original full results are still in the conversation context.
+                                if (executedMultiStepSignatures.has(stepSignature)) {
+                                    console.warn('[Chat] COMPOSIO_MULTI_EXECUTE_TOOL skipped ” identical steps already executed this turn');
+                                    result = JSON.stringify({
+                                        duplicate: true,
+                                        message: 'These COMPOSIO_MULTI_EXECUTE_TOOL steps were already executed earlier in this turn. Re-use the previous tool results in the context instead of calling this tool again.',
+                                    });
+                                } else {
                             // Validate: every step must reference a tool discovered via COMPOSIO_SEARCH_TOOLS this turn.
                             // Prevents the LLM from guessing tool names from training memory.
                             const undiscovered = steps
                                 .map((s, idx) => ({ idx: idx + 1, tool: s.tool }))
                                 .filter(s => s.tool && !discoveredComposioTools.has(s.tool));
 
-	                            if (undiscovered.length > 0) {
-	                                console.warn(`[Chat] COMPOSIO_MULTI_EXECUTE_TOOL rejected ” undiscovered tools: ${undiscovered.map(u => u.tool).join(', ')}`);
-	                                result = JSON.stringify({
-	                                    rejected: true,
-	                                    reason: 'One or more tools were not discovered via COMPOSIO_SEARCH_TOOLS in this turn.',
-	                                    undiscoveredTools: undiscovered,
-	                                    requiredAction: 'Call COMPOSIO_SEARCH_TOOLS first with queries describing what each undiscovered tool does. Read the returned schemas (parameter names and types) carefully, then retry COMPOSIO_MULTI_EXECUTE_TOOL using only discovered tools and schema-correct params.',
-	                                    discoveredSoFar: [...discoveredComposioTools]
-	                                });
-	                            } else {
-	                                const multiRes = await axios.post(
-	                                    `${BACKEND_GATEWAY_URL}/api/greta/gateway/composio/multi-execute`,
-	                                    { agentId: AGENT_ID, userId, steps },
-	                                    { headers: { 'x-gateway-signature': gatewaySignature } }
-	                                );
-	                                result = multiRes.data.success
-	                                    ? JSON.stringify(multiRes.data.results)
-	                                    : `Error: ${multiRes.data.error}`;
-	                                if (multiRes.data.success) {
-	                                    executedMultiStepSignatures.add(stepSignature);
-	                                    // Extract GitHub repository names directly from the raw multi-execute
-	                                    // response so the final answer can list ONLY real repos, never
-	                                    // hallucinated names. This parsing happens BEFORE shapeToolResult
-	                                    // truncates or depth-limits the payload.
-	                                    try {
-	                                        const results = multiRes.data.results || [];
-	                                        for (const stepRes of results) {
-	                                            const payload = stepRes?.data?.data || stepRes?.data;
-	                                            if (!payload) continue;
-	                                            const repos = payload.repositories || payload.repos || [];
-	                                            if (!Array.isArray(repos)) continue;
-	                                            for (const repo of repos) {
-	                                                if (!repo || typeof repo !== 'object') continue;
-	                                                const ownerLogin = repo.owner?.login || repo.owner?.name;
-	                                                const simpleName = typeof repo.name === 'string' ? repo.name : null;
-	                                                const fullName = typeof repo.full_name === 'string'
-	                                                    ? repo.full_name
-	                                                    : (ownerLogin && simpleName ? `${ownerLogin}/${simpleName}` : simpleName);
-	                                                if (typeof fullName === 'string' && fullName.trim()) {
-	                                                    githubRepoNames.add(fullName.trim());
-	                                                }
-	                                            }
-	                                        }
-	                                    } catch (extractErr) {
-	                                        console.warn('[Chat] Failed to extract GitHub repo names from COMPOSIO_MULTI_EXECUTE_TOOL:', extractErr.message);
-	                                    }
-	                                }
-	                            }
-	                            }
-	                        } else {
-	                            result = await executeExternalTool(tc);
-	                        }
-	                        // Central shaping ” strips email headers, MIME parts, ARC sigs, and other
-	                        // tool-response bloat before the result enters the LLM context. Applies to
-	                        // ALL paths (MULTI_EXECUTE_TOOL, direct Composio calls, MCP, orchestration).
-	                        // shapeToolResult is a no-op for small results, so it's safe everywhere.
-	                        const shaped = shapeToolResult(result);
-	                        phase3Messages.push({ role: 'tool', tool_call_id: tc.id, content: shaped });
-	                        toolsExecuted = true;
+                                if (undiscovered.length > 0) {
+                                    console.warn(`[Chat] COMPOSIO_MULTI_EXECUTE_TOOL rejected ” undiscovered tools: ${undiscovered.map(u => u.tool).join(', ')}`);
+                                    result = JSON.stringify({
+                                        rejected: true,
+                                        reason: 'One or more tools were not discovered via COMPOSIO_SEARCH_TOOLS in this turn.',
+                                        undiscoveredTools: undiscovered,
+                                        requiredAction: 'Call COMPOSIO_SEARCH_TOOLS first with queries describing what each undiscovered tool does. Read the returned schemas (parameter names and types) carefully, then retry COMPOSIO_MULTI_EXECUTE_TOOL using only discovered tools and schema-correct params.',
+                                        discoveredSoFar: [...discoveredComposioTools]
+                                    });
+                                } else {
+                                    const multiRes = await axios.post(
+                                        `${BACKEND_GATEWAY_URL}/api/greta/gateway/composio/multi-execute`,
+                                        { agentId: AGENT_ID, userId, steps },
+                                        { headers: { 'x-gateway-signature': gatewaySignature } }
+                                    );
+                                    result = multiRes.data.success
+                                        ? JSON.stringify(multiRes.data.results)
+                                        : `Error: ${multiRes.data.error}`;
+                                    if (multiRes.data.success) {
+                                        executedMultiStepSignatures.add(stepSignature);
+                                        // Extract GitHub repository names directly from the raw multi-execute
+                                        // response so the final answer can list ONLY real repos, never
+                                        // hallucinated names. This parsing happens BEFORE shapeToolResult
+                                        // truncates or depth-limits the payload.
+                                        try {
+                                            const results = multiRes.data.results || [];
+                                            for (const stepRes of results) {
+                                                const payload = stepRes?.data?.data || stepRes?.data;
+                                                if (!payload) continue;
+                                                const repos = payload.repositories || payload.repos || [];
+                                                if (!Array.isArray(repos)) continue;
+                                                for (const repo of repos) {
+                                                    if (!repo || typeof repo !== 'object') continue;
+                                                    const ownerLogin = repo.owner?.login || repo.owner?.name;
+                                                    const simpleName = typeof repo.name === 'string' ? repo.name : null;
+                                                    const fullName = typeof repo.full_name === 'string'
+                                                        ? repo.full_name
+                                                        : (ownerLogin && simpleName ? `${ownerLogin}/${simpleName}` : simpleName);
+                                                    if (typeof fullName === 'string' && fullName.trim()) {
+                                                        githubRepoNames.add(fullName.trim());
+                                                    }
+                                                }
+                                            }
+                                        } catch (extractErr) {
+                                            console.warn('[Chat] Failed to extract GitHub repo names from COMPOSIO_MULTI_EXECUTE_TOOL:', extractErr.message);
+                                        }
+                                    }
+                                }
+                                }
+                            } else {
+                                result = await executeExternalTool(tc);
+                            }
+                            // Central shaping ” strips email headers, MIME parts, ARC sigs, and other
+                            // tool-response bloat before the result enters the LLM context. Applies to
+                            // ALL paths (MULTI_EXECUTE_TOOL, direct Composio calls, MCP, orchestration).
+                            // shapeToolResult is a no-op for small results, so it's safe everywhere.
+                            const shaped = shapeToolResult(result);
+                            phase3Messages.push({ role: 'tool', tool_call_id: tc.id, content: shaped });
+                            toolsExecuted = true;
                     } catch (e) {
                         phase3Messages.push({ role: 'tool', tool_call_id: tc.id, content: `Tool failed: ${e.message}` });
                     }
                 }));
             }
 
-	            // Always synthesize the final user-facing answer from tool results when tools
-	            // were executed. This keeps the final response tightly grounded in actual data
-	            // instead of whatever the last ReAct step happened to say.
-	            if (toolsExecuted && !cancelled) {
+                // Always synthesize the final user-facing answer from tool results when tools
+                // were executed. This keeps the final response tightly grounded in actual data
+                // instead of whatever the last ReAct step happened to say.
+                if (toolsExecuted && !cancelled) {
                 const toolMsgs = phase3Messages.filter(m => m.role === 'tool');
                 if (toolMsgs.length > 0) {
                     try {
-	                        const toolResultsText = toolMsgs.map(m => String(m.content)).join('\n---\n');
-	                        let extractedContext = '';
-	                        if (githubRepoNames.size > 0) {
-	                            extractedContext += '\n\nExtracted GitHub repositories (from tools):\n' +
-	                                [...githubRepoNames].map(n => `- ${n}`).join('\n');
-	                        }
-	                        const synthMsg = await llm.invoke([
-	                            {
-	                                role: 'system',
-	                                content: 'Summarize these tool results as a clear helpful response. Be direct, no filler. When listing GitHub repositories, ONLY use repository names that appear in the tool results or in the "Extracted GitHub repositories" list provided. Do NOT invent or guess additional repository names.'
-	                            },
-	                            {
-	                                role: 'user',
-	                                content: `User said: "${message}"\n\nTool results:\n${toolResultsText}${extractedContext}`
-	                            }
-	                        ]);
+                            const toolResultsText = toolMsgs.map(m => String(m.content)).join('\n---\n');
+                            let extractedContext = '';
+                            if (githubRepoNames.size > 0) {
+                                extractedContext += '\n\nExtracted GitHub repositories (from tools):\n' +
+                                    [...githubRepoNames].map(n => `- ${n}`).join('\n');
+                            }
+                            const synthMsg = await llm.invoke([
+                                {
+                                    role: 'system',
+                                    content: 'Summarize these tool results as a clear helpful response. Be direct, no filler. When listing GitHub repositories, ONLY use repository names that appear in the tool results or in the "Extracted GitHub repositories" list provided. Do NOT invent or guess additional repository names.'
+                                },
+                                {
+                                    role: 'user',
+                                    content: `User said: "${message}"\n\nTool results:\n${toolResultsText}${extractedContext}`
+                                }
+                            ]);
                         trackCall(synthMsg);
                         finalText = extractText(synthMsg).trim();
                     } catch (e) { console.error('[Chat] Synthesis failed:', e.message); }
