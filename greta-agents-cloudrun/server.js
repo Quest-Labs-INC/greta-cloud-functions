@@ -69,53 +69,162 @@ async function loadAppsCatalog() {
     }
 }
 
-// Local tool: Create a scheduled task/trigger from chat
+// Local tool: Create a scheduled, webhook, or DB-event task/trigger from chat
 const CREATE_TRIGGER_TOOL = {
     type: 'function',
     function: {
         name: 'create_trigger',
-        description: `Create a scheduled task or webhook trigger for this agent.
+        description: `Create a task/trigger for this agent. Three types available:
 
-CRITICAL: The runPrompt is NOT a static message — it is a FULL AGENTIC INSTRUCTION. When the trigger fires, this agent runs autonomously with ALL connected tools and executes the runPrompt as a complete AI task.
+## DB_EVENT — fires when a specific collection in the linked project's database changes
+Use when the user wants to react to their app's data changes (new signup, order placed, record updated).
+- Agent discovers the collection name from the project schema first
+- The runPromptTemplate receives the triggering document automatically as {{record}}
 
-## Two patterns for the runPrompt:
+## SCHEDULED — fires on a cron schedule
+Use when the user wants time-based automation (every day 9am, every 5 min, etc.).
 
-### Pattern 1 — Simple polling (one-shot per run)
-Use when: each run is independent. Check condition → act → done.
-Example: "Every 30 min: check Gmail unread > 24h, send Slack digest"
+## WEBHOOK_RECEIVED — fires when an external system POSTs to a unique URL
+Use when an external service sends outbound webhooks.
 
-### Pattern 2 — Async multi-turn workflow (use create_task for "wait" steps)
-Use when: the workflow spans multiple time windows (e.g. send email → wait for reply → book meeting).
-The agent has a built-in create_task tool to schedule a follow-up execution of itself.
+---
 
-EXAMPLE — "email negative tone → send meeting request → wait for reply → book calendar":
-runPrompt: "Check Gmail for new emails from user@example.com (only emails received after the [Run context] timestamp). For each new email: analyze the tone. If negative: (a) check watch_get('meeting_req_'+messageId) — if exists:true, skip. (b) Send a reply asking for their availability. (c) watch_set('meeting_req_'+messageId, the threadId, ttlHours=168). (d) create_task with instruction 'Check Gmail thread [threadId] for a reply from user@example.com. If they gave a time: reply confirming, then create a Google Calendar event. If still no reply: create_task again to check in 30 minutes.' and delayMinutes=30, context={threadId, messageId}."
+For SCHEDULED — CRITICAL: The runPrompt is a FULL AGENTIC INSTRUCTION executed autonomously with all connected tools.
 
-EXAMPLE — "PR review alert after 2 hours":
-runPrompt: "Check GitHub for PRs where I am a requested reviewer (only PRs opened after [Run context] timestamp). For each new PR: check watch_get('pr_alerted_'+prNumber) — if exists:true skip. Otherwise: create_task with instruction 'Check if PR #[number] at [url] still needs review. If review is still pending: send email to [owner] with the PR link. If already reviewed: done.' and delayMinutes=120, context={prNumber, prUrl, owner}. Then watch_set('pr_alerted_'+prNumber, true, ttlHours=48)."
+EXAMPLE — “email negative tone → send meeting request → wait for reply → book calendar”:
+runPrompt: “Check Gmail for new emails from user@example.com (only emails received after the [Run context] timestamp). For each new email: analyze the tone. If negative: (a) check watch_get('meeting_req_'+messageId) — if exists:true, skip. (b) Send a reply asking for their availability. (c) watch_set('meeting_req_'+messageId, the threadId, ttlHours=168). (d) create_task with instruction 'Check Gmail thread [threadId] for a reply from user@example.com. If they gave a time: reply confirming, then create a Google Calendar event. If still no reply: create_task again to check in 30 minutes.' and delayMinutes=30, context={threadId, messageId}.”
 
 KEY RULES:
-- Use create_task (not watch_get polling) for any "wait N hours/minutes then check" workflow
-- Use watch_get/watch_set only for dedup: "have I already acted on this item?"
-- Always reference item IDs (message ID, thread ID, PR number) in watch keys so they're unique
-- The [Run context] timestamp is automatically injected — reference it as "after [Run context] timestamp" to filter to new items only
+- Use create_task (not watch_get polling) for any “wait N hours/minutes then check” workflow
+- Use watch_get/watch_set only for dedup: “have I already acted on this item?”
+- The [Run context] timestamp is automatically injected — reference it as “after [Run context] timestamp” to filter to new items only
 
-Call this tool after gathering: what to monitor, what condition triggers action, what action to take, how often to poll.`,
+Call this tool after gathering all required parameters for the chosen type.`,
         parameters: {
             type: 'object',
             properties: {
-                name: { type: 'string', description: 'Short descriptive name (e.g. "PR review alert")' },
+                name: { type: 'string', description: 'Short descriptive name (e.g. “Signup alert”, “Daily digest”)' },
                 description: { type: 'string', description: 'Human-readable description of what this task does' },
-                type: { type: 'string', enum: ['SCHEDULED', 'WEBHOOK_RECEIVED'], description: 'SCHEDULED for time-based polling, WEBHOOK_RECEIVED for webhook-triggered' },
-                cronExpression: { type: 'string', description: 'Cron expression. REQUIRED for SCHEDULED type. Examples: "0 9 * * *" = every day 9am, "0 9 * * 1-5" = weekdays 9am, "*/5 * * * *" = every 5 min, "0 9 * * 1" = Monday 9am. Use empty string for WEBHOOK_RECEIVED.' },
-                timezone: { type: 'string', description: 'Timezone for SCHEDULED tasks (e.g. "America/New_York", "Asia/Kolkata", "UTC"). Default UTC.' },
-                runPrompt: { type: 'string', description: 'Natural language instruction the agent will follow at runtime. MUST be plain English ” NEVER code, scripts, or pseudocode. Be specific: what to fetch, what condition to check, what action to take. Example: "Fetch today\'s Google Calendar events. Send an email to user@example.com with the subject \'Daily Meeting Reminder\' listing each meeting\'s time and title."' },
-                composioApps: { type: 'array', items: { type: 'string' }, description: 'Apps this task needs. CRITICAL: only list apps from your "Connected apps" section. If an app is not connected, do NOT include it here ” the task will still be created and the runPrompt can still reference that app.' },
+                type: { type: 'string', enum: ['SCHEDULED', 'WEBHOOK_RECEIVED', 'DB_EVENT'], description: 'DB_EVENT for app database triggers, SCHEDULED for time-based polling, WEBHOOK_RECEIVED for inbound webhooks' },
+                // SCHEDULED fields
+                cronExpression: { type: 'string', description: 'Cron expression. REQUIRED for SCHEDULED. Examples: “0 9 * * *” = every day 9am, “*/5 * * * *” = every 5 min. Use empty string for other types.' },
+                timezone: { type: 'string', description: 'Timezone for SCHEDULED tasks (e.g. “America/New_York”, “Asia/Kolkata”, “UTC”). Default UTC.' },
+                runPrompt: { type: 'string', description: 'REQUIRED for SCHEDULED and WEBHOOK_RECEIVED. Full agentic instruction in plain English — NEVER code or pseudocode.' },
+                // Project linkage — REQUIRED for DB_EVENT, OPTIONAL but strongly recommended for SCHEDULED
+                // when the task needs to read the user's app DB (e.g. "daily signup summary").
+                // When set, the agent gains the mongo_query tool at runtime to query the project's DB.
+                projectId: { type: 'string', description: 'REQUIRED for DB_EVENT. For SCHEDULED tasks reading the app DB — pass the project ID. CRITICAL: this MUST be the exact UUID `projectId` value from list_projects output (looks like "8268d524-2f01-4110-8172-dfe1cc5a3a56"). NEVER pass the project name/title here — that will fail. Always copy the `projectId` field verbatim from list_projects.' },
+                collectionName: { type: 'string', description: 'REQUIRED for DB_EVENT. MongoDB collection to watch (e.g. “users”, “orders”).' },
+                events: { type: 'array', items: { type: 'string', enum: ['INSERT', 'UPDATE', 'DELETE'] }, description: 'DB_EVENT: which operations to watch. Default: [“INSERT”].' },
+                runPromptTemplate: { type: 'string', description: 'REQUIRED for DB_EVENT. Plain English instruction executed when the trigger fires. Use {{record}} to reference the triggering document, {{event}} for the operation type, {{collection}} for the collection name.' },
+                composioApps: { type: 'array', items: { type: 'string' }, description: 'Apps this task needs. Only list apps from your “Connected apps” section.' },
             },
-            required: ['name', 'type', 'runPrompt', 'cronExpression'],
+            required: ['name', 'type'],
         },
     },
 };
+
+// Local tool: List user's Greta projects with backend status
+const LIST_PROJECTS_TOOL = {
+    type: 'function',
+    function: {
+        name: 'list_projects',
+        description: `List all Greta projects that belong to this user.
+Returns each project's display name, projectId, and hasBackend flag.
+hasBackend is true when the project has a database connected (backend deployed + MongoDB ready) — this is the only condition required for DB-based tasks.
+
+Use this when the user wants to:
+- Create a DB_EVENT task for one of their apps
+- Set up a SCHEDULED task that reads from their app's database
+- See which apps are linked to their account
+
+ALWAYS show projects by NAME — never show the projectId to the user (it's a UUID, not user-friendly).`,
+        parameters: { type: 'object', properties: {}, required: [] },
+    },
+};
+
+// Local tool: Explore a project's DB schema and suggest tasks
+const EXPLORE_PROJECT_DB_TOOL = {
+    type: 'function',
+    function: {
+        name: 'explore_project_db',
+        description: `Fetch the MongoDB collections and existing tasks for a specific project.
+Call this after the user picks a project from list_projects.
+
+Returns:
+- collections: array of collection names in the project's database
+- existingTasks: tasks already set up for this project
+- projectName: display name of the project
+
+After calling this, YOU MUST:
+1. Show the collections in a readable format
+2. For each collection, suggest 2-3 concrete automations that make sense (signups → alert/welcome email, orders → Slack notify, payments → invoice, etc.)
+3. Also suggest SCHEDULED tasks that could work with this data (daily digests, weekly reports, anomaly detection)
+4. Ask which one they want to set up`,
+        parameters: {
+            type: 'object',
+            properties: {
+                projectId: { type: 'string', description: 'The project ID from list_projects' },
+            },
+            required: ['projectId'],
+        },
+    },
+};
+
+// Gated prompt section — only injected when the conversation is actually about
+// project / app-based tasks. Keeps system prompt tight on every other turn.
+const PROJECT_FLOW_PROMPT = `---
+
+## App-based tasks (DB_EVENT) — discovery flow
+
+**STEP 0 — Clarify intent first if it's ambiguous.**
+Before jumping into Composio search or tool calls, decide: is the user describing an **app/project-based task** (reacting to something in their own Greta-built app's database) or a **general SaaS task** (reacting to Gmail, Slack, GitHub, etc.)?
+
+- **Clear app intent** ("signup alert for my todo app", "when new order in my shop") → skip clarification, proceed to STEP 1.
+- **Clear SaaS intent** ("alert me when I get an email from X", "post to slack daily") → don't call list_projects, proceed with Composio flow.
+- **Ambiguous** ("signup alert", "send me alerts", "notify me when something happens") → ASK ONE SHORT QUESTION first:
+  > "Quick check — is this for one of your Greta apps (like a signup form firing an alert), or for an external tool like Gmail/Slack? Either is easy."
+
+  Wait for the answer before doing anything else. Don't search Composio tools speculatively — that wastes context.
+
+**STEP 1 — Call list_projects.** Once you know it's app-based, call list_projects without asking "which project?" — show the results and let the user pick. Present projects by NAME (never by projectId, which is a UUID).
+
+Bucket the projects into two groups based on \`hasBackend\`:
+
+**If at least one project has hasBackend: true** — present like:
+> Here are your projects ready for tasks:
+> 1. **Todo App** ✓
+> 2. **Customer CRM** ✓
+>
+> Which one should I set up the task for?
+>
+> (You also have projects without a database yet: Portfolio Site, Landing Page — let me know if you want to add one of those.)
+
+**If NO project has hasBackend: true** — say warmly:
+> To create and save tasks for your app, you'll need to add a backend first — which is easy! Pick one of your projects, ask Greta to "add a backend with MongoDB", and once that's done I'll create the task for you.
+>
+> Your projects: **Todo App**, **Portfolio Site**, **Landing Page**
+
+NEVER say "Enable a backend / Enable MongoDB / Create a Tasks collection" as a checklist — it's intimidating. Frame it as one easy step.
+NEVER show projectId UUIDs to the user.
+
+**STEP 2 — Once user picks a project (must be one with hasBackend), call explore_project_db.**
+Present collections with concrete, domain-aware suggestions (users → signup flow, orders → fulfillment, payments → finance, messages → comms, leads → CRM). For each collection, suggest 2-3 specific automations — both DB_EVENT (instant) and SCHEDULED (digest/report). Show existing tasks to avoid duplicates.
+
+**STEP 3 — User picks → confirm spec → call create_trigger.**
+For DB_EVENT tasks the spec format is:
+> - **Task**: [description]
+> - **Watches**: \`[collectionName]\` in [projectName] on [INSERT/UPDATE/DELETE]
+> - **Action**: [what the agent will do when it fires]
+> - **Template**: The triggering record is available as {{record}}
+
+**CRITICAL when calling create_trigger:**
+- The \`projectId\` parameter MUST be the UUID from list_projects (e.g. "8268d524-2f01-4110-8172-dfe1cc5a3a56"), NOT the project name. Show the user the NAME but pass the UUID to the tool.
+- For SCHEDULED tasks reading this project's DB — also pass projectId so the agent gets mongo_query access at runtime.
+
+**RULE — DB_EVENT + SCHEDULED combo.** After a DB_EVENT task, offer the SCHEDULED counterpart: "Want a daily digest too?"
+
+---`;
 
 const COMPOSIO_SEARCH_TOOL_DEF = {
     type: 'function',
@@ -184,6 +293,26 @@ const GET_CURRENT_TIME_TOOL = {
         name: 'get_current_time',
         description: "Returns the current date and time. Call this FIRST when you need to know today's date, current time, day of the week, or to calculate relative dates (next week, tomorrow, etc.) ” especially for calendar queries, scheduling, deadlines.",
         parameters: { type: 'object', properties: {}, required: [] },
+    },
+};
+
+// Local tool: Verify if a specific Composio app is connected for this agent.
+// Available at runtime (not just onboarding) so the agent can fact-check itself
+// when a user disputes connection status. Reads from the connected-apps list
+// passed in the current chat's agentConfig — always reflects the latest DB state
+// because the backend reads fresh on every chat turn.
+const CHECK_INTEGRATION_STATUS_TOOL = {
+    type: 'function',
+    function: {
+        name: 'check_integration_status',
+        description: "Verify whether a specific Composio app is currently connected to this agent. Use this when the user says an integration is connected but your system prompt doesn't list it, or before claiming you can't do something — fact-check first. Returns ✓ if connected, ✗ if not.",
+        parameters: {
+            type: 'object',
+            properties: {
+                app: { type: 'string', description: 'The Composio app name to check (e.g., GMAIL, SLACK, GITHUB, GOOGLECALENDAR). Case-insensitive.' }
+            },
+            required: ['app']
+        }
     },
 };
 
@@ -345,6 +474,9 @@ app.post('/execute', async (req, res) => {
 
 function toolStatusLabel(toolName) {
     const n = toolName.toLowerCase();
+    if (n === 'list_projects') return 'Fetching your projects...';
+    if (n === 'explore_project_db') return 'Reading database schema...';
+    if (n === 'create_trigger') return 'Creating task...';
     if (n.includes('calendar')) return 'Checking your calendar...';
     if (n.includes('gmail') || n.includes('mail')) return 'Reading emails...';
     if (n.includes('slack')) return 'Checking Slack...';
@@ -445,7 +577,12 @@ Your goal is to take action with minimal back-and-forth.
 
 **EXCEPTION ” creating scheduled tasks / automations:** Inference does NOT apply. Tasks run autonomously with no chance to ask follow-up questions later. You MUST gather every critical runtime parameter (recipient, source account, trigger condition, content shape) before drafting the task. NEVER infer a recipient name (Slack user/channel, email address) ” these are user choices, not defaults. See "Creating scheduled tasks" rules below.
 
-**When the user has already answered a question:** Read the conversation history. Use their answer. Never ask the same thing twice.
+**When the user has already answered a question — READ THE FULL CONVERSATION HISTORY:** Before asking the user for ANY parameter (recipient, message content, schedule, etc.), scan every prior turn in this conversation for that information. If the user mentioned it ONCE — even three turns ago — use it. Examples of correct behavior:
+- User Turn 1: "Send a message to Paras in Slack" → Turn 2: "Say Hey" → You: Send "Hey" to Paras in Slack. (Recipient Paras was given in Turn 1, content "Hey" in Turn 2 — both clear, no need to ask anything.)
+- User Turn 1: "Email John about the meeting" → Turn 2: "tomorrow 3pm" → You: Send email to John about meeting at tomorrow 3pm. (Recipient and topic from Turn 1, time from Turn 2.)
+- NEVER ask "please specify the destination" if the user mentioned it in a prior turn. That is the most frustrating failure mode — it makes you look like you can't read.
+
+This is different from inferring a recipient (which is forbidden). Carrying forward what the user already said is REQUIRED.
 
 The user expects action, not a checklist conversation. Bias heavily toward acting with reasonable assumptions over asking.`;
 
@@ -508,8 +645,11 @@ ${memorySection}${appsSection}${mcpSection}
 
 ${identityRule}
 
-## Built-in tool available at all times
+## Built-in tools available at all times
 - **get_current_time**: Returns current date/time. Call this FIRST when you need to know "today", "now", or calculate relative dates like "next week", "tomorrow", "next Monday". Critical for calendar queries.
+- **check_integration_status**: Verify whether a specific app is connected.
+  - **MANDATORY before refusing an action due to "missing integration":** if you're about to tell the user "I don't have X connected" or "X is not integrated", call check_integration_status({ app: 'X' }) FIRST. Your system prompt's "Connected apps" list is your usual source of truth, but if the user disputes it ("I just connected it!"), check_integration_status is how you verify — never tell the user to "check their settings to confirm"; you can confirm directly.
+  - **MANDATORY when the user insists an app IS connected:** call this tool, do not argue. If the tool confirms connected → proceed with the action. If the tool confirms not connected → tell the user clearly with the connect path.
 
 ${composioApps.length > 0 ? `## Connected-app workflow
 
@@ -618,6 +758,8 @@ A scheduled task runs autonomously. Once created, it has no chance to ask follow
 - Which account to read from when multiple are connected
 - The trigger condition ("all" or "any" is never a safe default for "matching")
 
+**However — "inferring" means making something up.** Reading from prior conversation turns is NOT inferring; it is required. If the user said "send to Paras" in any prior turn of this conversation, "Paras" is the recipient — don't ask again. Only if the recipient has NEVER been mentioned should you ask.
+
 Inference is fine for low-stakes defaults (timezone → UTC, dedup TTL → 7 days). Inference is FORBIDDEN for recipients and sources — getting them wrong sends private data to the wrong person.
 
 ---
@@ -657,7 +799,9 @@ The runPrompt MUST be plain English natural language - NEVER code, scripts, or p
 In the runPrompt, always specify the exact watch key string, e.g. watch_get("notified_pr_{owner}_{repo}_{number}").
 
 **RULE 7 - Missing integration = connect it, not a workaround.**
-If a needed integration is not connected, respond EXACTLY: "To set this up, you'll need to connect **[App Name]** to your agent. Click **Configure** (top right) ’ Integrations ’ connect [App Name]. Once connected, come back and I'll create this task for you immediately."
+If a needed integration is not connected, respond EXACTLY: "To set this up, you’ll need to connect **[App Name]** to your agent. Click **Configure** (top right) ‘ Integrations ‘ connect [App Name]. Once connected, come back and I’ll create this task for you immediately."
+
+${PROJECT_FLOW_PROMPT}
 
 ${responseStyle}`;
         }
@@ -679,6 +823,18 @@ ${responseStyle}`;
             const name = tc.name;
             const args = tc.args || {};
 
+            // check_integration_status — pure local check against the connected-apps list
+            // passed in this chat's agentConfig. Lets the agent fact-check itself when the
+            // user disputes its claim that an integration isn't connected.
+            if (name === 'check_integration_status') {
+                const app = String(args.app || '').toUpperCase();
+                if (!app) return 'check_integration_status requires an `app` argument.';
+                const isConnected = composioApps.map(a => a.toUpperCase()).includes(app);
+                return isConnected
+                    ? `✓ ${app} is connected to this agent. You can use it now.`
+                    : `✗ ${app} is not connected. Tell the user to connect it via Settings → Integrations, then they can ask again.`;
+            }
+
             // Self-orchestration tools (watch_set/get/clear, create_task) ” handled locally
             if (['watch_set', 'watch_get', 'watch_clear', 'create_task'].includes(name)) {
                 try {
@@ -691,20 +847,63 @@ ${responseStyle}`;
                 } catch (e) { return `Tool failed: ${e.message}`; }
             }
 
+            // list_projects — fetch user's Greta projects with backend status
+            if (name === 'list_projects') {
+                try {
+                    const res = await axios.post(
+                        `${BACKEND_GATEWAY_URL}/api/greta/gateway/projects`,
+                        { agentId: AGENT_ID, userId },
+                        { headers: { 'x-gateway-signature': gatewaySignature }, validateStatus: s => s < 500 }
+                    );
+                    if (!res.data?.success) return `Error (${res.status}): ${res.data?.error || 'unknown'}`;
+                    const projects = res.data.projects || [];
+                    if (!projects.length) return 'No projects found for this user.';
+                    return JSON.stringify({ projects });
+                } catch (e) { console.log('[list_projects] error:', e.message); return `Tool failed: ${e.message}`; }
+            }
+
+            // explore_project_db — fetch collections + existing tasks for a project
+            if (name === 'explore_project_db') {
+                try {
+                    const res = await axios.post(
+                        `${BACKEND_GATEWAY_URL}/api/greta/gateway/projects/${args.projectId}/schema`,
+                        { agentId: AGENT_ID, userId },
+                        { headers: { 'x-gateway-signature': gatewaySignature }, validateStatus: s => s < 500 }
+                    );
+                    if (!res.data?.success) return `Error (${res.status}): ${res.data?.error || 'unknown'}. Make sure projectId is one returned by list_projects.`;
+                    return JSON.stringify({
+                        projectId: args.projectId,
+                        projectName: res.data.projectName,
+                        collections: res.data.collections || [],
+                        existingTasks: res.data.existingTasks || [],
+                    });
+                } catch (e) { console.log('[explore_project_db] error:', e.message); return `Tool failed: ${e.message}`; }
+            }
+
             // create_trigger — creates a scheduled task via backend, then notifies frontend
             if (name === 'create_trigger') {
                 try {
+                    console.log(`[create_trigger] payload:`, JSON.stringify({ ...args, runPrompt: args.runPrompt?.slice(0, 60), runPromptTemplate: args.runPromptTemplate?.slice(0, 60) }));
                     const trigRes = await axios.post(
                         `${BACKEND_GATEWAY_URL}/api/greta/gateway/trigger/create`,
                         { agentId: AGENT_ID, userId, ...args },
-                        { headers: { 'x-gateway-signature': gatewaySignature } }
+                        {
+                            headers: { 'x-gateway-signature': gatewaySignature },
+                            // Don't throw on 4xx — backend returns structured error JSON we want to surface.
+                            validateStatus: s => s < 500,
+                        }
                     );
-                    if (trigRes.data.success) {
+                    if (trigRes.data?.success) {
                         emit({ type: 'trigger_created', triggerId: trigRes.data.triggerId, name: args.name });
                         return JSON.stringify({ success: true, message: `Task "${args.name}" created successfully.` });
                     }
-                    return `Error: ${trigRes.data.error}`;
-                } catch (e) { return `Tool failed: ${e.message}`; }
+                    const backendError = trigRes.data?.error || `HTTP ${trigRes.status}`;
+                    console.log(`[create_trigger] backend rejected (${trigRes.status}): ${backendError}`);
+                    return `Error from backend (${trigRes.status}): ${backendError}. Check that projectId is a valid UUID from list_projects, and that all required fields for the trigger type are present.`;
+                } catch (e) {
+                    console.log(`[create_trigger] network/unknown error:`, e.message);
+                    return `Tool failed: ${e.message}`;
+                }
             }
 
             if (name.startsWith('mcp_')) {
@@ -814,7 +1013,10 @@ ${responseStyle}`;
             }
 
             toolDefs.push(GET_CURRENT_TIME_TOOL);
+            toolDefs.push(CHECK_INTEGRATION_STATUS_TOOL);
             toolDefs.push(CREATE_TRIGGER_TOOL);
+            toolDefs.push(LIST_PROJECTS_TOOL);
+            toolDefs.push(EXPLORE_PROJECT_DB_TOOL);
             if (composioApps.length > 0) {
                 toolDefs.push(COMPOSIO_SEARCH_TOOL_DEF);
                 toolDefs.push(COMPOSIO_MULTI_EXECUTE_TOOL_DEF);
@@ -837,20 +1039,20 @@ ${responseStyle}`;
                 llmWithTools = llm;
             }
 
-                // Track Composio tools discovered via search this turn ” used to validate MULTI_EXECUTE_TOOL calls.
-                // The LLM cannot bypass discovery by guessing tool names from training.
-                const discoveredComposioTools = new Set();
-                // Hard runtime guardrails for Composio tools to prevent thrashing:
-                // - Limit COMPOSIO_SEARCH_TOOLS calls per turn
-                // - Prevent identical COMPOSIO_MULTI_EXECUTE_TOOL calls from re-hitting the backend
-                let composioSearchCount = 0;
-                const executedMultiStepSignatures = new Set(); // key: JSON.stringify(steps)
-                // Structured facts extracted from raw tool results for safer, grounded answers.
-                // For now we track GitHub repository names explicitly so the final response
-                // never needs to œinvent repo names ” it can rely on this list instead.
-                const githubRepoNames = new Set();
+	            // Track Composio tools discovered via search this turn ” used to validate MULTI_EXECUTE_TOOL calls.
+	            // The LLM cannot bypass discovery by guessing tool names from training.
+	            const discoveredComposioTools = new Set();
+	            // Hard runtime guardrails for Composio tools to prevent thrashing:
+	            // - Limit COMPOSIO_SEARCH_TOOLS calls per turn
+	            // - Prevent identical COMPOSIO_MULTI_EXECUTE_TOOL calls from re-hitting the backend
+	            let composioSearchCount = 0;
+	            const executedMultiStepSignatures = new Set(); // key: JSON.stringify(steps)
+	            // Structured facts extracted from raw tool results for safer, grounded answers.
+	            // For now we track GitHub repository names explicitly so the final response
+	            // never needs to œinvent repo names ” it can rely on this list instead.
+	            const githubRepoNames = new Set();
 
-                for (let step = 0; step < 8 && !cancelled; step++) {
+	            for (let step = 0; step < 8 && !cancelled; step++) {
                 console.log(`[Chat] Step ${step + 1}: invoking LLM...`);
                 let msg;
                 try {
@@ -881,169 +1083,141 @@ ${responseStyle}`;
                 if (toolCalls.length === 0) { finalText = text; break; }
 
                 console.log(`[Chat] Executing:`, toolCalls.map(t => t.name).join(', '));
-                    await Promise.all(toolCalls.map(async (tc) => {
+	                await Promise.all(toolCalls.map(async (tc) => {
                     emit({ type: 'status', content: toolStatusLabel(tc.name) });
                     try {
                         let result;
                         if (tc.name === 'get_current_time') {
                             result = executeGetCurrentTime();
                         } else if (tc.name === 'COMPOSIO_SEARCH_TOOLS') {
-                                // Hard cap: avoid infinite/expensive search loops. After 2 searches in a
-                                // single user turn, instruct the LLM to re-use already discovered tools
-                                // instead of searching again.
-                                if (composioSearchCount >= 2) {
-                                    console.warn('[Chat] COMPOSIO_SEARCH_TOOLS limit reached ” returning searchLimitReached stub');
-                                    result = JSON.stringify({
-                                        searchLimitReached: true,
-                                        message: 'COMPOSIO_SEARCH_TOOLS has already been used 2 times in this turn. Re-use the tools you have already discovered instead of searching again. Plan with the current tool set and call COMPOSIO_MULTI_EXECUTE_TOOL using those tools.',
-                                        discoveredTools: [...discoveredComposioTools],
-                                    });
-                                } else {
-                                    composioSearchCount += 1;
-                                    const searchRes = await axios.post(
-                                        `${BACKEND_GATEWAY_URL}/api/greta/gateway/composio/meta/search`,
-                                        { agentId: AGENT_ID, userId, queries: tc.args?.queries || [] },
-                                        { headers: { 'x-gateway-signature': gatewaySignature } }
-                                    );
-                                    const newSchemas = searchRes.data.success ? (searchRes.data.tools || []) : [];
-                                    // Track discovered tool names for MULTI_EXECUTE_TOOL validation.
-                                    // Do NOT bind them as callable tools ” the LLM can only execute Composio
-                                    // tools via COMPOSIO_MULTI_EXECUTE_TOOL. This prevents bypass, keeps the
-                                    // per-call tool definitions small, and forces a single validated path.
-                                    for (const schema of newSchemas) {
-                                        const tName = schema.function?.name || schema.name;
-                                        if (tName) discoveredComposioTools.add(tName);
-                                    }
-                                    console.log(`[Chat] COMPOSIO_SEARCH_TOOLS found ${newSchemas.length} tools ” schemas returned to LLM, not bound`);
-                                    const planGuidance = searchRes.data.planGuidance || [];
-                                    result = JSON.stringify({
-                                        found: newSchemas.length,
-                                        // Full schemas (name + description + parameters) so the LLM can build
-                                        // schema-correct calls via COMPOSIO_MULTI_EXECUTE_TOOL.
-                                        tools: newSchemas.map(t => ({
-                                            name: t.function?.name || t.name,
-                                            description: t.function?.description,
-                                            parameters: t.function?.parameters
-                                        })),
-                                        ...(planGuidance.length > 0 && { planGuidance }),
-                                        message: newSchemas.length > 0
-                                            ? `Found ${newSchemas.length} tools. Each tool's name, description, and parameter schema is in the "tools" field. Call them via COMPOSIO_MULTI_EXECUTE_TOOL using the exact name and schema-correct params. Tools are NOT bound directly ” MULTI_EXECUTE_TOOL is the only execution path.`
-                                            : 'No tools found. Re-think the request, decompose into sub-goals, and search again with different terms.'
-                                    });
-                                }
-                            } else if (tc.name === 'COMPOSIO_MULTI_EXECUTE_TOOL') {
-                                const steps = tc.args?.steps || [];
-                                const stepSignature = JSON.stringify(steps || []);
-                                // Prevent identical MULTI_EXECUTE calls from re-hitting the backend. If the
-                                // exact same steps array (same tools + params) was already executed earlier
-                                // in this user turn, return a lightweight stub instead of calling Composio
-                                // again. The original full results are still in the conversation context.
-                                if (executedMultiStepSignatures.has(stepSignature)) {
-                                    console.warn('[Chat] COMPOSIO_MULTI_EXECUTE_TOOL skipped ” identical steps already executed this turn');
-                                    result = JSON.stringify({
-                                        duplicate: true,
-                                        message: 'These COMPOSIO_MULTI_EXECUTE_TOOL steps were already executed earlier in this turn. Re-use the previous tool results in the context instead of calling this tool again.',
-                                    });
-                                } else {
+	                            // Hard cap: avoid infinite/expensive search loops. After 2 searches in a
+	                            // single user turn, instruct the LLM to re-use already discovered tools
+	                            // instead of searching again.
+	                            if (composioSearchCount >= 2) {
+	                                console.warn('[Chat] COMPOSIO_SEARCH_TOOLS limit reached ” returning searchLimitReached stub');
+	                                result = JSON.stringify({
+	                                    searchLimitReached: true,
+	                                    message: 'COMPOSIO_SEARCH_TOOLS has already been used 2 times in this turn. Re-use the tools you have already discovered instead of searching again. Plan with the current tool set and call COMPOSIO_MULTI_EXECUTE_TOOL using those tools.',
+	                                    discoveredTools: [...discoveredComposioTools],
+	                                });
+	                            } else {
+	                                composioSearchCount += 1;
+	                                const searchRes = await axios.post(
+	                                    `${BACKEND_GATEWAY_URL}/api/greta/gateway/composio/meta/search`,
+	                                    { agentId: AGENT_ID, userId, queries: tc.args?.queries || [] },
+	                                    { headers: { 'x-gateway-signature': gatewaySignature } }
+	                                );
+	                                const newSchemas = searchRes.data.success ? (searchRes.data.tools || []) : [];
+	                                // Track discovered tool names for MULTI_EXECUTE_TOOL validation.
+	                                // Do NOT bind them as callable tools ” the LLM can only execute Composio
+	                                // tools via COMPOSIO_MULTI_EXECUTE_TOOL. This prevents bypass, keeps the
+	                                // per-call tool definitions small, and forces a single validated path.
+	                                for (const schema of newSchemas) {
+	                                    const tName = schema.function?.name || schema.name;
+	                                    if (tName) discoveredComposioTools.add(tName);
+	                                }
+	                                console.log(`[Chat] COMPOSIO_SEARCH_TOOLS found ${newSchemas.length} tools ” schemas returned to LLM, not bound`);
+	                                const planGuidance = searchRes.data.planGuidance || [];
+	                                result = JSON.stringify({
+	                                    found: newSchemas.length,
+	                                    // Full schemas (name + description + parameters) so the LLM can build
+	                                    // schema-correct calls via COMPOSIO_MULTI_EXECUTE_TOOL.
+	                                    tools: newSchemas.map(t => ({
+	                                        name: t.function?.name || t.name,
+	                                        description: t.function?.description,
+	                                        parameters: t.function?.parameters
+	                                    })),
+	                                    ...(planGuidance.length > 0 && { planGuidance }),
+	                                    message: newSchemas.length > 0
+	                                        ? `Found ${newSchemas.length} tools. Each tool's name, description, and parameter schema is in the "tools" field. Call them via COMPOSIO_MULTI_EXECUTE_TOOL using the exact name and schema-correct params. Tools are NOT bound directly ” MULTI_EXECUTE_TOOL is the only execution path.`
+	                                        : 'No tools found. Re-think the request, decompose into sub-goals, and search again with different terms.'
+	                                });
+	                            }
+	                        } else if (tc.name === 'COMPOSIO_MULTI_EXECUTE_TOOL') {
+	                            const steps = tc.args?.steps || [];
+	                            const stepSignature = JSON.stringify(steps || []);
+	                            // Prevent identical MULTI_EXECUTE calls from re-hitting the backend. If the
+	                            // exact same steps array (same tools + params) was already executed earlier
+	                            // in this user turn, return a lightweight stub instead of calling Composio
+	                            // again. The original full results are still in the conversation context.
+	                            if (executedMultiStepSignatures.has(stepSignature)) {
+	                                console.warn('[Chat] COMPOSIO_MULTI_EXECUTE_TOOL skipped ” identical steps already executed this turn');
+	                                result = JSON.stringify({
+	                                    duplicate: true,
+	                                    message: 'These COMPOSIO_MULTI_EXECUTE_TOOL steps were already executed earlier in this turn. Re-use the previous tool results in the context instead of calling this tool again.',
+	                                });
+	                            } else {
                             // Validate: every step must reference a tool discovered via COMPOSIO_SEARCH_TOOLS this turn.
                             // Prevents the LLM from guessing tool names from training memory.
                             const undiscovered = steps
                                 .map((s, idx) => ({ idx: idx + 1, tool: s.tool }))
                                 .filter(s => s.tool && !discoveredComposioTools.has(s.tool));
 
-                                if (undiscovered.length > 0) {
-                                    console.warn(`[Chat] COMPOSIO_MULTI_EXECUTE_TOOL rejected ” undiscovered tools: ${undiscovered.map(u => u.tool).join(', ')}`);
-                                    result = JSON.stringify({
-                                        rejected: true,
-                                        reason: 'One or more tools were not discovered via COMPOSIO_SEARCH_TOOLS in this turn.',
-                                        undiscoveredTools: undiscovered,
-                                        requiredAction: 'Call COMPOSIO_SEARCH_TOOLS first with queries describing what each undiscovered tool does. Read the returned schemas (parameter names and types) carefully, then retry COMPOSIO_MULTI_EXECUTE_TOOL using only discovered tools and schema-correct params.',
-                                        discoveredSoFar: [...discoveredComposioTools]
-                                    });
-                                } else {
-                                    const multiRes = await axios.post(
-                                        `${BACKEND_GATEWAY_URL}/api/greta/gateway/composio/multi-execute`,
-                                        { agentId: AGENT_ID, userId, steps },
-                                        { headers: { 'x-gateway-signature': gatewaySignature } }
-                                    );
-                                    result = multiRes.data.success
-                                        ? JSON.stringify(multiRes.data.results)
-                                        : `Error: ${multiRes.data.error}`;
-                                    if (multiRes.data.success) {
-                                        executedMultiStepSignatures.add(stepSignature);
-                                        // Extract GitHub repository names directly from the raw multi-execute
-                                        // response so the final answer can list ONLY real repos, never
-                                        // hallucinated names. This parsing happens BEFORE shapeToolResult
-                                        // truncates or depth-limits the payload.
-                                        try {
-                                            const results = multiRes.data.results || [];
-                                            for (const stepRes of results) {
-                                                const payload = stepRes?.data?.data || stepRes?.data;
-                                                if (!payload) continue;
-                                                const repos = payload.repositories || payload.repos || [];
-                                                if (!Array.isArray(repos)) continue;
-                                                for (const repo of repos) {
-                                                    if (!repo || typeof repo !== 'object') continue;
-                                                    const ownerLogin = repo.owner?.login || repo.owner?.name;
-                                                    const simpleName = typeof repo.name === 'string' ? repo.name : null;
-                                                    const fullName = typeof repo.full_name === 'string'
-                                                        ? repo.full_name
-                                                        : (ownerLogin && simpleName ? `${ownerLogin}/${simpleName}` : simpleName);
-                                                    if (typeof fullName === 'string' && fullName.trim()) {
-                                                        githubRepoNames.add(fullName.trim());
-                                                    }
-                                                }
-                                            }
-                                        } catch (extractErr) {
-                                            console.warn('[Chat] Failed to extract GitHub repo names from COMPOSIO_MULTI_EXECUTE_TOOL:', extractErr.message);
-                                        }
-                                    }
-                                }
-                                }
-                            } else {
-                                result = await executeExternalTool(tc);
-                            }
-                            // Central shaping ” strips email headers, MIME parts, ARC sigs, and other
-                            // tool-response bloat before the result enters the LLM context. Applies to
-                            // ALL paths (MULTI_EXECUTE_TOOL, direct Composio calls, MCP, orchestration).
-                            // shapeToolResult is a no-op for small results, so it's safe everywhere.
-                            const shaped = shapeToolResult(result);
-                            phase3Messages.push({ role: 'tool', tool_call_id: tc.id, content: shaped });
-                            toolsExecuted = true;
+	                            if (undiscovered.length > 0) {
+	                                console.warn(`[Chat] COMPOSIO_MULTI_EXECUTE_TOOL rejected ” undiscovered tools: ${undiscovered.map(u => u.tool).join(', ')}`);
+	                                result = JSON.stringify({
+	                                    rejected: true,
+	                                    reason: 'One or more tools were not discovered via COMPOSIO_SEARCH_TOOLS in this turn.',
+	                                    undiscoveredTools: undiscovered,
+	                                    requiredAction: 'Call COMPOSIO_SEARCH_TOOLS first with queries describing what each undiscovered tool does. Read the returned schemas (parameter names and types) carefully, then retry COMPOSIO_MULTI_EXECUTE_TOOL using only discovered tools and schema-correct params.',
+	                                    discoveredSoFar: [...discoveredComposioTools]
+	                                });
+	                            } else {
+	                                const multiRes = await axios.post(
+	                                    `${BACKEND_GATEWAY_URL}/api/greta/gateway/composio/multi-execute`,
+	                                    { agentId: AGENT_ID, userId, steps },
+	                                    { headers: { 'x-gateway-signature': gatewaySignature } }
+	                                );
+	                                result = multiRes.data.success
+	                                    ? JSON.stringify(multiRes.data.results)
+	                                    : `Error: ${multiRes.data.error}`;
+	                                if (multiRes.data.success) {
+	                                    executedMultiStepSignatures.add(stepSignature);
+	                                    // Extract GitHub repository names directly from the raw multi-execute
+	                                    // response so the final answer can list ONLY real repos, never
+	                                    // hallucinated names. This parsing happens BEFORE shapeToolResult
+	                                    // truncates or depth-limits the payload.
+	                                    try {
+	                                        const results = multiRes.data.results || [];
+	                                        for (const stepRes of results) {
+	                                            const payload = stepRes?.data?.data || stepRes?.data;
+	                                            if (!payload) continue;
+	                                            const repos = payload.repositories || payload.repos || [];
+	                                            if (!Array.isArray(repos)) continue;
+	                                            for (const repo of repos) {
+	                                                if (!repo || typeof repo !== 'object') continue;
+	                                                const ownerLogin = repo.owner?.login || repo.owner?.name;
+	                                                const simpleName = typeof repo.name === 'string' ? repo.name : null;
+	                                                const fullName = typeof repo.full_name === 'string'
+	                                                    ? repo.full_name
+	                                                    : (ownerLogin && simpleName ? `${ownerLogin}/${simpleName}` : simpleName);
+	                                                if (typeof fullName === 'string' && fullName.trim()) {
+	                                                    githubRepoNames.add(fullName.trim());
+	                                                }
+	                                            }
+	                                        }
+	                                    } catch (extractErr) {
+	                                        console.warn('[Chat] Failed to extract GitHub repo names from COMPOSIO_MULTI_EXECUTE_TOOL:', extractErr.message);
+	                                    }
+	                                }
+	                            }
+	                            }
+	                        } else {
+	                            result = await executeExternalTool(tc);
+	                        }
+	                        // Central shaping ” strips email headers, MIME parts, ARC sigs, and other
+	                        // tool-response bloat before the result enters the LLM context. Applies to
+	                        // ALL paths (MULTI_EXECUTE_TOOL, direct Composio calls, MCP, orchestration).
+	                        // shapeToolResult is a no-op for small results, so it's safe everywhere.
+	                        const shaped = shapeToolResult(result);
+	                        phase3Messages.push({ role: 'tool', tool_call_id: tc.id, content: shaped });
+	                        toolsExecuted = true;
                     } catch (e) {
                         phase3Messages.push({ role: 'tool', tool_call_id: tc.id, content: `Tool failed: ${e.message}` });
                     }
                 }));
             }
 
-                // Always synthesize the final user-facing answer from tool results when tools
-                // were executed. This keeps the final response tightly grounded in actual data
-                // instead of whatever the last ReAct step happened to say.
-                if (toolsExecuted && !cancelled) {
-                const toolMsgs = phase3Messages.filter(m => m.role === 'tool');
-                if (toolMsgs.length > 0) {
-                    try {
-                            const toolResultsText = toolMsgs.map(m => String(m.content)).join('\n---\n');
-                            let extractedContext = '';
-                            if (githubRepoNames.size > 0) {
-                                extractedContext += '\n\nExtracted GitHub repositories (from tools):\n' +
-                                    [...githubRepoNames].map(n => `- ${n}`).join('\n');
-                            }
-                            const synthMsg = await llm.invoke([
-                                {
-                                    role: 'system',
-                                    content: 'Summarize these tool results as a clear helpful response. Be direct, no filler. When listing GitHub repositories, ONLY use repository names that appear in the tool results or in the "Extracted GitHub repositories" list provided. Do NOT invent or guess additional repository names.'
-                                },
-                                {
-                                    role: 'user',
-                                    content: `User said: "${message}"\n\nTool results:\n${toolResultsText}${extractedContext}`
-                                }
-                            ]);
-                        trackCall(synthMsg);
-                        finalText = extractText(synthMsg).trim();
-                    } catch (e) { console.error('[Chat] Synthesis failed:', e.message); }
-                }
-            }
         }
 
         console.log(`[Chat] After all phases ” finalText.length:${finalText.length}, toolsExecuted:${toolsExecuted}, cancelled:${cancelled}`);
