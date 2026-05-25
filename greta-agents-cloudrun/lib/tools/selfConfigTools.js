@@ -3,7 +3,7 @@ const { z } = require('zod');
 const axios = require('axios');
 const { SUPPORTED_APPS } = require('./supportedApps');
 
-function createSelfConfigTools({ agentId, userId, gatewayUrl, composioApps = [] }) {
+function createSelfConfigTools({ agentId, userId, gatewayUrl, composioApps = [], getSignature = () => null, emit = () => {} }) {
     return [
         tool(
             async ({ name }) => {
@@ -119,6 +119,97 @@ function createSelfConfigTools({ agentId, userId, gatewayUrl, composioApps = [] 
                 name: 'complete_onboarding',
                 description: 'Mark onboarding as complete. Use when you have a name, clear purpose, and all necessary integrations configured.',
                 schema: z.object({ summary: z.string().describe('Brief summary of your configuration') })
+            }
+        ),
+
+        // ─────────────────────────────────────────────────────────────────────
+        // Project-task tools — also available during onboarding so a new agent
+        // can immediately show projects + create tasks, not wait for setup to finish.
+        // Mirrors the non-onboarding handlers in server.js but uses LangChain format.
+        // ─────────────────────────────────────────────────────────────────────
+
+        tool(
+            async () => {
+                try {
+                    const res = await axios.post(
+                        `${gatewayUrl}/api/greta/gateway/projects`,
+                        { agentId, userId },
+                        { headers: { 'x-gateway-signature': getSignature() }, validateStatus: s => s < 500 }
+                    );
+                    if (!res.data?.success) return `Error (${res.status}): ${res.data?.error || 'unknown'}`;
+                    const projects = res.data.projects || [];
+                    if (!projects.length) return 'No projects found for this user.';
+                    return JSON.stringify({ projects });
+                } catch (e) { return `Tool failed: ${e.message}`; }
+            },
+            {
+                name: 'list_projects',
+                description: `Fetch the user's Greta projects with backend status. Returns each project's display name, projectId, and hasBackend flag. ALWAYS show projects by NAME — never show the projectId to the user (it's a UUID, not user-friendly).`,
+                schema: z.object({})
+            }
+        ),
+
+        tool(
+            async ({ projectId }) => {
+                try {
+                    const res = await axios.post(
+                        `${gatewayUrl}/api/greta/gateway/projects/${projectId}/schema`,
+                        { agentId, userId },
+                        { headers: { 'x-gateway-signature': getSignature() }, validateStatus: s => s < 500 }
+                    );
+                    if (!res.data?.success) return `Error (${res.status}): ${res.data?.error || 'unknown'}. Make sure projectId is one returned by list_projects.`;
+                    return JSON.stringify({
+                        projectId,
+                        projectName: res.data.projectName,
+                        collections: res.data.collections || [],
+                        existingTasks: res.data.existingTasks || [],
+                    });
+                } catch (e) { return `Tool failed: ${e.message}`; }
+            },
+            {
+                name: 'explore_project_db',
+                description: `Fetch the database collections + existing tasks for a Greta project. Call this after the user picks a project from list_projects, before discussing what task to build.`,
+                schema: z.object({
+                    projectId: z.string().describe('The project ID (UUID) from list_projects')
+                })
+            }
+        ),
+
+        tool(
+            async (args) => {
+                try {
+                    const trigRes = await axios.post(
+                        `${gatewayUrl}/api/greta/gateway/trigger/create`,
+                        { agentId, userId, ...args },
+                        { headers: { 'x-gateway-signature': getSignature() }, validateStatus: s => s < 500 }
+                    );
+                    if (trigRes.data?.success) {
+                        try { emit({ type: 'trigger_created', triggerId: trigRes.data.triggerId, name: args.name }); } catch {}
+                        return JSON.stringify({ success: true, message: `Task "${args.name}" created successfully.` });
+                    }
+                    return `Error from backend (${trigRes.status}): ${trigRes.data?.error || 'unknown'}. Check that projectId is a valid UUID from list_projects, and that all required fields for the trigger type are present.`;
+                } catch (e) { return `Tool failed: ${e.message}`; }
+            },
+            {
+                name: 'create_trigger',
+                description: `Create a task for this agent. Types: SCHEDULED (cron-based), DB_EVENT (fires on user's app DB writes — REQUIRES projectId), WEBHOOK_RECEIVED (incoming webhook). For DB_EVENT, projectId MUST be the exact UUID from list_projects (never the project name).`,
+                schema: z.object({
+                    name: z.string().describe('Short task name shown to the user'),
+                    description: z.string().optional().describe('Friendly description of what this task does'),
+                    type: z.enum(['SCHEDULED', 'DB_EVENT', 'WEBHOOK_RECEIVED']).describe('Trigger type'),
+                    projectId: z.string().optional().describe('REQUIRED for DB_EVENT. The exact UUID projectId from list_projects.'),
+                    schedule: z.object({
+                        cronExpression: z.string(),
+                        timezone: z.string().optional()
+                    }).optional().describe('REQUIRED for SCHEDULED tasks. Standard 5-field cron expression.'),
+                    dbEvent: z.object({
+                        collectionName: z.string(),
+                        events: z.array(z.enum(['INSERT', 'UPDATE', 'DELETE']))
+                    }).optional().describe('REQUIRED for DB_EVENT tasks.'),
+                    runPrompt: z.string().optional().describe('REQUIRED for SCHEDULED. Plain English instruction executed when the trigger fires.'),
+                    runPromptTemplate: z.string().optional().describe('REQUIRED for DB_EVENT. Plain English instruction with {{record}}, {{event}}, {{collection}} placeholders.'),
+                    composioApps: z.array(z.string()).optional().describe('Apps this task needs. Only list apps from your Connected apps section.')
+                })
             }
         ),
     ];
