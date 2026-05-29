@@ -96,7 +96,6 @@ export async function restartVite() {
   log.emoji('restart', 'Restarting Vite to pick up new dependencies...');
   stopVite();
 
-  // Clear Vite dep cache so new hash is generated — prevents browser 504 on stale hash
   const viteCacheDir = path.join(FRONTEND_DIR, 'node_modules', '.vite');
   await rm(viteCacheDir, { recursive: true, force: true }).catch(() => {});
   log.info('Cleared Vite dep cache');

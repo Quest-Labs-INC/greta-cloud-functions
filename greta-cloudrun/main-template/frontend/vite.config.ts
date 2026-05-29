@@ -10,6 +10,8 @@ export default defineConfig(({ mode }) => ({
     port: 5173,
     hmr: {
       overlay: false,
+      port: 9999,
+      clientPort: 9999,
     },
     watch: {
       ignored: [
