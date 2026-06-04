@@ -542,7 +542,14 @@ app.post('/chat', async (req, res) => {
         let selfConfigToolInstances = [];
 
         if (isOnboarding) {
-            selfConfigToolInstances = createSelfConfigTools({ agentId: AGENT_ID, userId, gatewayUrl: BACKEND_GATEWAY_URL, composioApps });
+            selfConfigToolInstances = createSelfConfigTools({
+                agentId: AGENT_ID,
+                userId,
+                gatewayUrl: BACKEND_GATEWAY_URL,
+                composioApps,
+                getSignature: () => gatewaySignature,
+                emit,
+            });
             toolDefs = selfConfigToolInstances;
             console.log(`[Chat] Onboarding mode ” loaded ${toolDefs.length} self-config tools`);
         }
