@@ -492,6 +492,87 @@ function toolStatusLabel(toolName) {
     return 'Working...';
 }
 
+// Truncate long strings for inline display in tool labels.
+function truncate(s, n) {
+    s = String(s ?? '');
+    return s.length > n ? s.slice(0, n - 1) + '…' : s;
+}
+
+// Trim a tool description to the first sentence, capped at maxLen chars.
+// Composio descriptions are usually one or two sentences ("Sends an email via Gmail.
+// Supports CC, BCC, and attachments."). The first sentence is the action label.
+function firstSentence(text, maxLen = 70) {
+    if (!text) return '';
+    const cleaned = String(text).replace(/\s+/g, ' ').trim();
+    const cut = cleaned.match(/^[^.!?]+[.!?]?/);
+    const sentence = (cut ? cut[0] : cleaned).replace(/\.$/, '').trim();
+    return sentence.length > maxLen ? sentence.slice(0, maxLen - 1) + '…' : sentence;
+}
+
+// Describe a Composio step using its own description (from the cache populated when
+// COMPOSIO_SEARCH_TOOLS ran). Appends one piece of param context (recipient/title/query)
+// when an obvious key is present. Zero per-tool/per-app dictionaries.
+function describeComposioStep(step, descriptionCache) {
+    const slug = (step?.tool || '').toUpperCase();
+    const params = step?.params || {};
+    if (!slug) return 'Running step';
+
+    const cached = descriptionCache?.get(slug);
+    const base = cached
+        ? firstSentence(cached)
+        // Last-resort fallback (description not in cache — shouldn't happen in normal flow
+        // since MULTI_EXECUTE always follows a SEARCH that populated the cache).
+        : slug.split('_').slice(1).join(' ').toLowerCase() || slug;
+
+    // Generic param probes — these key names are Composio conventions, not per-tool config.
+    const recipient = params.recipient_email ?? params.recipientEmail ?? params.to ?? params.channel;
+    const subject = params.subject ?? params.summary ?? params.title ?? params.name;
+    const query = params.query ?? params.q ?? params.search_query;
+    let tail = '';
+    if (recipient) tail = ` → ${truncate(recipient, 40)}`;
+    else if (subject) tail = `: "${truncate(subject, 40)}"`;
+    else if (query) tail = `: "${truncate(query, 40)}"`;
+    return base + tail;
+}
+
+// Generate a context-rich label for a top-level tool call (with args).
+// `descriptionCache` is the turn-scoped Map of {slug → Composio description} populated
+// when COMPOSIO_SEARCH_TOOLS runs; used by Composio sub-step labelling.
+function describeToolCall(name, args, descriptionCache) {
+    const a = args || {};
+    // Built-in / Greta-internal tools: hand-written labels. These don't come from Composio
+    // schemas, so the description cache won't help them.
+    if (name === 'get_current_time') return 'Checking the current time';
+    if (name === 'check_integration_status') return `Checking if ${String(a.app || '').toUpperCase()} is connected`;
+    if (name === 'request_integration') return `Requesting access to ${String(a.app || '').toUpperCase()}`;
+    if (name === 'list_projects') return 'Fetching your projects';
+    if (name === 'explore_project_db') return 'Reading the project database';
+    if (name === 'create_trigger') return `Creating task: ${truncate(a.name || 'new task', 40)}`;
+    if (name === 'update_my_name') return `Saving name: ${truncate(a.name || '', 30)}`;
+    if (name === 'update_my_purpose') return 'Saving purpose';
+    if (name === 'update_my_instructions') return 'Saving behavior instructions';
+    if (name === 'complete_onboarding') return 'Finalizing setup';
+    if (name === 'COMPOSIO_SEARCH_TOOLS') {
+        const queries = Array.isArray(a.queries) ? a.queries : [];
+        const first = queries[0]?.use_case;
+        if (!first) return 'Looking up the right tool';
+        return queries.length === 1
+            ? `Looking up: ${truncate(first, 60)}`
+            : `Looking up ${queries.length} capabilities`;
+    }
+    if (name === 'COMPOSIO_MULTI_EXECUTE_TOOL') {
+        const steps = Array.isArray(a.steps) ? a.steps : [];
+        if (!steps.length) return 'Running actions';
+        if (steps.length === 1) return describeComposioStep(steps[0], descriptionCache);
+        return steps.map(s => describeComposioStep(s, descriptionCache)).join(' → ');
+    }
+    // Bare Composio slug invoked directly (rare — usually goes through MULTI_EXECUTE).
+    if (descriptionCache?.has(name) || /_/.test(name)) {
+        return describeComposioStep({ tool: name, params: a }, descriptionCache);
+    }
+    return toolStatusLabel(name).replace(/\.{3}$/, '');
+}
+
 app.post('/chat', async (req, res) => {
     const incomingToken = req.headers['x-pod-token'];
     if (!incomingToken || incomingToken !== POD_TOKEN) {
@@ -518,6 +599,9 @@ app.post('/chat', async (req, res) => {
     // Phase 3 starts. res closes only when the response is actually finished or
     // the client truly disconnects.
     res.on('close', () => { cancelled = true; });
+
+    const chatStart = Date.now();
+    const timings = { llmSteps: [], tools: [] };
 
     try {
         if (!gatewaySignature) {
@@ -558,8 +642,9 @@ app.post('/chat', async (req, res) => {
             : '';
 
         const notConnectedApps = supportedAppsList.filter(a => !composioApps.map(x => x.toUpperCase()).includes(a.toUpperCase()));
+        const allSupportedList = supportedAppsList.join(', ');
         const connectableSection = notConnectedApps.length > 0
-            ? `\n\n## Apps available to connect (not yet connected)\n${notConnectedApps.join(', ')}\n\nCRITICAL ” "connect X" rule: If the user says "connect [app]", "add [app]", "I want to use [app]", or asks to do ANYTHING that requires one of the apps above, output TOOLS_NEEDED:APPNAME on the FIRST line. You MAY add one optional sentence on the next line telling the user what you will do after they connect (especially if they described a specific task). Nothing else.\nFormat:\nTOOLS_NEEDED:APPNAME\n[Optional: one sentence about what happens after connecting]\n\nUse the exact uppercase name from the list. Examples:\n- "connect stripe" ’ TOOLS_NEEDED:STRIPE\n- "add Stripe for invoice reminders" ’ TOOLS_NEEDED:STRIPE\\nConnect Stripe below ” once authorized, I'll set up your invoice reminder task.\n- "add hubspot" ’ TOOLS_NEEDED:HUBSPOT\n- "I want to use zoom" ’ TOOLS_NEEDED:ZOOM\nDo NOT say you cannot connect it. Do NOT explain at length. Just TOOLS_NEEDED:APPNAME and one optional follow-up line.`
+            ? `\n\n## Apps available to connect (not yet connected)\n${notConnectedApps.join(', ')}\n\n## Apps NOT supported\nAny app NOT in the Connected list above and NOT in the "available to connect" list is NOT supported by this platform. The COMPLETE list of supported apps is: ${allSupportedList}. Nothing else exists. If the user asks about an app outside this list (e.g. Asana, HubSpot, Zoom, Airtable, Trello, etc.), you MUST tell them it is not currently supported, then list the supported apps. Do NOT output TOOLS_NEEDED for unsupported apps. Do NOT instruct the user to "go to Settings" or "Configure → Integrations" for unsupported apps — that path does not exist for them.\n\nCRITICAL ” "connect X" rule (supported apps only): If the user says "connect [app]", "add [app]", "I want to use [app]", or asks to do ANYTHING that requires one of the apps in the "available to connect" list, output TOOLS_NEEDED:APPNAME on the FIRST line. You MAY add one optional sentence on the next line telling the user what you will do after they connect (especially if they described a specific task). Nothing else.\nFormat:\nTOOLS_NEEDED:APPNAME\n[Optional: one sentence about what happens after connecting]\n\nUse the exact uppercase name from the supported list. Examples (only apps from the supported list are valid):\n- "connect stripe" ’ TOOLS_NEEDED:STRIPE\n- "add Stripe for invoice reminders" ’ TOOLS_NEEDED:STRIPE\\nConnect Stripe below ” once authorized, I'll set up your invoice reminder task.\n- "add notion" ’ TOOLS_NEEDED:NOTION\n- "I want to use github" ’ TOOLS_NEEDED:GITHUB\n- "connect asana" ’ "Asana isn't supported right now. The apps you can connect are: ${allSupportedList}."\n- "is hubspot available" ’ "HubSpot isn't supported. Available: ${allSupportedList}."\nDo NOT say you cannot connect a supported app. Do NOT explain at length. For supported apps: TOOLS_NEEDED:APPNAME and one optional follow-up. For unsupported apps: say not supported + list what is.`
             : '';
         const enabledMcpServers = mcpServers.filter(s => s.enabled !== false);
         const mcpSection = mcpEnabled && enabledMcpServers.length > 0
@@ -638,12 +723,26 @@ When the user asks to rename you or change your identity:
 - Acknowledge the ask without rejecting it as a flaw: "I'm fixed as ${agentName} for now ” renaming isn't something I support yet. What can I help you with in the meantime?"
 - Never pretend it's possible.`;
 
+            const toneRule = `## Tone — enthusiastic teammate
+
+You're a coworker who's into the project, not a corporate assistant. Show genuine interest in what the user is working on, and react to what they say before diving into the help.
+
+- **React first, then help.** "Oh nice — finally getting around to that" / "Love this, automating that kind of thing is satisfying." Acknowledge the human before the task.
+- **Be visibly curious when it matters.** One sharp follow-up beats three clarifying questions in a row.
+- **Vary your phrasing.** Don't open every reply the same way. Mix recognition, agreement, surprise, light enthusiasm.
+- **Confidence over hedging.** "Here's what I'll do" beats "I think I could maybe try to..."
+- **Concise.** One or two sentences is usually right. Energy lives in word choice, not length. Exclamation marks are fine sparingly — when something is actually exciting, not as decoration.
+- **No emojis. No sycophancy.** No "What a great question!", no "Absolutely!", no "I'd be happy to assist you today!". Corporate chatbot energy reads as fake.
+- **When a task is done, sound like you're proud of the result, not relieved to be done.** "Done — calendar's pulled, here's what's coming up." Not "I have completed the task as requested."`;
+
             systemPrompt = `You are ${agentName}.
 
 ${coreInstructions}
 ${memorySection}${appsSection}${mcpSection}
 
 ${identityRule}
+
+${toneRule}
 
 ## Built-in tools available at all times
 - **get_current_time**: Returns current date/time. Call this FIRST when you need to know "today", "now", or calculate relative dates like "next week", "tomorrow", "next Monday". Critical for calendar queries.
@@ -798,8 +897,8 @@ The runPrompt MUST be plain English natural language - NEVER code, scripts, or p
 **RULE 6 - Use a fixed dedup key format.**
 In the runPrompt, always specify the exact watch key string, e.g. watch_get("notified_pr_{owner}_{repo}_{number}").
 
-**RULE 7 - Missing integration = connect it, not a workaround.**
-If a needed integration is not connected, respond EXACTLY: "To set this up, you’ll need to connect **[App Name]** to your agent. Click **Configure** (top right) ‘ Integrations ‘ connect [App Name]. Once connected, come back and I’ll create this task for you immediately."
+**RULE 7 - Missing integration = surface a connect button, never redirect to Configure.**
+If a needed (and supported) integration is not connected, respond with TOOLS_NEEDED:APPNAME on the first line and one short follow-up sentence. The frontend turns this into an inline Connect button right in the chat — that's the connection flow. NEVER tell the user to "click Configure", "open Settings", or "go to Integrations" — that text is forbidden for supported apps. This also applies when the user references a button you previously surfaced ("I missed the button", "where's the connect button", "the button is gone", "let me try connecting again") — just emit TOOLS_NEEDED:APPNAME again and a short reassurance like "Here's the connect button — click it and we'll continue." Do not apologise, do not explain it vanished, just re-emit.
 
 ${PROJECT_FLOW_PROMPT}
 
@@ -830,9 +929,12 @@ ${responseStyle}`;
                 const app = String(args.app || '').toUpperCase();
                 if (!app) return 'check_integration_status requires an `app` argument.';
                 const isConnected = composioApps.map(a => a.toUpperCase()).includes(app);
-                return isConnected
-                    ? `✓ ${app} is connected to this agent. You can use it now.`
-                    : `✗ ${app} is not connected. Tell the user to connect it via Settings → Integrations, then they can ask again.`;
+                if (isConnected) return `✓ ${app} is connected to this agent. You can use it now.`;
+                const isSupported = supportedAppsList.map(a => a.toUpperCase()).includes(app);
+                if (!isSupported) {
+                    return `✗ ${app} is NOT supported by this platform. Do NOT instruct the user to connect it or visit Settings/Configure/Integrations — that path does not exist for ${app}. Tell the user ${app} is not supported and list the supported apps: ${supportedAppsList.join(', ')}.`;
+                }
+                return `✗ ${app} is not connected yet, but it IS supported. Respond with TOOLS_NEEDED:${app} on the first line so the user can connect it.`;
             }
 
             // Self-orchestration tools (watch_set/get/clear, create_task) ” handled locally
@@ -946,7 +1048,8 @@ ${responseStyle}`;
 
         let finalText = '';
         let toolsExecuted = false;
-        const AGENT_MODEL_NAME = 'google/gemini-3.1-pro-preview';
+        let totalStreamedChars = 0; // skip the final-chunk emit if we already streamed something
+        const AGENT_MODEL_NAME = 'google/gemini-3-flash-preview';
         let totalPromptTokens = 0, totalCompletionTokens = 0;
 
         function trackCall(msg) {
@@ -1042,6 +1145,10 @@ ${responseStyle}`;
 	            // Track Composio tools discovered via search this turn ” used to validate MULTI_EXECUTE_TOOL calls.
 	            // The LLM cannot bypass discovery by guessing tool names from training.
 	            const discoveredComposioTools = new Set();
+	            // Composio's own human-written description per discovered tool slug.
+	            // Used to label tool_use events for the UI — Composio writes these for humans,
+	            // so we get readable labels for every tool without per-tool code.
+	            const toolDescriptions = new Map();
 	            // Hard runtime guardrails for Composio tools to prevent thrashing:
 	            // - Limit COMPOSIO_SEARCH_TOOLS calls per turn
 	            // - Prevent identical COMPOSIO_MULTI_EXECUTE_TOOL calls from re-hitting the backend
@@ -1053,17 +1160,35 @@ ${responseStyle}`;
 	            const githubRepoNames = new Set();
 
 	            for (let step = 0; step < 8 && !cancelled; step++) {
-                console.log(`[Chat] Step ${step + 1}: invoking LLM...`);
-                let msg;
+                console.log(`[Chat] Step ${step + 1}: streaming LLM...`);
+                const stepStart = Date.now();
+                let msg = null;
+                let firstTokenAt = null;
+                let stepStreamedChars = 0;
                 try {
-                    msg = await llmWithTools.invoke(phase3Messages);
+                    const stream = await llmWithTools.stream(phase3Messages);
+                    for await (const chunk of stream) {
+                        if (cancelled) break;
+                        if (firstTokenAt === null) firstTokenAt = Date.now();
+                        const chunkText = extractText(chunk);
+                        if (chunkText) {
+                            stepStreamedChars += chunkText.length;
+                            emit({ type: 'chunk', content: chunkText });
+                        }
+                        msg = msg ? msg.concat(chunk) : chunk;
+                    }
+                    totalStreamedChars += stepStreamedChars;
                 } catch (e) {
-                    console.error('[Chat] LLM invoke failed:', e.message, e.stack?.slice(0, 300));
+                    console.error('[Chat] LLM stream failed:', e.message, e.stack?.slice(0, 300));
                     Sentry.captureException(e, {
-                        tags: { agent_id: AGENT_ID, phase: 'llm_invoke', step: step + 1 },
+                        tags: { agent_id: AGENT_ID, phase: 'llm_stream', step: step + 1 },
                         user: { id: userId },
                         extra: { conversationId, model: AGENT_MODEL_NAME }
                     });
+                    break;
+                }
+                if (!msg) {
+                    console.warn(`[Chat] Step ${step + 1} produced no stream output`);
                     break;
                 }
 
@@ -1077,14 +1202,21 @@ ${responseStyle}`;
                     console.warn(`[Chat] Step ${step + 1} ” discarding hallucinated action text: "${text.slice(0, 80)}"`);
                 }
 
-                console.log(`[Chat] Step ${step + 1} ” "${text.slice(0, 100)}", tool_calls: ${toolCalls.length}`);
+                const stepMs = Date.now() - stepStart;
+                timings.llmSteps.push({ step: step + 1, ms: stepMs, tools: toolCalls.length });
+                console.log(`[Chat] Step ${step + 1} (${stepMs}ms) ” "${text.slice(0, 100)}", tool_calls: ${toolCalls.length}`);
                 phase3Messages.push(msg);
 
                 if (toolCalls.length === 0) { finalText = text; break; }
 
                 console.log(`[Chat] Executing:`, toolCalls.map(t => t.name).join(', '));
+                const toolBatchStart = Date.now();
 	                await Promise.all(toolCalls.map(async (tc) => {
-                    emit({ type: 'status', content: toolStatusLabel(tc.name) });
+                    const toolStart = Date.now();
+                    const label = describeToolCall(tc.name, tc.args, toolDescriptions);
+                    emit({ type: 'tool_use', toolCallId: tc.id, name: tc.name, label });
+                    let ok = true;
+                    let errorMessage = null;
                     try {
                         let result;
                         if (tc.name === 'get_current_time') {
@@ -1114,7 +1246,11 @@ ${responseStyle}`;
 	                                // per-call tool definitions small, and forces a single validated path.
 	                                for (const schema of newSchemas) {
 	                                    const tName = schema.function?.name || schema.name;
-	                                    if (tName) discoveredComposioTools.add(tName);
+	                                    if (tName) {
+	                                        discoveredComposioTools.add(tName);
+	                                        const desc = schema.function?.description || schema.description;
+	                                        if (desc) toolDescriptions.set(tName.toUpperCase(), desc);
+	                                    }
 	                                }
 	                                console.log(`[Chat] COMPOSIO_SEARCH_TOOLS found ${newSchemas.length} tools ” schemas returned to LLM, not bound`);
 	                                const planGuidance = searchRes.data.planGuidance || [];
@@ -1213,13 +1349,28 @@ ${responseStyle}`;
 	                        phase3Messages.push({ role: 'tool', tool_call_id: tc.id, content: shaped });
 	                        toolsExecuted = true;
                     } catch (e) {
+                        ok = false;
+                        errorMessage = e.message;
                         phase3Messages.push({ role: 'tool', tool_call_id: tc.id, content: `Tool failed: ${e.message}` });
                     }
+                    const toolMs = Date.now() - toolStart;
+                    timings.tools.push({ name: tc.name, ms: toolMs });
+                    emit({ type: 'tool_result', toolCallId: tc.id, ok, error: errorMessage, durationMs: toolMs });
+                    if (!ok) console.warn(`[Chat] Tool ${tc.name} FAILED in ${toolMs}ms: ${errorMessage}`);
                 }));
             }
 
         }
 
+        const totalChatMs = Date.now() - chatStart;
+        const llmTotal = timings.llmSteps.reduce((a, b) => a + b.ms, 0);
+        const toolTotal = timings.tools.reduce((a, b) => a + b.ms, 0);
+        console.log(
+            `[Timing] TURN TOTAL: ${totalChatMs}ms ` +
+            `(llm:${llmTotal}ms across ${timings.llmSteps.length} steps, ` +
+            `tools:${toolTotal}ms across ${timings.tools.length} calls, ` +
+            `overhead:${totalChatMs - llmTotal - toolTotal}ms)`
+        );
         console.log(`[Chat] After all phases ” finalText.length:${finalText.length}, toolsExecuted:${toolsExecuted}, cancelled:${cancelled}`);
 
         // Last-resort fallback ” tools loaded but LLM produced nothing at all.
@@ -1247,9 +1398,11 @@ ${responseStyle}`;
             .replace(/```tool_code[\s\S]*?```/g, '')
             .trim();
 
-        console.log(`[Chat] Sending done ” cancelled:${cancelled} finalText:"${cleanText.slice(0, 100)}" (${cleanText.length} chars)`);
+        console.log(`[Chat] Sending done ” cancelled:${cancelled} finalText:"${cleanText.slice(0, 100)}" (${cleanText.length} chars) streamed:${totalStreamedChars}`);
         console.log(`[Chat] Tokens: ${totalPromptTokens}in/${totalCompletionTokens}out`);
-        if (cleanText) emit({ type: 'chunk', content: cleanText });
+        // Only emit the full text as a chunk if we DIDN'T already stream it during the LLM loop
+        // (fallback path, or rare cases where the stream produced no content).
+        if (cleanText && totalStreamedChars === 0) emit({ type: 'chunk', content: cleanText });
         emit({
             type: 'done',
             response: cleanText,
