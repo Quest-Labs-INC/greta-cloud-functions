@@ -806,9 +806,18 @@ ${PROJECT_FLOW_PROMPT}
 ${responseStyle}`;
         }
 
+        // History from addons-be may include OpenAI-format tool_calls + role:'tool'
+        // entries from Tier 2 dedup (messageHistoryHelper.toLLMMessages). Don't strip —
+        // those fields are how the LLM sees past tool exchanges and avoids redundant
+        // re-fetching. Pass each entry through with only known LLM-relevant fields.
         const phase3Messages = [
             { role: 'system', content: systemPrompt },
-            ...history.map(m => ({ role: m.role, content: m.content })),
+            ...history.map(m => {
+                const out = { role: m.role, content: m.content ?? '' };
+                if (m.tool_calls) out.tool_calls = m.tool_calls;
+                if (m.tool_call_id) out.tool_call_id = m.tool_call_id;
+                return out;
+            }),
             { role: 'user', content: message }
         ];
 
@@ -948,6 +957,11 @@ ${responseStyle}`;
         let toolsExecuted = false;
         const AGENT_MODEL_NAME = 'google/gemini-3.1-pro-preview';
         let totalPromptTokens = 0, totalCompletionTokens = 0;
+        // Per-turn tool call ledger — function-scope so both onboarding and non-onboarding
+        // branches can push to it, and the `done` event below can always read it.
+        // Returned in `done` so addons-be can persist on the assistant message; powers
+        // (a) the frontend trace UI and (b) Tier 1 dedup annotation in subsequent turns.
+        const turnToolCalls = [];
 
         function trackCall(msg) {
             if (!msg) return;
@@ -1085,6 +1099,9 @@ ${responseStyle}`;
                 console.log(`[Chat] Executing:`, toolCalls.map(t => t.name).join(', '));
 	                await Promise.all(toolCalls.map(async (tc) => {
                     emit({ type: 'status', content: toolStatusLabel(tc.name) });
+                    // Trace event: tool dispatched. Frontend renders pending step.
+                    emit({ type: 'tool_use', toolCallId: tc.id, name: tc.name });
+                    let _toolOk = true, _toolErr;
                     try {
                         let result;
                         if (tc.name === 'get_current_time') {
@@ -1212,8 +1229,15 @@ ${responseStyle}`;
 	                        const shaped = shapeToolResult(result);
 	                        phase3Messages.push({ role: 'tool', tool_call_id: tc.id, content: shaped });
 	                        toolsExecuted = true;
+                        turnToolCalls.push({ id: tc.id, name: tc.name, arguments: tc.args || {}, result: shaped });
                     } catch (e) {
+                        _toolOk = false;
+                        _toolErr = e.message;
                         phase3Messages.push({ role: 'tool', tool_call_id: tc.id, content: `Tool failed: ${e.message}` });
+                        turnToolCalls.push({ id: tc.id, name: tc.name, arguments: tc.args || {}, result: `Tool failed: ${e.message}` });
+                    } finally {
+                        // Trace event: tool returned (success or failure). Step flips to ✓ or ✗.
+                        emit({ type: 'tool_result', toolCallId: tc.id, ok: _toolOk, ...(_toolErr ? { error: _toolErr } : {}) });
                     }
                 }));
             }
@@ -1255,6 +1279,13 @@ ${responseStyle}`;
             response: cleanText,
             conversationId,
             tokenUsage: { promptTokens: totalPromptTokens, completionTokens: totalCompletionTokens, model: AGENT_MODEL_NAME },
+            // Tool ledger for this turn — addons-be persists this on the assistant message.
+            // Ship full {id, name, arguments, result} so:
+            //   - Future turns can do accurate dedup (same tool+same args detection)
+            //   - DB has a full audit trail for debugging
+            //   - Future Tier 2 escalation (real tool messages in LLM context) needs no
+            //     extra container changes — data is already there.
+            toolCalls: turnToolCalls,
         });
         res.end();
 
