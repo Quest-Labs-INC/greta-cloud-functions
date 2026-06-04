@@ -63,6 +63,18 @@ router.post('/search-replace', async (req, res) => {
     // Count occurrences before replacing
     const occurrences = content.split(oldStr).length - 1;
 
+    // Guard: when NOT replacing all, require a unique match. Silently replacing
+    // the first of several occurrences edits an ambiguous spot and hides bugs.
+    // Mirrors Claude Code's edit tool: error and ask for more context. (0 matches
+    // is left to fall through to the existing "No matches found" response below.)
+    if (!replaceAll && occurrences > 1) {
+      return apiResponse(res, 400, {
+        error: `old_str matches ${occurrences} times in ${filePath}. Add more ` +
+               `surrounding context so it matches exactly once, or pass ` +
+               `replace_all: true to replace every occurrence. File was not modified.`
+      });
+    }
+
     if (replaceAll) {
       content = content.split(oldStr).join(newStr);
     } else {
@@ -75,6 +87,28 @@ router.post('/search-replace', async (req, res) => {
       return apiResponse(res, 200, response);
     }
 
+    // Guard: refuse edits that explode the file. A normal edit (rename, wrap, add
+    // a block) never multiplies a file several-fold; a runaway replace_all whose
+    // new_str re-contains old_str does — that's how a file once grew to 97k lines
+    // / 4.3MB. Trip only when BOTH the growth factor is large AND the result is
+    // big in absolute terms, so small files and ordinary edits are never blocked.
+    const GROWTH_FACTOR = 2;
+    const MIN_ABS_BYTES = 200_000;
+    if (
+      originalContent.length > 0 &&
+      content.length > originalContent.length * GROWTH_FACTOR &&
+      content.length > MIN_ABS_BYTES
+    ) {
+      return apiResponse(res, 400, {
+        error: `Refused: this replace would grow ${filePath} from ` +
+               `${(originalContent.length / 1024).toFixed(0)}KB to ` +
+               `${(content.length / 1024).toFixed(0)}KB ` +
+               `(${(content.length / originalContent.length).toFixed(1)}x). This usually ` +
+               `means new_str re-contains old_str and replace_all is duplicating the ` +
+               `content. The file was NOT modified — check old_str/new_str and retry.`
+      });
+    }
+
     await fs.writeFile(fullPath, content, 'utf8');
     console.log(`✅ Search-replace in: ${filePath} (${replaceAll ? occurrences : 1} replacements)`);
     scheduleSyncToGCS(filePath);  // Incremental sync
@@ -83,8 +117,10 @@ router.post('/search-replace', async (req, res) => {
       changed: true,
       path: filePath,
       replacements: replaceAll ? occurrences : 1,
-      total_occurrences: occurrences,
-      previousContent: originalContent  // Store original content for rollback
+      total_occurrences: occurrences
+      // previousContent intentionally omitted: it's never read (revert uses git /
+      // the edit's own args) and echoing the full pre-edit file into the tool
+      // result bloated the LLM payload (a runaway edit once made it 4.3MB).
     };
 
     if (status) response.status = getAppStatus();
@@ -303,12 +339,18 @@ router.post('/glob-files', async (req, res) => {
     const allFiles = await listFilesRecursive(searchDir, searchDir);
 
     // Robust glob matching (supports *, **, ?, [abc], {a,b,c})
+    // NOTE: `**/` is handled as a unit so the globstar matches ZERO-or-more
+    // directories. Without this, `backend/**/*.py` becomes `backend/.*/...`,
+    // whose mandatory slash means it can't match `backend/server.py` (no
+    // intermediate dir) — the agent then burns loops retrying patterns.
     const regexPattern = pattern
       .replace(/\\/g, '/')
       .replace(/\./g, '\\.')
       .replace(/\?/g, '[^/]')
-      .replace(/\*\*/g, '{{GLOBSTAR}}')
+      .replace(/\*\*\//g, '{{GLOBSTAR_SLASH}}')  // **/ → optional path prefix
+      .replace(/\*\*/g, '{{GLOBSTAR}}')          // bare ** → any chars
       .replace(/\*/g, '[^/]*')
+      .replace(/{{GLOBSTAR_SLASH}}/g, '(?:.*/)?')
       .replace(/{{GLOBSTAR}}/g, '.*')
       .replace(/\{([^}]+)\}/g, (_, group) => `(${group.split(',').join('|')})`);
 
