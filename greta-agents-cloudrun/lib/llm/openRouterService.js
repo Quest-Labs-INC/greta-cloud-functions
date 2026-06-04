@@ -2,7 +2,7 @@ const { ChatOpenAI } = require('@langchain/openai');
 const axios = require('axios');
 
 const OPEN_ROUTER_API_KEY = process.env.OPEN_ROUTER_API_KEY;
-const DEFAULT_AGENT_MODEL = 'google/gemini-3.1-pro-preview';
+const DEFAULT_AGENT_MODEL = 'google/gemini-3-flash-preview';
 const OPENROUTER_BASE_URL = 'https://openrouter.ai/api/v1';
 
 /**

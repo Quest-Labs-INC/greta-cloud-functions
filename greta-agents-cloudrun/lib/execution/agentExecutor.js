@@ -260,7 +260,7 @@ class AgentExecutor {
         // task_complete is always present — the agent MUST call it to end the task.
         let dynamicTools = [GET_CURRENT_TIME_TOOL, TASK_COMPLETE_TOOL, ...toolDefs, COMPOSIO_SEARCH_TOOL_DEF];
         let llmWithTools = dynamicTools.length > 0 ? llm.bindTools(dynamicTools) : llm;
-        const AGENT_MODEL_NAME = 'google/gemini-3.1-pro-preview';
+        const AGENT_MODEL_NAME = 'google/gemini-3-flash-preview';
         let totalPromptTokens = 0, totalCompletionTokens = 0;
         function trackCall(msg) {
             if (!msg) return;
