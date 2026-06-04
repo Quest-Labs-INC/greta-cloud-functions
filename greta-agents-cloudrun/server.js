@@ -619,6 +619,7 @@ app.post('/chat', async (req, res) => {
         const isOnboarding = agentConfig.onboardingStatus === 'in_progress';
         const mcpEnabled = agentConfig.mcpEnabled || false;
         const mcpServers = agentConfig.mcpServers || [];
+        const userFirstName = agentConfig.userFirstName || '';
 
         console.log(`[Chat] Agent: ${agentName}, Apps: ${JSON.stringify(composioApps)}, MCP: ${mcpEnabled}, Onboarding: ${isOnboarding}`);
 
@@ -629,6 +630,16 @@ app.post('/chat', async (req, res) => {
             selfConfigToolInstances = createSelfConfigTools({ agentId: AGENT_ID, userId, gatewayUrl: BACKEND_GATEWAY_URL, composioApps });
             toolDefs = selfConfigToolInstances;
             console.log(`[Chat] Onboarding mode ” loaded ${toolDefs.length} self-config tools`);
+        } else {
+            // Post-onboarding: expose only the safe re-configuration tools so the user can
+            // rename / re-purpose the agent mid-conversation. Skip complete_onboarding (done),
+            // skip request_integration (handled via TOOLS_NEEDED), skip check_integration_status
+            // (already in the built-in handler).
+            const allSelfConfig = createSelfConfigTools({ agentId: AGENT_ID, userId, gatewayUrl: BACKEND_GATEWAY_URL, composioApps });
+            const allowedNames = new Set(['update_my_name', 'update_my_purpose', 'update_my_instructions']);
+            selfConfigToolInstances = allSelfConfig.filter(t => allowedNames.has(t.name));
+            toolDefs = [...selfConfigToolInstances];
+            console.log(`[Chat] Loaded ${selfConfigToolInstances.length} self-reconfig tools (post-onboarding)`);
         }
 
         // Build base prompt sections used by both Phase 1 and Phase 3
@@ -705,7 +716,15 @@ When you can't do something, pivot to what you CAN do.
         if (isOnboarding) {
             systemPrompt = getOnboardingPrompt();
         } else {
-            const identityRule = `## Identity
+            const userContextRule = userFirstName
+                ? `## About your user
+
+The user's first name is **${userFirstName}**. You may address them by it warmly. **${userFirstName} is NOT your name** — never name yourself after the user, never confuse the two. Your name is "${agentName}".
+
+`
+                : '';
+
+            const identityRule = `${userContextRule}## Identity
 
 You are ${agentName}, an agent built on the Greta platform.
 
@@ -719,9 +738,8 @@ When asked about the underlying AI model, technology, or "are you GPT/Claude/Gem
 - Never name a specific model, training company, or framework.
 
 When the user asks to rename you or change your identity:
-- Be honest: this version doesn't support renaming. Don't fabricate a settings path.
-- Acknowledge the ask without rejecting it as a flaw: "I'm fixed as ${agentName} for now ” renaming isn't something I support yet. What can I help you with in the meantime?"
-- Never pretend it's possible.`;
+- This IS supported. Call the **update_my_name** tool with the new name they offer (e.g. "call yourself Pixie" → update_my_name({name: 'Pixie'})). After the tool succeeds, confirm with one short line ("Got it — calling myself Pixie from now on.") and continue. Do NOT redirect them to Settings.
+- If they want to change your purpose or behaviour instructions, you may use **update_my_purpose** / **update_my_instructions** the same way when the change is clear and the user has confirmed it.`;
 
             const toneRule = `## Tone — enthusiastic teammate
 
@@ -921,6 +939,14 @@ ${responseStyle}`;
             // LangChain format: tc.name / tc.args (already-parsed object)
             const name = tc.name;
             const args = tc.args || {};
+
+            // Self-reconfiguration tools (update_my_name / purpose / instructions). These are
+            // loaded post-onboarding so the user can rename or re-purpose the agent mid-chat.
+            const selfConfigTool = selfConfigToolInstances.find(t => t.name === name);
+            if (selfConfigTool) {
+                try { return String(await selfConfigTool.invoke(args)); }
+                catch (e) { return `Tool failed: ${e.message}`; }
+            }
 
             // check_integration_status — pure local check against the connected-apps list
             // passed in this chat's agentConfig. Lets the agent fact-check itself when the
