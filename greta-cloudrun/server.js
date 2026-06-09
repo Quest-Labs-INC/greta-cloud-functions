@@ -17,8 +17,13 @@
 
 import express from 'express';
 import cors from 'cors';
+import net from 'net';
 import fs from 'fs-extra';
 import path from 'path';
+import { exec } from 'child_process';
+import { promisify } from 'util';
+
+const execAsync = promisify(exec);
 
 /* ─────────────────────────────────────────────────────────────────────────────
  * IMPORTS - Core Configuration & State
@@ -26,6 +31,9 @@ import path from 'path';
 
 import {
   PORT,
+  VITE_PORT,
+  BACKEND_PORT,
+  MONGO_PORT,
   PROJECT_DIR,
   FRONTEND_DIR,
   BACKEND_DIR,
@@ -33,7 +41,7 @@ import {
   BACKEND_TEMPLATE_DIR,
   projectId,
   MONGO_BACKUP_INTERVAL,
-  IMAGE_VERSION
+  IMAGE_VERSION,
 } from './lib/core/config.js';
 
 import { state } from './lib/core/state.js';
@@ -73,31 +81,50 @@ app.use(cors());
  * HEALTH & KEEPALIVE ENDPOINTS
  * ═══════════════════════════════════════════════════════════════════════════════ */
 
+function checkPort(port) {
+  return new Promise(resolve => {
+    const socket = net.createConnection(port, '127.0.0.1');
+    socket.setTimeout(500);
+    socket.on('connect', () => { socket.destroy(); resolve(true); });
+    socket.on('error',   () => resolve(false));
+    socket.on('timeout', () => { socket.destroy(); resolve(false); });
+  });
+}
+
 /**
- * GET /health - Health check endpoint for Cloud Run.
+ * GET /health - Health check endpoint for Cloud Run / GKE.
  */
-app.get('/health', (req, res) => {
+app.get('/health', async (req, res) => {
+  const [viteRunning, backendRunning, mongoRunning] = await Promise.all([
+    checkPort(VITE_PORT),
+    checkPort(BACKEND_PORT),
+    checkPort(MONGO_PORT),
+  ]);
   res.json({
     status: 'healthy',
     projectId,
     imageVersion: IMAGE_VERSION,
-    viteRunning: !!state.viteProcess,
-    backendRunning: !!state.backendProcess,
-    mongoRunning: !!state.mongoProcess
+    viteRunning,
+    backendRunning,
+    mongoRunning,
   });
 });
 
 /**
  * POST /_greta/keepAlive - Called every 30s by frontend to keep container alive.
  */
-app.post('/_greta/keepAlive', (req, res) => {
+app.post('/_greta/keepAlive', async (req, res) => {
   state.lastKeepAlive = Date.now();
+  const [viteRunning, backendRunning] = await Promise.all([
+    checkPort(VITE_PORT),
+    checkPort(BACKEND_PORT),
+  ]);
   res.json({
     status: 'alive',
     timestamp: state.lastKeepAlive,
     projectId,
-    viteRunning: !!state.viteProcess,
-    backendRunning: !!state.backendProcess
+    viteRunning,
+    backendRunning,
   });
 });
 
@@ -151,10 +178,6 @@ async function copyFrontendTemplate(templateDir, targetDir) {
 async function initializeProject() {
   console.log(`🔧 Initializing project: ${projectId}`);
 
-  const { exec } = await import('child_process');
-  const { promisify } = await import('util');
-  const execAsync = promisify(exec);
-
   /* ─────────────────────────────────────────────────────────────────────────────
    * STEP 0: Load Shared Secrets from GCS
    * ───────────────────────────────────────────────────────────────────────────── */
@@ -198,13 +221,8 @@ async function initializeProject() {
     }
 
     if (!syncSuccess) {
-      // GCS sync failed - fall back to template to keep container running
-      console.warn('⚠️  GCS sync failed after retries - falling back to template');
-      console.warn('⚠️  User may see stale data until GCS sync succeeds');
-
-      // Copy template as fallback
-      await copyFrontendTemplate(FRONTEND_TEMPLATE_DIR, FRONTEND_DIR);
-      console.log('✅ Frontend template copied as fallback');
+      // Never fall back to template — user data must be restored.
+      throw new Error('GCS sync failed after 3 attempts — will retry');
     }
   } else {
     // NEW PROJECT: Use template
@@ -367,18 +385,17 @@ async function shutdown() {
     console.error('Failed to save files to GCS:', error.message);
   }
 
-  // Stop all processes
+  // Stop vite + backend via supervisord; MongoDB is spawn-managed and dies with this process
+  try {
+    await execAsync('supervisorctl stop vite backend');
+    console.log('✅ Supervised services stopped');
+  } catch (err) {
+    console.error('Failed to stop supervised services:', err.message);
+  }
+
   if (state.mongoProcess) {
     state.mongoProcess.kill();
     console.log('MongoDB stopped');
-  }
-  if (state.viteProcess) {
-    state.viteProcess.kill();
-    console.log('Vite stopped');
-  }
-  if (state.backendProcess) {
-    state.backendProcess.kill();
-    console.log('Backend stopped');
   }
 
   console.log('✅ Graceful shutdown complete');

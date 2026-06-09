@@ -18,7 +18,6 @@ import {
   scheduleSyncToGCS,
   isBinaryFile,
   getAppStatus,
-  getRecentLogs
 } from './helpers.js';
 import { restartVite } from '../../services/processes/vite.js';
 
@@ -42,12 +41,7 @@ const router = express.Router();
  */
 router.post('/bulk-write-files', async (req, res) => {
   try {
-    const {
-      files,
-      capture_logs_backend = false,
-      capture_logs_frontend = false,
-      status = false
-    } = req.body;
+    const { files, status = false } = req.body;
 
     if (!files || !Array.isArray(files)) {
       return apiResponse(res, 400, { error: 'files array required' });
@@ -92,14 +86,6 @@ router.post('/bulk-write-files', async (req, res) => {
       successCount,
       failedCount: files.length - successCount,
     };
-
-    if (capture_logs_backend) {
-      response.backendLogs = getRecentLogs('backend', 50);
-    }
-
-    if (capture_logs_frontend) {
-      response.frontendLogs = getRecentLogs('frontend', 50);
-    }
 
     if (status) {
       response.status = getAppStatus();

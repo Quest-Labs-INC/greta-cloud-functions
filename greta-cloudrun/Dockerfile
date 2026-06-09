@@ -10,6 +10,7 @@ RUN apt-get update && apt-get install -y \
     unzip \
     lz4 \
     util-linux \
+    supervisor \
     python3 \
     python3-pip \
     python3-venv \
@@ -82,13 +83,14 @@ WORKDIR /app
 
 # Copy server files
 COPY package.json ./
-RUN npm install
+RUN bun install
 
-# Install Playwright with Chromium only (smaller than all browsers)
-RUN npx playwright install chromium --with-deps
+# Install Playwright with Chromium only (system deps already installed above via apt-get)
+RUN npx playwright install chromium
 
 COPY server.js ./
 COPY lib/ ./lib/
+COPY supervisord.conf /etc/supervisor/conf.d/supervisord.conf
 
 # Environment variables
 ENV NODE_ENV=development
@@ -110,9 +112,9 @@ ENV DB_NAME=chat-testing
 EXPOSE 8080 5173 8000 27017
 
 # Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+HEALTHCHECK --interval=30s --timeout=10s --start-period=20s --retries=3 \
   CMD curl -f http://localhost:8080/health || exit 1
 
 # Start the server
-CMD ["node", "server.js"]
+CMD ["/usr/bin/supervisord", "-n", "-c", "/etc/supervisor/conf.d/supervisord.conf"]
 
