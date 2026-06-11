@@ -24,7 +24,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
  * Used for tracking deployed container versions
  */
 
-export const IMAGE_VERSION = 'v81';
+export const IMAGE_VERSION = 'v1';
 
 
 /* ─────────────────────────────────────────────────────────────────────────────
@@ -100,7 +100,7 @@ export const FRONTEND_NODE_MODULES = PATHS.frontendNodeModules;
 
 export const GCS = {
   /** GCS bucket for project files */
-  bucket: process.env.GCS_BUCKET || 'greta-projects',
+  bucket: process.env.GCS_BUCKET || 'greta-projects-prod-new',
 
   /** Current project identifier */
   projectId: process.env.PROJECT_ID || 'default',

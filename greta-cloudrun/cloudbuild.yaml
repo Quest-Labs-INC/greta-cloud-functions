@@ -26,11 +26,13 @@ steps:
 substitutions:
   _REGION: us-central1
   _REPOSITORY: greta-containers
-  _TAG: v81
+  _TAG: v1
 
 images:
   - '${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPOSITORY}/greta-preview:${_TAG}'
   - '${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPOSITORY}/greta-preview:latest'
+
+serviceAccount: 'projects/tensile-imprint-498906-n3/serviceAccounts/backend-server@tensile-imprint-498906-n3.iam.gserviceaccount.com'
 
 options:
   logging: CLOUD_LOGGING_ONLY
