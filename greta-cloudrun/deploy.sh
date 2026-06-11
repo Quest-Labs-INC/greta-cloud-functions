@@ -3,6 +3,11 @@
 
 set -e
 
+# Load .env from repo root if it exists
+if [ -f "$(dirname "$0")/../.env" ]; then
+  export $(grep -v '^#' "$(dirname "$0")/../.env" | xargs)
+fi
+
 # Configuration
 PROJECT_ID="${GCP_PROJECT_ID:-your-gcp-project}"
 REGION="${GCP_REGION:-us-central1}"
