@@ -21,3 +21,5 @@
 - `greta-cloudrun/main-template/` — generated template files, not hand-maintained code
 - `*.lock` files (bun.lock, package-lock.json)
 - Formatting-only changes
+
+
