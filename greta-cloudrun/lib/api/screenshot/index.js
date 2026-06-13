@@ -58,6 +58,21 @@ process.on('SIGTERM', async () => {
  * ───────────────────────────────────────────────────────────────────────────── */
 
 /**
+ * Navigate with one retry. Vite can stall requests for 10-30s while it
+ * re-optimizes deps after new imports land — a single retry after a short
+ * pause absorbs that window instead of failing the whole screenshot.
+ */
+async function gotoWithRetry(page, url, { timeout = 30000 } = {}) {
+  try {
+    return await page.goto(url, { waitUntil: 'load', timeout });
+  } catch (err) {
+    console.log(`⚠️ page.goto failed (${err.message.split('\n')[0]}), retrying once...`);
+    await page.waitForTimeout(3000);
+    return await page.goto(url, { waitUntil: 'load', timeout });
+  }
+}
+
+/**
  * Execute a single browser action.
  * @param {Page} page - Playwright page
  * @param {Object} action - Action to execute
@@ -69,7 +84,7 @@ async function executeAction(page, action) {
   try {
     switch (action.type) {
       case 'goto':
-        await page.goto(action.url, { waitUntil: 'load', timeout: 15000 });
+        await gotoWithRetry(page, action.url);
         return { success: true, type: 'goto', url: action.url };
 
       case 'fill':
@@ -145,6 +160,8 @@ async function executeAction(page, action) {
  * - height: Viewport height (default: 720)
  * - selector: CSS selector for specific element
  * - waitFor: Time to wait for rendering in ms (default: 2000)
+ * - quality: JPEG quality 0-100 (default: 40). Lower = smaller payload = fewer
+ *   image tokens for the LLM. 40 keeps UI/text legible for "is it broken" checks.
  * - actions: Array of actions to perform BEFORE screenshot (login, fill forms, navigate, etc.)
  *   Each action: { type: 'goto'|'fill'|'click'|'wait'|'type'|'select'|'press', selector?, value?, url?, ms? }
  */
@@ -156,6 +173,7 @@ router.post('/screenshot', async (req, res) => {
     height = 720,
     selector = null,
     waitFor = 2000,
+    quality = 40,
     actions = []
   } = req.body || {};
 
@@ -181,7 +199,7 @@ router.post('/screenshot', async (req, res) => {
 
   try {
     // 'load' not 'networkidle' — Vite HMR WebSocket prevents networkidle from ever firing
-    await page.goto(url, { waitUntil: 'load', timeout: 15000 });
+    await gotoWithRetry(page, url);
 
     if (hasActions) {
       console.log(`🎬 Executing ${actions.length} pre-screenshot actions...`);
@@ -211,9 +229,9 @@ router.post('/screenshot', async (req, res) => {
       if (!element) {
         return res.status(400).json({ error: `Selector "${selector}" not found on page` });
       }
-      screenshotBuffer = await element.screenshot({ type: 'png' });
+      screenshotBuffer = await element.screenshot({ type: 'jpeg', quality });
     } else {
-      screenshotBuffer = await page.screenshot({ type: 'png', fullPage });
+      screenshotBuffer = await page.screenshot({ type: 'jpeg', quality, fullPage });
     }
 
     if (consoleErrors.length > 0) {
@@ -231,7 +249,7 @@ router.post('/screenshot', async (req, res) => {
     const response = {
       success: true,
       image: screenshotBuffer.toString('base64'),
-      mimeType: 'image/png',
+      mimeType: 'image/jpeg',
       size: screenshotBuffer.length,
       dimensions: { width, height },
       url: finalUrl,
@@ -307,7 +325,7 @@ router.post('/browser-check', async (req, res) => {
     });
 
     try {
-      const navResponse = await page.goto(targetUrl, { waitUntil: 'load', timeout: 15000 });
+      const navResponse = await gotoWithRetry(page, targetUrl);
       const statusCode = navResponse?.status();
 
       const actionResults = [];

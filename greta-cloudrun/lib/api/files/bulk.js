@@ -19,8 +19,6 @@ import {
   isBinaryFile,
   getAppStatus,
 } from './helpers.js';
-import { restartVite } from '../../services/processes/vite.js';
-
 const router = express.Router();
 
 
@@ -75,9 +73,6 @@ router.post('/bulk-write-files', async (req, res) => {
     console.log(`✅ Bulk write: ${successCount}/${files.length} files written`);
 
     results.filter(r => r.success).forEach(r => scheduleSyncToGCS(r.path));
-
-    const hasFrontendFiles = files.some(f => f.path?.includes('frontend/src'));
-    if (hasFrontendFiles) restartVite().catch(() => {});
 
     // Build response
     const response = {
