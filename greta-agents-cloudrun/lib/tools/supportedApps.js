@@ -6,6 +6,7 @@ const SUPPORTED_APPS = [
     'GITHUB',
     'GOOGLESHEETS',
     'JIRA',
+    'CLICKUP',
     'CALENDLY',
     'DISCORD',
     'GOOGLEDOCS',
