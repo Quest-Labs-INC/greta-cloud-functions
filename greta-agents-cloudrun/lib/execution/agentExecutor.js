@@ -183,11 +183,20 @@ class AgentExecutor {
 
             // Pass appsToLoad so system prompt reflects the actual tools available this run
             const systemPrompt = this.buildSystemPrompt(agent, { projectMongoUrl, appsToLoad });
-            const { output, tokenUsage } = await this.runAgentLoop({ systemPrompt, userPrompt, toolDefs, localTools });
+            const { output, tokenUsage, composioCallCount } = await this.runAgentLoop({
+                systemPrompt,
+                userPrompt,
+                toolDefs,
+                localTools,
+                // GATE 1: pre-flight check inside the Composio dispatch — only the apps
+                // in this list can reach the Composio gateway. Trigger-level whitelist
+                // overrides the broader agent list (a task only needs what its prompt asks for).
+                connectedComposioApps: appsToLoad,
+            });
 
             const executionTime = Date.now() - startTime;
             console.log(`[AgentExecutor] ✅ Completed in ${executionTime}ms`);
-            return { output, executionTime, success: true, tokenUsage };
+            return { output, executionTime, success: true, tokenUsage, composioCallCount };
 
         } catch (error) {
             const executionTime = Date.now() - startTime;
@@ -254,7 +263,7 @@ class AgentExecutor {
         return toolDefs;
     }
 
-    async runAgentLoop({ systemPrompt, userPrompt, toolDefs, localTools = new Map() }) {
+    async runAgentLoop({ systemPrompt, userPrompt, toolDefs, localTools = new Map(), connectedComposioApps = [] }) {
         const llm = createOpenRouterLLM({ temperature: 0 });
         // Mutable: COMPOSIO_SEARCH_TOOLS injects discovered schemas at runtime and rebinds.
         // task_complete is always present — the agent MUST call it to end the task.
@@ -262,6 +271,16 @@ class AgentExecutor {
         let llmWithTools = dynamicTools.length > 0 ? llm.bindTools(dynamicTools) : llm;
         const AGENT_MODEL_NAME = 'google/gemini-3-flash-preview';
         let totalPromptTokens = 0, totalCompletionTokens = 0;
+        // Honesty + pre-flight trackers (parity with chat path).
+        // - composioExecuteAttempted: any Composio tool was called this run
+        // - composioExecuteSucceeded: at least one Composio call returned ok
+        // - failedComposioApps: apps the model tried whose execute path failed
+        //   (used in the truthful summary the HONESTY GUARDRAIL writes).
+        let composioExecuteAttempted = false;
+        let composioExecuteSucceeded = false;
+        let composioCallCount = 0;
+        const failedComposioApps = new Set();
+        const connectedAppsUpper = new Set((connectedComposioApps || []).map(a => String(a).toUpperCase()));
         function trackCall(msg) {
             if (!msg) return;
             const u = msg.usage_metadata || msg.response_metadata?.tokenUsage || msg.response_metadata?.usage;
@@ -334,13 +353,34 @@ class AgentExecutor {
                         : `Error: ${res.data.error}`;
                 } catch (e) { return `Tool failed: ${e.message}`; }
             }
+            // Catch-all path — direct Composio tool call. Every Composio tool name
+            // begins APPNAME_VERB_OBJECT, so the prefix tells us which app this needs.
+            // GATE 1: reject calls for apps the agent isn't connected to. Returns a
+            // structured error the model can convert into a truthful task_complete.
+            const appPrefix = String(name).split('_')[0].toUpperCase();
+            if (connectedAppsUpper.size > 0 && !connectedAppsUpper.has(appPrefix)) {
+                failedComposioApps.add(appPrefix);
+                console.warn(`[AgentExecutor] GATE 1 — rejected ${name}: ${appPrefix} not in connected apps`);
+                return JSON.stringify({
+                    success: false,
+                    rejected: true,
+                    reason: `${appPrefix} is not connected to this agent. You cannot execute ${name} or any other ${appPrefix}_* tool until the user connects ${appPrefix}.`,
+                    requiredAction: `Stop trying other tools for ${appPrefix}. Call task_complete with summary: "Cannot complete — ${appPrefix} is not connected for this agent."`,
+                });
+            }
+            composioExecuteAttempted = true;
+            composioCallCount += 1;
             try {
                 const res = await axios.post(
                     `${this.backendGatewayUrl}/api/greta/gateway/composio/execute`,
                     { agentId: this.agentId, userId: this.userId, action: name, params: args },
                     { headers: { 'x-gateway-signature': this.gatewaySignature } }
                 );
-                if (res.data.success) return JSON.stringify(res.data.data);
+                if (res.data.success) {
+                    composioExecuteSucceeded = true;
+                    return JSON.stringify(res.data.data);
+                }
+                failedComposioApps.add(appPrefix);
                 const failures = (toolFailureCount.get(name) || 0) + 1;
                 toolFailureCount.set(name, failures);
                 if (failures >= 2) {
@@ -348,6 +388,7 @@ class AgentExecutor {
                 }
                 return `Error: ${res.data.error}`;
             } catch (e) {
+                failedComposioApps.add(appPrefix);
                 const failures = (toolFailureCount.get(name) || 0) + 1;
                 toolFailureCount.set(name, failures);
                 if (failures >= 2) {
@@ -377,12 +418,12 @@ class AgentExecutor {
                     extra: { model: AGENT_MODEL_NAME, totalPromptTokens, totalCompletionTokens }
                 });
                 const tokenUsage = { promptTokens: totalPromptTokens, completionTokens: totalCompletionTokens, model: AGENT_MODEL_NAME };
-                return { output: `Task failed at step ${step + 1}: ${err.message || 'LLM error'}`, tokenUsage, failed: true };
+                return { output: `Task failed at step ${step + 1}: ${err.message || 'LLM error'}`, tokenUsage, composioCallCount, failed: true };
             }
             if (!msg || typeof msg !== 'object') {
                 console.error(`[AgentExecutor] LLM returned invalid response at step ${step + 1}`);
                 const tokenUsage = { promptTokens: totalPromptTokens, completionTokens: totalCompletionTokens, model: AGENT_MODEL_NAME };
-                return { output: `Task failed at step ${step + 1}: invalid LLM response`, tokenUsage, failed: true };
+                return { output: `Task failed at step ${step + 1}: invalid LLM response`, tokenUsage, composioCallCount, failed: true };
             }
             trackCall(msg);
             messages.push(msg);
@@ -395,11 +436,30 @@ class AgentExecutor {
             // we stop immediately and return its summary. No nudging, no guessing.
             const completionCall = toolCalls.find(tc => tc.name === 'task_complete');
             if (completionCall) {
-                const summary = completionCall.args?.summary || text || 'Task completed.';
+                let summary = completionCall.args?.summary || text || 'Task completed.';
                 const itemsProcessed = completionCall.args?.itemsProcessed;
+
+                // HONESTY GUARDRAIL — the worst failure mode for autonomous tasks is
+                // claiming success when nothing actually happened. No human is watching;
+                // the lie reaches credit deduction + the run-history UI as if the work
+                // succeeded. If the model attempted Composio work but nothing succeeded,
+                // and the summary contains success language, rewrite it truthfully.
+                if (composioExecuteAttempted && !composioExecuteSucceeded) {
+                    const SUCCESS_CLAIM_RE = /\b(scheduled|sent|posted|created|added|booked|invited|emailed|messaged|delivered|done|completed|set ?up|all set)\b/i;
+                    if (SUCCESS_CLAIM_RE.test(summary)) {
+                        const apps = [...failedComposioApps];
+                        const appList = apps.length ? apps.join(', ') : 'the required app';
+                        console.warn(`[AgentExecutor] ⚠ HONESTY GUARDRAIL — summary claimed success but no Composio execute succeeded. Apps tried: [${appList}]. Rewriting.`);
+                        const wasNotConnected = apps.length > 0 && apps.every(a => !connectedAppsUpper.has(a));
+                        summary = wasNotConnected
+                            ? `Task did not complete — ${appList} ${apps.length > 1 ? 'are' : 'is'} not connected to this agent. No action was performed.`
+                            : `Task did not complete — tool calls to ${appList} all failed. No action was performed. Details in the run logs.`;
+                    }
+                }
+
                 console.log(`[AgentExecutor] ✓ task_complete called — ${summary.substring(0, 100)}`);
                 const tokenUsage = { promptTokens: totalPromptTokens, completionTokens: totalCompletionTokens, model: AGENT_MODEL_NAME };
-                return { output: summary, itemsProcessed, tokenUsage };
+                return { output: summary, itemsProcessed, tokenUsage, composioCallCount };
             }
 
             if (toolCalls.length === 0) {
@@ -417,7 +477,7 @@ class AgentExecutor {
 
                 const tokenUsage = { promptTokens: totalPromptTokens, completionTokens: totalCompletionTokens, model: AGENT_MODEL_NAME };
                 console.log(`[AgentExecutor] Tokens: ${totalPromptTokens}in/${totalCompletionTokens}out`);
-                return { output: text || 'Task completed.', tokenUsage };
+                return { output: text || 'Task completed.', tokenUsage, composioCallCount };
             }
 
             console.log(`[AgentExecutor] Executing:`, toolCalls.map(t => t.name).join(', '));
@@ -446,7 +506,7 @@ class AgentExecutor {
 
         const tokenUsage = { promptTokens: totalPromptTokens, completionTokens: totalCompletionTokens, model: AGENT_MODEL_NAME };
         console.log(`[AgentExecutor] Tokens: ${totalPromptTokens}in/${totalCompletionTokens}out`);
-        return { output: 'Task completed.', tokenUsage };
+        return { output: 'Task completed.', tokenUsage, composioCallCount };
     }
 
     buildPrompt(trigger, payload, headers) {
@@ -509,60 +569,47 @@ class AgentExecutor {
     }
 
     buildSystemPrompt(agent, { projectMongoUrl = null, appsToLoad = null } = {}) {
-        // Timestamp removed — use get_current_time tool instead so system prompt stays stable for caching.
+        // Timestamp omitted — use get_current_time tool. Keeps the prompt stable
+        // for prefix caching across runs of the same trigger.
         const memorySection = agent.memory ? `\n\n## What you remember about this user\n${agent.memory}` : '';
         // Use appsToLoad (the actual tools loaded for this run) so the agent isn't told it has
         // apps it can't actually call. Falls back to the full agent list if not specified.
         const displayApps = (appsToLoad?.length > 0) ? appsToLoad : (agent.composioApps || []);
         const appsSection = displayApps.length > 0 ? `\n\n## Connected apps\n${displayApps.join(', ')}` : '';
         const projectSection = projectMongoUrl
-            ? `\n\n## Linked project database\nThis task is connected to a Greta v2 project database. You have the \`mongo_query\` tool to read data from it directly.\n- "the app", "signups", "users", "orders", "the database" → use \`mongo_query\`\n- For totals: operation="count". For breakdowns: operation="groupBy". For trends over time: operation="timeSeries". For lists: operation="find". For unique values: operation="distinct".\n- Always call \`mongo_query\` to get real numbers before writing any summary. Never invent or estimate data.`
+            ? `\n\n## Linked project database\nThis task is connected to a Greta v2 project's MongoDB. Use the \`mongo_query\` tool to read it.\n- "the app", "signups", "users", "orders", "the database" → \`mongo_query\`.\n- Totals → operation="count". Breakdowns → "groupBy". Trends → "timeSeries". Lists → "find". Unique values → "distinct".\n- Always query for real numbers before writing a summary. Never invent or estimate.`
             : '';
 
-        return `You are ${agent.name || 'Assistant'}.
+        return `You are ${agent.name || 'Assistant'}, running an autonomous task. No user is present — you must complete or fail without asking questions.
 
 ${agent.coreInstructions || 'You are a helpful assistant.'}
 ${memorySection}${appsSection}${projectSection}
 
-## Tool discovery
-Use COMPOSIO_SEARCH_TOOLS when you need a specific action. After finding tools, call them directly by name.
+## How you work — five invariants
 
-Composio tools follow the pattern \`APPNAME_VERB_OBJECT\` (e.g. \`SLACK_LIST_MEMBERS\`, \`GMAIL_FETCH_EMAILS\`). Use these verbs in your search queries: **list, fetch, send, search, get, create, update, delete**. Natural-language outcome phrases return 0 results.
+1. **Honesty over confidence.** Only claim work succeeded if its tool returned ok this run. "Done — sent the email" without a successful send is the worst failure mode in autonomous mode: no one is watching, the lie reaches credit deduction and run-history as if it were real. The runtime now rewrites false success summaries — don't lie, and you won't be overruled.
 
-Translate outcomes into capabilities:
-- "unread messages" → "list slack conversations" (returns unread_count per channel/DM)
-- "messages from Alice" → "search slack messages" (pass name in query, no user lookup needed)
-- "find slack user" → "list slack members"
-- "summary of emails" → "fetch gmail emails" or "list gmail messages"
+2. **Pre-flight every required app.** Before any Composio work, identify which apps your task needs. If any aren't in your **Connected apps** list above, call task_complete immediately with summary "Cannot complete — [App] is not connected for this agent." Don't search for tools, don't try anyway — the runtime rejects calls to disconnected apps.
 
-**Slack "unread" — no dedicated tool.** \`LIST_CONVERSATIONS\` returns \`unread_count\` per channel/DM. Filter for \`unread_count > 0\`, then fetch messages from those channels.
+3. **No questions, no narration.** There is no one to answer "please tell me…" / "could you share…". There is no one to wait for "let me check…" / "I am going to…". Call tools first; words come only in your final task_complete summary.
 
-**Aggregation cap:** For "summarize all emails", "check all unread", "process all records" — cap at 10 items (most recent). Include the sample count in your task_complete summary.
+4. **task_complete is the only way out.** Plain text without task_complete is treated as paused and the loop nudges you once. Call task_complete when work is done, when no more items remain, or when a hard blocker means you cannot proceed (auth failure, app not connected, API down). Include the failure reason in the summary so the run history is useful.
 
-## Self-orchestration tools always available
-- **watch_set(key, value, ttlHours?)** — persist state between runs. Use descriptive keys that include item IDs: "handled_email_abc123", "notified_pr_42". Always set ttlHours for time-bounded state (e.g. 72h for email threads).
-- **watch_get(key)** — retrieve previously stored state. Returns {exists: false, value: null} if key was never set or expired.
-- **watch_clear(key)** — delete a stored value when a workflow is fully complete (e.g. meeting booked, ticket resolved).
-- **create_task(instruction, delayMinutes, context?)** — schedule a ONE-TIME delayed follow-up (e.g. "check back in 24h if they replied to my meeting request email"). NEVER use this to re-schedule the current task — you are already running on a schedule managed externally.
+5. **Dedup and stop.** Use watch_get / watch_set with keys that include item IDs ("handled_email_abc123", "notified_pr_42") to track what you've already processed. After this run's items are handled, call task_complete — do NOT re-fetch "to check if more arrived." The next scheduled run handles new items.
 
-Use watch_set/watch_get to track which items you've already processed. Use create_task only for conditional one-time follow-ups (e.g. waiting for a reply), never to recreate the recurring schedule.
+## Tools
 
-## AUTONOMOUS TASK — CRITICAL RULES
-You are running as a background job. There is NO USER present. No one will see your questions or reply to them.
+- **get_current_time** — today's date / current time. Call first when you need to compute "since last run" or relative dates.
+- **COMPOSIO_SEARCH_TOOLS** — find tools by capability. Use Composio's verbs (list / fetch / send / search / get / create / update / delete), not your end-goal phrasing. One call with all queries in the array. Outcome phrases like "unread messages" return 0 results — translate to "list slack conversations" (returns unread_count per channel).
+- **After search, call the discovered tools directly by name** (APPNAME_VERB_OBJECT). The runtime routes them through Composio.
+- **watch_set(key, value, ttlHours?)** / **watch_get(key)** / **watch_clear(key)** — persistent state between runs. Always set ttlHours for time-bounded items (e.g. 72h for email threads).
+- **create_task(instruction, delayMinutes, context?)** — schedule ONE-TIME delayed follow-up ("check back in 24h if no reply"). Never use to recreate the recurring schedule — that's externally managed.${projectMongoUrl ? '\n- **mongo_query** — read the linked project database (see above).' : ''}
 
-1. NEVER ask a question. There is nobody to answer.
-2. NEVER say "please tell me" or "could you share". There is nobody listening.
-3. If you need data — use your tools to fetch it RIGHT NOW.
-4. ALWAYS complete the task with whatever data is available. If any tool returns zero results, note it briefly and continue with all remaining steps.
-5. Call tools immediately. NEVER narrate or describe what you are about to do — just call the tool. Never say "Now I will fetch...", "Next I'll...", "I am going to...", etc. Call first, narrate never.
-6. If multiple independent tools are needed (e.g., fetch emails AND fetch calendar events), call ALL of them — you can call them in parallel in the same step.
-7. Only write a final response AFTER all tools have been called and all results received.
-8. **Signal completion by calling the \`task_complete\` tool** — this is MANDATORY. Pass a brief summary (1-2 sentences). Plain text without calling task_complete will be treated as "paused" and the loop will ask you to continue. Once you're done, call task_complete — do not write a separate text summary.
-9. Zero results from a tool is a valid outcome — include it in your task_complete summary and stop. Never abort the whole task because one data source was empty.
-10. If a hard infrastructure error (auth failure, API down) makes it impossible to proceed, call task_complete with summary "Task could not complete: [reason]".
-11. If you have no tools connected and the task requires external integrations, call task_complete with summary "Task could not complete: no integrations connected for this agent."
-12. DEDUPLICATION — for tasks that process items across runs (emails, tickets, records): call watch_get("handled_{type}_{id}") BEFORE acting on each item. If it returns exists:true, skip that item. After successfully acting, immediately call watch_set("handled_{type}_{id}", true, ttlHours?) so future runs don't reprocess it. The [Run context] above tells you what's "new" since the last run — use it as your primary filter, then use watch_get as a safety net for items that fall near the boundary.
-13. STOP CONDITION — after processing the items you set out to handle in this run, call task_complete immediately. Do NOT re-fetch the same data source "to check if more arrived". The next scheduled run handles new items. Re-fetching wastes context and tokens.`;
+## Patterns worth knowing
+
+- **Batch fetches at 10 items max** for "summarize all" / "process all" tasks. Tell the user the sample size in your task_complete summary.
+- **Slack "unread"** — no dedicated tool. \`LIST_CONVERSATIONS\` returns unread_count per channel/DM; filter > 0, then fetch.
+- **Parallel calls in one step** when tools are independent (e.g. fetch emails AND fetch calendar events).`;
     }
 
     async loadAgentConfig() {

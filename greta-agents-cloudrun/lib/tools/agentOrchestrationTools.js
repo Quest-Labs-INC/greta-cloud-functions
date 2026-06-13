@@ -70,21 +70,17 @@ function createOrchestrationTools({ agentId, userId, backendGatewayUrl, getSigna
         type: 'function',
         function: {
             name: 'create_task',
-            description: 'Schedule a delayed follow-up execution of yourself. Use when you need to check something after a time delay — e.g. "check in 2 hours if this PR has been reviewed". The agent will be called again with the instruction and context you provide.',
+            description: 'Schedule a delayed follow-up run of this agent. Use when you need to wait then act (e.g. send email now, check reply in 1 hour, book meeting if confirmed). Instruction is the full prompt for the follow-up.',
             parameters: {
                 type: 'object',
                 properties: {
                     instruction: {
                         type: 'string',
-                        description: 'The exact instruction for what to do in the follow-up run. Be specific — include IDs, URLs, conditions to check, and actions to take.',
+                        description: 'Self-contained instruction for the follow-up run. Include IDs, recipient addresses, the wait condition, and what to do for each outcome.',
                     },
                     delayMinutes: {
-                        type: 'number',
-                        description: 'How many minutes from now to run the follow-up. Min 1, max 43200 (30 days).',
-                    },
-                    context: {
-                        type: 'object',
-                        description: 'Optional data to pass to the follow-up run (e.g. PR details, email ID). Available as payload in the follow-up execution.',
+                        type: 'integer',
+                        description: 'Minutes from now to run the follow-up. Min 1, max 43200.',
                     },
                 },
                 required: ['instruction', 'delayMinutes'],
@@ -133,14 +129,24 @@ function createOrchestrationTools({ agentId, userId, backendGatewayUrl, getSigna
             }
 
             case 'create_task': {
-                const { instruction, delayMinutes, context = {} } = args;
+                const { instruction, delayMinutes } = args;
+                // Accept either contextJson (Vertex-safe string, new schema) or
+                // context (object, legacy schema). Parse contextJson into an
+                // object before passing to the backend gateway.
+                let context = {};
+                if (args.contextJson) {
+                    try { context = JSON.parse(args.contextJson); }
+                    catch (e) { return `Error: contextJson is not valid JSON (${e.message}). Pass an empty string if no context, or escape inner quotes properly.`; }
+                } else if (args.context && typeof args.context === 'object') {
+                    context = args.context;
+                }
                 const res = await axios.post(
                     `${backendGatewayUrl}/api/greta/gateway/schedule-followup`,
                     { agentId, userId, instruction, delayMinutes, context },
                     { headers: headers() }
                 );
                 if (!res.data.success) return `Error: ${res.data.error}`;
-                return `Follow-up scheduled for ${new Date(res.data.runAt).toLocaleString()} (in ${delayMinutes} min)`;
+                return `Follow-up scheduled for ${new Date(res.data.runAt).toLocaleString()} (in ${delayMinutes} min). Tell the user clearly that you scheduled this — don't just say "I'll keep an eye out."`;
             }
 
             default:

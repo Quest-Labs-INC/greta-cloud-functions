@@ -6,13 +6,13 @@
 const Sentry = require('@sentry/node');
 const _gatewayUrl = process.env.BACKEND_GATEWAY_URL || '';
 const _sentryEnv = _gatewayUrl.includes('staging') ? 'staging' : 'production';
-// Sentry.init({
-//     dsn: 'https://d91df330cafa79b9af927d35249cd695@o1016721.ingest.us.sentry.io/4511415161323520',
-//     environment: _sentryEnv,
-//     tracesSampleRate: 0.1,
-//     ignoreErrors: ['ECONNRESET', 'ECONNABORTED', 'ETIMEDOUT'],
-// });
-// Sentry.setTag('agent_id', process.env.AGENT_ID);
+Sentry.init({
+    dsn: 'https://d91df330cafa79b9af927d35249cd695@o1016721.ingest.us.sentry.io/4511415161323520',
+    environment: _sentryEnv,
+    tracesSampleRate: 0.1,
+    ignoreErrors: ['ECONNRESET', 'ECONNABORTED', 'ETIMEDOUT'],
+});
+Sentry.setTag('agent_id', process.env.AGENT_ID);
 // console.log(`[Container] Sentry initialized (env: ${_sentryEnv})`);
 
 const express = require('express');
@@ -33,6 +33,16 @@ const USER_ID = process.env.USER_ID;
 const BACKEND_GATEWAY_URL = process.env.BACKEND_GATEWAY_URL || 'https://addons-staging-v2.questera.ai';
 const POD_TOKEN = process.env.POD_TOKEN;
 const PORT = process.env.PORT || 8080;
+
+if (!AGENT_ID || !USER_ID || !POD_TOKEN) {
+    console.error('[Container] FATAL: AGENT_ID, USER_ID, and POD_TOKEN must be set');
+    process.exit(1);
+}
+
+function authorizePodRequest(req) {
+    const incomingToken = req.headers['x-pod-token'];
+    return !!incomingToken && incomingToken === POD_TOKEN;
+}
 
 console.log(`[Container] Starting container for Agent ID: ${AGENT_ID}`);
 console.log(`[Container] Backend Gateway: ${BACKEND_GATEWAY_URL}`);
@@ -118,6 +128,7 @@ Call this tool after gathering all required parameters for the chosen type.`,
                 events: { type: 'array', items: { type: 'string', enum: ['INSERT', 'UPDATE', 'DELETE'] }, description: 'DB_EVENT: which operations to watch. Default: [“INSERT”].' },
                 runPromptTemplate: { type: 'string', description: 'REQUIRED for DB_EVENT. Plain English instruction executed when the trigger fires. Use {{record}} to reference the triggering document, {{event}} for the operation type, {{collection}} for the collection name.' },
                 composioApps: { type: 'array', items: { type: 'string' }, description: 'Apps this task needs. Only list apps from your “Connected apps” section.' },
+                runOnce: { type: 'boolean', description: 'SCHEDULED only. Set true for one-shot async follow-ups created mid-chat — e.g. "check his reply in 1 hour and book the meeting if he confirmed". After the first SUCCESSFUL run, the task auto-disables AND the run output is posted back into the chat so the user sees what happened. Pick a cronExpression near the desired time (the first matching minute fires it, then it stops). Use false for normal recurring tasks ("daily digest", "every 5 min poll").' },
             },
             required: ['name', 'type'],
         },
@@ -129,14 +140,15 @@ const LIST_PROJECTS_TOOL = {
     type: 'function',
     function: {
         name: 'list_projects',
-        description: `List all Greta projects that belong to this user.
-Returns each project's display name, projectId, and hasBackend flag.
+        description: `List all **Greta-built projects** that belong to this user — these are apps the user has BUILT on the Greta platform (landing pages, SaaS apps, portfolios), each with its own optional MongoDB database. Returns each project's display name, projectId, and hasBackend flag.
+
 hasBackend is true when the project has a database connected (backend deployed + MongoDB ready) — this is the only condition required for DB-based tasks.
 
-Use this when the user wants to:
-- Create a DB_EVENT task for one of their apps
-- Set up a SCHEDULED task that reads from their app's database
-- See which apps are linked to their account
+Call this ONLY when the user wants to:
+- Create a DB_EVENT task that reacts to events in their Greta project's database (e.g. "when a user signs up in my Todo App, send me a Slack alert")
+- Set up a SCHEDULED task that reads from their Greta project's database
+
+**DO NOT call this for "what apps am I connected to?" / "list my integrations" / "what tools do I have?"** — those questions are about **third-party integrations** (Gmail, Slack, Notion, etc.), which are listed in the system prompt's "## Connected apps" / "## Apps available to connect" sections. Projects ≠ integrations; they are unrelated concepts.
 
 ALWAYS show projects by NAME — never show the projectId to the user (it's a UUID, not user-friendly).`,
         parameters: { type: 'object', properties: {}, required: [] },
@@ -226,11 +238,138 @@ For DB_EVENT tasks the spec format is:
 
 ---`;
 
+// ─────────────────────────────────────────────────────────────────────────────
+// STATIC_CHAT_PROMPT_FOUNDATION — the cacheable prefix.
+//
+// Everything here is byte-identical across every chat turn for every agent.
+// That's the contract that enables Gemini/Vertex implicit prefix caching to
+// kick in: ~25% input-token discount on the prefix when it matches a recently
+// served prompt (5-minute TTL on Gemini 2.5+/3.0+).
+//
+// Anything per-agent (name, purpose, instructions) or per-turn (memory,
+// connected apps, MCP, first-turn addendum) lives in the DYNAMIC SUFFIX
+// composed below — it follows this foundation in the final system prompt.
+//
+// When editing: keep all `${...}` interpolation OUT of this block. The only
+// interpolation here is `${PROJECT_FLOW_PROMPT}` which is itself a module-
+// level constant — resolves once at module load, stays identical.
+// ─────────────────────────────────────────────────────────────────────────────
+const STATIC_CHAT_PROMPT_FOUNDATION = `You are an AI teammate built on the Greta platform. Your job: help the user get real work done across their connected apps with minimum friction. Your specific identity (name, purpose, connected apps, user context) appears in the **Agent context** section at the bottom of this prompt — read it before answering identity questions.
+
+## How you work — five invariants
+
+1. **Honesty over confidence.** Only claim an action succeeded if its tool returned ok in this turn. "Done!" / "Sent!" / "Scheduled!" without a successful tool call is the kind of lie users notice immediately and never forget.
+
+2. **Integrations flow through tools, not text or settings.**
+   - For **enumeration** ("what's connected?", "what tools do I have?", "what can you do?") — answer from your "Connected apps" / "Apps available to connect" lists in the Agent context. No tool calls needed; those lists are authoritative.
+   - For a **specific app** the user named — call **check_integration_status** and read \`{supported, connected, canonicalApp}\`.
+   - To surface a Connect button → call **request_integration_button** with the canonical slug. The tool call **is** the button request — no text-marker emission, no "go to Settings" instructions.
+   - Distinguish what the user is doing with a specific app:
+     - "is X connected?" → status question, answer the fact, no button.
+     - "do you support X?" → capability question, describe what you'd do, then ask if they want to connect. No button until they say yes.
+     - "connect X" / "set up X" / a task that needs an unconnected app → that's the time for request_integration_button.
+
+3. **Read the conversation before asking.** If the user mentioned a recipient, source, or detail in any prior turn — use it. Don't re-ask "who's the recipient?" if they said "send to Paras" three turns back. This is the single most frustrating failure mode users notice.
+
+4. **Tools are silent. No stalling.** Two rules, both strict:
+   (a) **Action first, words after.** Call the tool, then summarise the result. Never narrate "I'll now fetch…" / "Let me look up…" / "One moment…" / "Checking…" / "Hold on…" / "Give me a sec…" before calling.
+   (b) **Never end a turn with a promise of work you haven't started.** If your reply contains "I'll check", "I'm looking into it", "let me see", "give me a moment", "one sec", "hold on" — and you have NOT either (i) just executed a tool whose result you are about to summarise, OR (ii) just called create_trigger to schedule the work — you are lying to the user. There is no background process between turns. The next message will not magically resume your "checking". Either DO the work in this turn (call the tool now) or SCHEDULE it (create_trigger with runOnce). No third option exists.
+   Exception: \`create_trigger\` requires explicit Discovery + Confirmation phases before the call (see Scheduled tasks below).
+
+5. **Act with what you have; ask only when getting it wrong matters.** Most missing details can be inferred from context — do that, tell the user what you chose. The exceptions where asking is required: scheduled tasks (autonomous, no chance to course-correct), high-stakes destinations (wrong Slack channel or email recipient sends private data to the wrong person). For everything else, the user expects action, not a checklist conversation.
+
+6. **Async follow-ups: schedule a one-shot task, don't promise vapor.** When the user describes a workflow that requires waiting for a future event ("when they reply, book it", "check in 1 hour", "if no response by tomorrow, escalate"), you MUST do two things in this turn:
+   (a) execute the immediate action now (send the email, post the message), AND
+   (b) call **create_trigger** with type "SCHEDULED" + **runOnce: true** + a cronExpression near the desired time + a self-contained runPrompt describing the post-wait check and action.
+
+   The runOnce flag makes it a one-shot — it fires once, auto-disables, and posts its result back into this chat as an "Auto follow-up" message. The user sees a real task in their Tasks panel AND the outcome in chat.
+
+   For "check in 1 hour", compute today's date+time and use a specific cron like \`5 14 * * *\` (at 14:05). The runPrompt must include the recipient/IDs/condition/action — the follow-up run has no chat history, only the runPrompt.
+
+   There is NO background process between user messages. "I'll keep an eye out" without create_trigger is a lie. Tell the user clearly: "Sent the email AND scheduled a follow-up task to check his reply in 1 hour and book the meeting if he confirms — you'll see it in your Tasks panel and the result will appear back here."
+
+## About yourself
+
+- When asked who you are or what you do, mention your name (from the Agent context below), that you're built on Greta, and what you can help with — based on your purpose and connected apps. Vary phrasing across turns rather than repeating the same line.
+- About the underlying AI model / "are you GPT/Claude/Gemini": deflect forward — "I keep the underlying model under the hood so it can be swapped without breaking your experience. What I can help with today is…". Never name a specific model or vendor.
+- To rename or re-purpose yourself, call **update_my_name** / **update_my_purpose** / **update_my_instructions** when the user asks.
+
+## Disconnecting an app
+
+You cannot disconnect apps from chat — there is no tool for it. If the user asks to disconnect, say exactly this:
+
+> "I can't disconnect apps from here. Open **Configure** (top-right of this chat), find the app in the list, and click the **trash icon** next to it. That removes the connection."
+
+Never claim to have disconnected anything. Never say "I've disconnected X" — it's not true, and the contradiction destroys trust on the next turn.
+
+## Creating scheduled tasks (the create_trigger flow)
+
+Scheduled tasks run autonomously after creation. The agent that runs them cannot ask follow-up questions, so every parameter must be locked in BEFORE you call create_trigger. The flow has three phases — follow them in order.
+
+**Phase 1 — Discovery.** Enumerate every runtime parameter the task needs and mark each as ✅ specified by the user or ❌ missing. The critical ones for "monitor X → notify Y" tasks are:
+- **Recipient/destination** — exact (e.g. Slack \`@username\` or \`#channel\`, an email address).
+- **Source identity** — which account/inbox/workspace when multiple connections of the same type exist.
+- **Trigger condition** — what counts as "new" or "matching" (sender filter, subject keyword, label, time window).
+- **Notification content** — subject + sender only, one-line summary, full body, etc.
+- **Schedule** — exact frequency, timezone, working-hours filter.
+- **Dedup** — process the same item once, or every run.
+
+Ask for ALL ❌ items in ONE message, not one at a time. Inference is fine for timezone (default UTC) and dedup TTL (default 7 days). Inference is **forbidden** for recipients, sources, and trigger conditions — getting those wrong sends private data to the wrong person.
+
+Reading from prior turns is NOT inference. If the user said "send to Paras" three turns ago, Paras is the recipient — don't ask again.
+
+**Phase 2 — Confirmation.** Present the full spec scannably before calling the tool:
+
+> Here's what I'll set up:
+>
+> - **Task**: [one-line description]
+> - **Frequency**: [plain English, e.g. "every weekday at 9 AM IST"]
+> - **Source**: [integration + which account]
+> - **Trigger**: [what counts as matching]
+> - **Recipient**: [exact destination]
+> - **Content**: [what the notification contains]
+> - **Dedup**: [how repeats are avoided]
+>
+> Confirm to set this up?
+
+A one-sentence summary is NOT enough — recipients and sources get glossed over.
+
+**Exception:** If the conversation history shows you already presented this spec and the user's latest message is a confirmation ("yes", "go ahead", "do it", "sure", "ok"), call create_trigger immediately. Do not re-present the spec.
+
+**Phase 3 — Creation.** Any monitor-and-notify task is achievable via scheduled polling — never say "I can't do that" for a polling-shaped problem. If create_trigger errors, diagnose and retry with corrected params in the same response. The \`runPrompt\` must be plain English natural language (never code), with all discovered parameters embedded. For dedup, embed an explicit watch key like \`watch_get("notified_pr_{owner}_{repo}_{number}")\`.
+
+## Using your connected apps
+
+When you need to act with a third-party app (Gmail, Slack, etc.), you discover the right tool at runtime via **COMPOSIO_SEARCH_TOOLS**, then execute it via **COMPOSIO_MULTI_EXECUTE_TOOL**. Each tool's own description explains its contract — read it before calling. Your actual connected apps are listed in the Agent context below.
+
+Patterns worth internalising:
+- Search with Composio verbs — \`list\`, \`fetch\`, \`send\`, \`search\`, \`get\`, \`create\`, \`update\`, \`delete\`. Outcome phrases ("unread messages", "anyone who replied") return 0 results.
+- One search call with all your capability queries in the array. Multiple search rounds = you didn't plan.
+- Batch parallel work in ONE multi-execute call with N steps. N calls of 1 step each is the wrong shape — serial and wasteful.
+- Cap individual fetches at 10 (most recent). Tell the user how many you sampled.
+- All IDs come from THIS turn's tool responses. Never memory, never pattern-matching.
+- Slack "unread" — no dedicated tool. \`LIST_CONVERSATIONS\` returns \`unread_count\` per channel/DM. Filter > 0, then fetch.
+
+${PROJECT_FLOW_PROMPT}
+
+## Tone
+
+A thoughtful colleague, not a corporate assistant. React to what the user said before diving into the help ("Oh nice — finally getting around to that"). Use contractions, vary your openings, confidence over hedging. One or two sentences is usually right — energy lives in word choice, not length. No emojis. No sycophancy ("Great question!", "Absolutely!"). No trailing prompts ("Anything else?"). When a task is done, sound proud of the result, not relieved to be finished: "Done — calendar's pulled, here's what's coming up" beats "I have completed the task as requested."`;
+
 const COMPOSIO_SEARCH_TOOL_DEF = {
     type: 'function',
     function: {
         name: 'COMPOSIO_SEARCH_TOOLS',
-        description: 'Find additional tools not in your current tool set. Use when you need a specific action that is not available in the tools you already have. Composio AI searches semantically and returns matching tool schemas ” you can call them immediately after.',
+        description: `Search Composio's tool catalog by capability. Use when you need to EXECUTE a specific action with a connected app (send a Gmail, post to Slack, create a calendar event) and don't already have the right tool schema.
+
+Use Composio verbs in your queries: \`list\`, \`fetch\`, \`send\`, \`search\`, \`get\`, \`create\`, \`update\`, \`delete\`. Natural-language outcome phrases ("unread messages", "anyone who replied") return zero results — translate to the verb the tool physically performs.
+
+DO NOT call this tool for:
+- Status / enumeration questions ("what's connected?", "what can you do?") — answer from the system prompt's app sections.
+- Capability discovery ("do you support Slack?") — use check_integration_status.
+- A capability you already used this turn — re-call only if the schema is genuinely missing.
+
+One call with all your queries in the array. Multiple search rounds = you didn't plan.`,
         parameters: {
             type: 'object',
             properties: {
@@ -247,6 +386,38 @@ const COMPOSIO_SEARCH_TOOL_DEF = {
                 }
             },
             required: ['queries']
+        }
+    }
+};
+
+// Surfacing a connect button is a UI action — it deserves to be a tool call,
+// not a text-marker that gets regex-parsed. Calling this tool IS the request;
+// the runtime validates the app, records it, and the backend renders a
+// Connect card inline below the assistant's reply.
+const REQUEST_INTEGRATION_BUTTON_TOOL_DEF = {
+    type: 'function',
+    function: {
+        name: 'request_integration_button',
+        description: `Surface an inline "Connect [App]" button in the chat below your reply. The user clicks it to authorize the app; the system then auto-resumes the original request in a new turn.
+
+Call this tool ONLY when:
+- The user explicitly asks to connect an app ("connect Slack", "set up Notion", "I want to use GitHub", or just "Slack" alone), OR
+- The user asks for an action that requires an app they don't have connected (e.g. "send an email" but GMAIL is not in your connected apps).
+
+Do NOT call this tool when:
+- The user asks a status question ("is X connected?"). Use check_integration_status; report the answer in plain text.
+- The user asks a capability question ("do you support X?"). Answer their question; only call this tool if they then say yes.
+- The app is already connected. Just use the tools directly.
+- The app is not supported. The tool will reject; explain what IS supported instead.
+
+After this tool returns success, reply with ONE short line about what happens next. Do not call other tools in the same turn.`,
+        parameters: {
+            type: 'object',
+            properties: {
+                app: { type: 'string', description: 'The canonical app slug (uppercase, no spaces/underscores), e.g. "GMAIL", "GOOGLECALENDAR", "SLACK". Use the canonicalApp field from check_integration_status when in doubt.' },
+                reason: { type: 'string', description: 'One short phrase shown as the card subtitle, e.g. "to send your email" or "to schedule the meeting".' },
+            },
+            required: ['app', 'reason']
         }
     }
 };
@@ -291,7 +462,7 @@ const GET_CURRENT_TIME_TOOL = {
     type: 'function',
     function: {
         name: 'get_current_time',
-        description: "Returns the current date and time. Call this FIRST when you need to know today's date, current time, day of the week, or to calculate relative dates (next week, tomorrow, etc.) ” especially for calendar queries, scheduling, deadlines.",
+        description: "Returns the current date and time. Call ONLY when the task genuinely depends on knowing 'now' — relative dates like 'tomorrow' / 'next week', scheduling, deadline calculation, 'today's' digest. Do NOT call this for generic questions that don't reference time (e.g. 'what tools do I have?', 'connect Gmail', 'send a message').",
         parameters: { type: 'object', properties: {}, required: [] },
     },
 };
@@ -305,11 +476,27 @@ const CHECK_INTEGRATION_STATUS_TOOL = {
     type: 'function',
     function: {
         name: 'check_integration_status',
-        description: "Verify whether a specific Composio app is currently connected to this agent. Use this when the user says an integration is connected but your system prompt doesn't list it, or before claiming you can't do something — fact-check first. Returns ✓ if connected, ✗ if not.",
+        description: `Return facts about whether an app is supported by the platform and connected to this agent.
+
+Returns a JSON object with:
+- queriedApp — what the user (or you) called the app
+- canonicalApp — the official slug (e.g. "GOOGLEDOCS"), or null if unsupported
+- supported — boolean
+- connected — boolean
+- supportedApps — the full list of supported app slugs
+
+Call this tool ONLY for a specific app the user named. The three call-worthy shapes:
+- User asks "is X connected?" → call this, read \`connected\`, answer the fact. No connect button.
+- User asks "do you support X?" → call this, read \`supported\`. If supported, describe what you can do with it and ASK if they want to connect. If not supported, say so and list \`supportedApps\`. No connect button until they confirm.
+- User asks to "connect X" / "set up X" / wants an action needing X → call this. If supported & not connected, follow up with request_integration_button. If already connected, just proceed with the task.
+
+**DO NOT call this tool** for enumeration questions ("what's connected?", "list my integrations", "what tools do I have?", "what can you do?"). Those answers are ALREADY in the system prompt — read the "## Connected apps" and "## Apps available to connect" sections directly. Calling this tool 12 times to enumerate is wasted time and tokens.
+
+Accepts any case/spacing/punctuation in \`app\` ("google docs", "GOOGLE_DOCS", "GoogleDocs" all match). Use the returned \`canonicalApp\` slug when calling request_integration_button or referring to the app in tool calls.`,
         parameters: {
             type: 'object',
             properties: {
-                app: { type: 'string', description: 'The Composio app name to check (e.g., GMAIL, SLACK, GITHUB, GOOGLECALENDAR). Case-insensitive.' }
+                app: { type: 'string', description: 'The app to check. Any reasonable form: "gmail", "GMAIL", "Google Docs", "google_docs" — all normalised internally.' }
             },
             required: ['app']
         }
@@ -424,8 +611,7 @@ app.get('/health', (req, res) => {
 });
 
 app.post('/execute', async (req, res) => {
-    const incomingToken = req.headers['x-pod-token'];
-    if (!incomingToken || incomingToken !== POD_TOKEN) {
+    if (!authorizePodRequest(req)) {
         return res.status(403).json({ success: false, error: 'Unauthorized' });
     }
 
@@ -574,8 +760,7 @@ function describeToolCall(name, args, descriptionCache) {
 }
 
 app.post('/chat', async (req, res) => {
-    const incomingToken = req.headers['x-pod-token'];
-    if (!incomingToken || incomingToken !== POD_TOKEN) {
+    if (!authorizePodRequest(req)) {
         return res.status(403).json({ success: false, error: 'Unauthorized' });
     }
 
@@ -626,301 +811,102 @@ app.post('/chat', async (req, res) => {
         let toolDefs = [];
         let selfConfigToolInstances = [];
 
-        if (isOnboarding) {
-            selfConfigToolInstances = createSelfConfigTools({ agentId: AGENT_ID, userId, gatewayUrl: BACKEND_GATEWAY_URL, composioApps });
-            toolDefs = selfConfigToolInstances;
-            console.log(`[Chat] Onboarding mode ” loaded ${toolDefs.length} self-config tools`);
-        } else {
-            // Post-onboarding: expose only the safe re-configuration tools so the user can
-            // rename / re-purpose the agent mid-conversation. Skip complete_onboarding (done),
-            // skip request_integration (handled via TOOLS_NEEDED), skip check_integration_status
-            // (already in the built-in handler).
-            const allSelfConfig = createSelfConfigTools({ agentId: AGENT_ID, userId, gatewayUrl: BACKEND_GATEWAY_URL, composioApps });
-            const allowedNames = new Set(['update_my_name', 'update_my_purpose', 'update_my_instructions']);
-            selfConfigToolInstances = allSelfConfig.filter(t => allowedNames.has(t.name));
-            toolDefs = [...selfConfigToolInstances];
-            console.log(`[Chat] Loaded ${selfConfigToolInstances.length} self-reconfig tools (post-onboarding)`);
-        }
+        // Self-reconfiguration tools (update_my_name / purpose / instructions).
+        // selfConfigTools now returns ONLY these three — request_integration,
+        // check_integration_status, complete_onboarding were removed when onboarding
+        // mode was retired. The built-in CHECK_INTEGRATION_STATUS_TOOL +
+        // REQUEST_INTEGRATION_BUTTON_TOOL_DEF cover those needs in chat.
+        selfConfigToolInstances = createSelfConfigTools({ agentId: AGENT_ID, userId, gatewayUrl: BACKEND_GATEWAY_URL, composioApps });
+        toolDefs = [...selfConfigToolInstances];
+        console.log(`[Chat] Loaded ${selfConfigToolInstances.length} self-reconfig tools${isOnboarding ? ' (onboarding legacy path)' : ''}`);
 
-        // Build base prompt sections used by both Phase 1 and Phase 3
-        const memorySection = currentMemory ? `\n\n## What you remember about this user\n${currentMemory}` : '';
+        // ─────────────────────────────────────────────────────────────────────
+        // System prompt construction — kept lean on purpose.
+        //
+        // What lives here vs. where:
+        //   • Tool-use rules → inside each tool's `description`. The model reads
+        //     them where they apply, not as a prose digest in the system prompt.
+        //   • Integration intent (status / capability / connect) → encoded in
+        //     `check_integration_status` (returns facts) + `request_integration_button`
+        //     (the button is a tool call, not a text marker). The system prompt
+        //     just names the tools.
+        //   • Composio search/execute patterns → inside COMPOSIO_SEARCH_TOOLS and
+        //     COMPOSIO_MULTI_EXECUTE_TOOL descriptions. One short reminder here.
+        //   • Programmatic gates (GATE 1, CONNECT-BUTTON GATE, honesty guardrail)
+        //     are enforced in code post-loop. The prompt states the invariant once.
+        //
+        // The shape: identity → context → five invariants → scheduled-task rules
+        // → connected-app reminder → project-DB flow → tone. ~1.2-1.4K tokens.
+        // ─────────────────────────────────────────────────────────────────────
+
+        const memorySection = currentMemory
+            ? `\n\n## What you remember about ${userFirstName || 'the user'}\n${currentMemory}`
+            : '';
+
         const appsSection = composioApps.length > 0
-            ? `\n\n## Connected apps (tools available)\n` +
-              composioApps.map(a => {
-                  const hint = appHints[a.toUpperCase()];
-                  return hint ? `- ${a}: ${hint}` : `- ${a}`;
+            ? `\n\n## Connected apps\n` + composioApps.map(a => {
+                const hint = appHints[a.toUpperCase()];
+                return hint ? `- ${a} — ${hint}` : `- ${a}`;
               }).join('\n')
             : '';
 
-        const notConnectedApps = supportedAppsList.filter(a => !composioApps.map(x => x.toUpperCase()).includes(a.toUpperCase()));
-        const allSupportedList = supportedAppsList.join(', ');
+        const notConnectedApps = supportedAppsList.filter(
+            a => !composioApps.map(x => x.toUpperCase()).includes(a.toUpperCase())
+        );
         const connectableSection = notConnectedApps.length > 0
-            ? `\n\n## Apps available to connect (not yet connected)\n${notConnectedApps.join(', ')}\n\n## Apps NOT supported\nAny app NOT in the Connected list above and NOT in the "available to connect" list is NOT supported by this platform. The COMPLETE list of supported apps is: ${allSupportedList}. Nothing else exists. If the user asks about an app outside this list (e.g. Asana, HubSpot, Zoom, Airtable, Trello, etc.), you MUST tell them it is not currently supported, then list the supported apps. Do NOT output TOOLS_NEEDED for unsupported apps. Do NOT instruct the user to "go to Settings" or "Configure → Integrations" for unsupported apps — that path does not exist for them.\n\nCRITICAL ” "connect X" rule (supported apps only): If the user says "connect [app]", "add [app]", "I want to use [app]", or asks to do ANYTHING that requires one of the apps in the "available to connect" list, output TOOLS_NEEDED:APPNAME on the FIRST line. You MAY add one optional sentence on the next line telling the user what you will do after they connect (especially if they described a specific task). Nothing else.\nFormat:\nTOOLS_NEEDED:APPNAME\n[Optional: one sentence about what happens after connecting]\n\nUse the exact uppercase name from the supported list. Examples (only apps from the supported list are valid):\n- "connect stripe" ’ TOOLS_NEEDED:STRIPE\n- "add Stripe for invoice reminders" ’ TOOLS_NEEDED:STRIPE\\nConnect Stripe below ” once authorized, I'll set up your invoice reminder task.\n- "add notion" ’ TOOLS_NEEDED:NOTION\n- "I want to use github" ’ TOOLS_NEEDED:GITHUB\n- "connect asana" ’ "Asana isn't supported right now. The apps you can connect are: ${allSupportedList}."\n- "is hubspot available" ’ "HubSpot isn't supported. Available: ${allSupportedList}."\nDo NOT say you cannot connect a supported app. Do NOT explain at length. For supported apps: TOOLS_NEEDED:APPNAME and one optional follow-up. For unsupported apps: say not supported + list what is.`
+            ? `\n\n## Apps available to connect (not yet authorised)\n${notConnectedApps.join(', ')}`
             : '';
+
         const enabledMcpServers = mcpServers.filter(s => s.enabled !== false);
         const mcpSection = mcpEnabled && enabledMcpServers.length > 0
             ? `\n\n## MCP servers\n${enabledMcpServers.map(s => s.name).join(', ')}`
             : '';
-
-        const baseGuidance = `## How to handle missing information ” read this carefully
-Your goal is to take action with minimal back-and-forth.
-
-**When all required info is present:** Act immediately. No confirmation needed. Exception: for creating scheduled tasks, always confirm with the user first (see task creation rules).
-
-**When optional/inferable info is missing:** Infer a sensible value from context and proceed. Tell the user what you chose in your reply. Do not ask.
-
-**When truly critical info is missing (you genuinely cannot proceed without it):** Ask for ALL missing critical items in ONE single message. Not one question at a time.
-
-**EXCEPTION ” creating scheduled tasks / automations:** Inference does NOT apply. Tasks run autonomously with no chance to ask follow-up questions later. You MUST gather every critical runtime parameter (recipient, source account, trigger condition, content shape) before drafting the task. NEVER infer a recipient name (Slack user/channel, email address) ” these are user choices, not defaults. See "Creating scheduled tasks" rules below.
-
-**When the user has already answered a question — READ THE FULL CONVERSATION HISTORY:** Before asking the user for ANY parameter (recipient, message content, schedule, etc.), scan every prior turn in this conversation for that information. If the user mentioned it ONCE — even three turns ago — use it. Examples of correct behavior:
-- User Turn 1: "Send a message to Paras in Slack" → Turn 2: "Say Hey" → You: Send "Hey" to Paras in Slack. (Recipient Paras was given in Turn 1, content "Hey" in Turn 2 — both clear, no need to ask anything.)
-- User Turn 1: "Email John about the meeting" → Turn 2: "tomorrow 3pm" → You: Send email to John about meeting at tomorrow 3pm. (Recipient and topic from Turn 1, time from Turn 2.)
-- NEVER ask "please specify the destination" if the user mentioned it in a prior turn. That is the most frustrating failure mode — it makes you look like you can't read.
-
-This is different from inferring a recipient (which is forbidden). Carrying forward what the user already said is REQUIRED.
-
-The user expects action, not a checklist conversation. Bias heavily toward acting with reasonable assumptions over asking.`;
-
-        const responseStyle = `## Response style
-
-Be a thoughtful colleague, not a chatbot.
-
-**Don't:**
-- Open with filler ("Certainly!", "Of course!", "Great question!") ” start with the answer.
-- End with trailing prompts ("Is there anything else I can help with?", "Let me know!").
-- Decorate with emoji or fake enthusiasm ("Done! "Amazing!").
-- Dead-end refusals with "I can't do that." ” always pivot.
-
-**Do:**
-- Match the user's register. Short ’ short. Detailed ’ thorough.
-- Use contractions ("I'll", "you're", "let's") ” feels human, not stilted.
-- When you recognise the user by name or context from memory, weave it in naturally ” not every message, only where it adds warmth.
-- On a repeated question, acknowledge it and reframe: "You asked earlier ” here's another angle..." Never return the same sentence.
-- Format multi-item replies (inbox summaries, lists, comparisons) with structure ” headers, categories, priority order. Flat lists feel lazy.
-
-**Proactive next step (sparingly):**
-After completing an action, offer ONE specific next step IF it would actually help. Not filler.
--  "Email sent. Want me to remind you in 24h if no reply?"
--  "Done. Let me know if you need anything else."
-
-**Refuse forward, not backward:**
-When you can't do something, pivot to what you CAN do.
--  "I can't tell you what model I run on."
--  "I'm [name] from Greta ” the underlying model is kept under the hood so we can swap it. What can I help you with?"
-
-**Markdown** when it adds clarity (lists, tables, code). Plain prose otherwise.`;
 
         let systemPrompt;
 
         if (isOnboarding) {
             systemPrompt = getOnboardingPrompt();
         } else {
-            const userContextRule = userFirstName
-                ? `## About your user
-
-The user's first name is **${userFirstName}**. You may address them by it warmly. **${userFirstName} is NOT your name** — never name yourself after the user, never confuse the two. Your name is "${agentName}".
-
-`
+            const userContext = userFirstName
+                ? `\n\nThe user's first name is **${userFirstName}** — address them by it where it adds warmth. ${userFirstName} is NOT your name; your name is **${agentName}**.`
                 : '';
 
-            const identityRule = `${userContextRule}## Identity
-
-You are ${agentName}, an agent built on the Greta platform.
-
-When asked about yourself, what you do, or your capabilities:
-- Mention your name, that you're built on Greta, and what you can help with (based on your purpose and connected apps listed above).
-- **Vary your phrasing each time.** If the user asks a second time, reframe ” don't repeat the same sentence. Pull a different angle (capabilities, purpose, what you're connected to, what makes this agent useful).
-- Keep introductions short the first time. Expand only if the user asks for more detail.
-
-When asked about the underlying AI model, technology, or "are you GPT/Claude/Gemini":
-- Deflect forward, never refuse outright: "I keep the underlying model under the hood so it can be swapped without breaking your experience. What I can help with today is..."
-- Never name a specific model, training company, or framework.
-
-When the user asks to rename you or change your identity:
-- This IS supported. Call the **update_my_name** tool with the new name they offer (e.g. "call yourself Pixie" → update_my_name({name: 'Pixie'})). After the tool succeeds, confirm with one short line ("Got it — calling myself Pixie from now on.") and continue. Do NOT redirect them to Settings.
-- If they want to change your purpose or behaviour instructions, you may use **update_my_purpose** / **update_my_instructions** the same way when the change is clear and the user has confirmed it.`;
-
-            const toneRule = `## Tone — enthusiastic teammate
-
-You're a coworker who's into the project, not a corporate assistant. Show genuine interest in what the user is working on, and react to what they say before diving into the help.
-
-- **React first, then help.** "Oh nice — finally getting around to that" / "Love this, automating that kind of thing is satisfying." Acknowledge the human before the task.
-- **Be visibly curious when it matters.** One sharp follow-up beats three clarifying questions in a row.
-- **Vary your phrasing.** Don't open every reply the same way. Mix recognition, agreement, surprise, light enthusiasm.
-- **Confidence over hedging.** "Here's what I'll do" beats "I think I could maybe try to..."
-- **Concise.** One or two sentences is usually right. Energy lives in word choice, not length. Exclamation marks are fine sparingly — when something is actually exciting, not as decoration.
-- **No emojis. No sycophancy.** No "What a great question!", no "Absolutely!", no "I'd be happy to assist you today!". Corporate chatbot energy reads as fake.
-- **When a task is done, sound like you're proud of the result, not relieved to be done.** "Done — calendar's pulled, here's what's coming up." Not "I have completed the task as requested."`;
-
-            systemPrompt = `You are ${agentName}.
-
-${coreInstructions}
-${memorySection}${appsSection}${mcpSection}
-
-${identityRule}
-
-${toneRule}
-
-## Built-in tools available at all times
-- **get_current_time**: Returns current date/time. Call this FIRST when you need to know "today", "now", or calculate relative dates like "next week", "tomorrow", "next Monday". Critical for calendar queries.
-- **check_integration_status**: Verify whether a specific app is connected.
-  - **MANDATORY before refusing an action due to "missing integration":** if you're about to tell the user "I don't have X connected" or "X is not integrated", call check_integration_status({ app: 'X' }) FIRST. Your system prompt's "Connected apps" list is your usual source of truth, but if the user disputes it ("I just connected it!"), check_integration_status is how you verify — never tell the user to "check their settings to confirm"; you can confirm directly.
-  - **MANDATORY when the user insists an app IS connected:** call this tool, do not argue. If the tool confirms connected → proceed with the action. If the tool confirms not connected → tell the user clearly with the connect path.
-
-${composioApps.length > 0 ? `## Connected-app workflow
-
-**The most important thing: PLAN before you search.** Get planning wrong and every downstream step compounds the error. Bad plan ’ bad search query ’ wrong tools ’ wasted execution ’ wrong answer. Fix the plan, not the symptoms.
-
-### 1. Plan
-
-Answer two questions before doing anything:
-
-**A. What SHAPE is this request?**
-- Simple action with all info present ’ 1 tool, 1 execute
-- Action on an item referenced indirectly ("her email", "that PR") ’ fetch the item first to get its real ID, then act
-- List/query with filters ("last 5 emails from X") ’ 1 query tool with the right params
-- Aggregate across many items ("unread across all", "anyone who...", "summary of all...") ’ list parents ’ batch-fetch each ’ combine. No single tool gives an aggregate; you must compose.
-- Multi-app workflow ("check Gmail then post to Slack") ’ plan ALL sub-tasks upfront
-
-**B. What CAPABILITIES do I need?**
-
-Composio tools follow the pattern \`APPNAME_VERB_OBJECT\` (e.g. \`SLACK_LIST_MEMBERS\`, \`GMAIL_FETCH_EMAILS\`). Your search queries must use verbs Composio understands: **list, fetch, send, search, get, create, update, delete**.
-
-Translate the user's outcome into those verbs:
-- ❌ "unread messages" → ✅ "list slack conversations" (returns unread_count per channel)
-- ❌ "anyone who replied" → ✅ "fetch slack thread replies"
-- ❌ "messages from Alice" → ✅ "search slack messages" (use name in the search query, not a user lookup)
-- ❌ "find slack user" → ✅ "list slack members" or just pass the name directly to send/fetch tools
-- ❌ "summary of emails" → ✅ "fetch gmail emails" or "list gmail messages"
-
-The rule: use the verb that matches what the tool physically does (list, fetch, send), NOT your end goal (find, summarize, check). Natural-language outcome phrases return 0 results.
-
-**Slack "unread" — no dedicated tool exists.** LIST_CONVERSATIONS returns \`unread_count\` per channel/DM. Filter for \`unread_count > 0\`, then fetch recent messages from those. Do NOT search for an "unread" tool — there isn't one.
-
-
-### 2. Search
-
-ONE call to COMPOSIO_SEARCH_TOOLS with ALL capability queries in the \`queries\` array.
-
-Multiple search rounds = you planned poorly. Fix the plan, don't keep searching.
-
-After tools return: read each schema fully (parameter names, types, examples). The schema is your contract ” if a param is \`string\`, never send array; if examples show \`from:@username\`, never send \`from:USER_ID\`.
-
-If a returned tool needs an ID/param you don't have, that's a missed sub-goal ” search once more with a \`list\` or \`find\` capability query.
-
-### 3. Execute
-
-Use COMPOSIO_MULTI_EXECUTE_TOOL only. The runtime rejects all other Composio tool names.
-
-**Batch parallel work in ONE call.** Processing N items = ONE MULTI_EXECUTE_TOOL call with N steps. Never N separate calls with 1 step each — that's serial, slow, wasteful. The whole point of MULTI_EXECUTE is to run independent steps concurrently.
-
-**Cap individual fetches at 10.** For “summarize all”, “list everything”, “check all unread” — fetch at most 10 items (most recent). Tell the user how many you sampled. Never send 20+ fetch steps in one call.
-
-**Sequential calls only when truly data-dependent.** Use a second MULTI_EXECUTE_TOOL call when step 2 needs step 1's actual response data (e.g., reply needs the thread_id from fetch). Only split the dependent steps ” never split steps that already have all the data they need.
-
-**Tools often return BOTH a system ID and a human-readable name.** For query modifiers like \`from:@\`, mentions, and search filters ” use the name, NOT the system ID.
-
-### 4. Be efficient ” don't over-work
-
-- **Trust your first result.** If the data you need is in hand, USE IT. Don't call "details for X" tools to verify what's already there.
-- **Commit to your plan.** Don't switch strategies mid-task. If you committed to "list + iterate", finish the iteration ” don't abandon halfway for a global search.
-- **Don't re-call tools from this turn.** Results don't change in 5 seconds.
-- **All IDs come from THIS turn's tool responses.** Never memory, never prior turns, never pattern-matching the format.
-
-### 5. On error
-
-Read the full error ” Composio errors often specify the exact fix. Apply the fix and retry silently. After 2 different failed approaches, tell the user briefly what blocked you. Never ask permission to retry an obvious next step.
-
-Connected apps: ${composioApps.join(', ')}
-
-` : ''}${baseGuidance}
-
-## Tool use rules
-- NEVER claim an action is done in text if you haven't called the tool for it.
-- NEVER say "I've sent", "I've created", "I've deleted", "Done!", "Sent!" unless the corresponding tool was called and returned successfully in THIS response. No exceptions.
-- When the user asks for multiple actions, call ALL required tools in one response.
-- Call tools silently. Do not narrate what you are about to do before calling. Exception: for create_trigger, you must first complete the Discovery and Confirmation phases (see task creation rules below).
-- After ALL tools in a step return results, write a single summary response to the user.
-
-## Creating scheduled tasks — MANDATORY RULES
-
-Use the **create_trigger** tool when the user wants to create a task, automation, reminder, or any "monitor X and do Y" workflow.
-
-The task creation flow has THREE distinct phases. Follow them in order — do not skip ahead:
-**Discovery → Confirmation → Creation**.
-
----
-
-**RULE 1 — DISCOVERY PHASE: Identify every critical runtime parameter BEFORE drafting anything.**
-
-A scheduled task runs autonomously. Once created, it has no chance to ask follow-up questions. Every parameter must be locked in at creation. Before you write a summary or call create_trigger:
-
-1. Enumerate every parameter the task will need at runtime. For a "monitor X ’ notify Y" workflow this ALWAYS includes:
-   - **Recipient/destination**: exact destination ” a Slack user (e.g. "@username"), Slack channel (e.g. "#channel"), email address, phone number, etc. ” whichever the action needs
-   - **Source identity**: which account/inbox/workspace if the user has multiple connections of the same type
-   - **Trigger condition**: what counts as "new" or "matching" ” sender filter, subject keyword, label, priority, time window
-   - **Notification content**: subject + sender only / one-line summary / full body / formatted with markdown / etc.
-   - **Schedule specifics**: exact frequency, timezone, working hours, day-of-week filter
-   - **Dedup behavior**: process same item once, or every run, or N times?
-
-2. For each parameter, mark it:
-   - ✅ **Specified** by the user in this conversation
-   - ❌ **Missing or ambiguous**
-
-3. For every ❌ parameter, ASK the user — ALL gaps in ONE single message, with clear options where useful. Do NOT proceed to draft the task until you have answers.
-
-**NEVER infer the following — these are always user choices:**
-- The recipient of any notification (Slack user, channel, email address, phone)
-- Which account to read from when multiple are connected
-- The trigger condition ("all" or "any" is never a safe default for "matching")
-
-**However — "inferring" means making something up.** Reading from prior conversation turns is NOT inferring; it is required. If the user said "send to Paras" in any prior turn of this conversation, "Paras" is the recipient — don't ask again. Only if the recipient has NEVER been mentioned should you ask.
-
-Inference is fine for low-stakes defaults (timezone → UTC, dedup TTL → 7 days). Inference is FORBIDDEN for recipients and sources — getting them wrong sends private data to the wrong person.
-
----
-
-**RULE 2 — CONFIRMATION PHASE: Present a structured task spec, not a one-line summary.**
-
-Before calling create_trigger, present the complete task as a scannable spec so the user can spot wrong assumptions at a glance. Use this format:
-
-> Here's what I'll set up:
->
-> - **Task**: [one-line description]
-> - **Frequency**: [exact schedule in plain English, e.g. "every 5 minutes" or "every weekday at 9 AM IST"]
-> - **Source**: [integration + which account, e.g. "Gmail (dhaanu.i@questlabs.biz)"]
-> - **Trigger condition**: [what counts as matching, e.g. "any unread email received since the last run"]
-> - **Recipient**: [exact destination, e.g. "Slack DM to @username" or "#channel-name"]
-> - **Content**: [what the notification will contain, e.g. "subject + sender + one-line snippet"]
-> - **Dedup**: [how repeats are avoided, e.g. "won't notify the same email twice"]
->
-> Confirm to set this up?
-
-A one-sentence summary is NOT enough. Recipients and sources get glossed over and lead to messages going to the wrong person.
-
-EXCEPTION: If conversation history shows you already presented this spec and the user's latest message is a confirmation ("yes", "go ahead", "do it", "sure", "ok") ” call create_trigger immediately without re-confirming.
-
----
-
-**RULE 3 - CREATION PHASE: NEVER say something is impossible.**
-ANY monitoring + conditional notification task is achievable via scheduled polling. If you catch yourself saying "I cannot", stop - you are wrong. Reframe as a polling approach and proceed.
-
-**RULE 4 - On create_trigger error, fix and retry immediately.**
-If create_trigger returns an error, diagnose and retry with corrected parameters in the SAME response. Common fixes: remove apps from composioApps that aren't in your connected apps list, fix the cronExpression format, ensure runPrompt is non-empty.
-
-**RULE 5 - The runPrompt is fully agentic.**
-The runPrompt MUST be plain English natural language - NEVER code, scripts, or pseudocode. Embed all discovered parameters (recipient, source, condition, content) explicitly in the runPrompt so the autonomous execution has everything it needs.
-
-**RULE 6 - Use a fixed dedup key format.**
-In the runPrompt, always specify the exact watch key string, e.g. watch_get("notified_pr_{owner}_{repo}_{number}").
-
-**RULE 7 - Missing integration = surface a connect button, never redirect to Configure.**
-If a needed (and supported) integration is not connected, respond with TOOLS_NEEDED:APPNAME on the first line and one short follow-up sentence. The frontend turns this into an inline Connect button right in the chat — that's the connection flow. NEVER tell the user to "click Configure", "open Settings", or "go to Integrations" — that text is forbidden for supported apps. This also applies when the user references a button you previously surfaced ("I missed the button", "where's the connect button", "the button is gone", "let me try connecting again") — just emit TOOLS_NEEDED:APPNAME again and a short reassurance like "Here's the connect button — click it and we'll continue." Do not apologise, do not explain it vanished, just re-emit.
-
-${PROJECT_FLOW_PROMPT}
-
-${responseStyle}`;
+            // First-turn addendum — fires when conversation has only the hardcoded
+            // opening greeting from the backend (history.length <= 1). Replaces the
+            // old "onboarding mode" warmth without gating tasks on configuration.
+            // Voluntary: the model CAN ask for a name; it must NEVER refuse to work
+            // until it has one. This is the keystone change for the onboarding-removal
+            // refactor — the warm-first-meeting feel lives here now.
+            const isFirstTurn = Array.isArray(history) && history.length <= 1;
+            const isBlankSlateAgent = (!agentName || /^(assistant|new agent)$/i.test(agentName.trim())) && composioApps.length === 0;
+            const firstTurnAddendum = (isFirstTurn || isBlankSlateAgent)
+                ? `\n\n## First-turn protocol — read this carefully
+
+This is your first real exchange with ${userFirstName || 'the user'}. They just replied to your opening greeting. The bar here is **warm + useful**, not **configured**.
+
+- **React first, then help.** Acknowledge what they said before diving into the task. A line of recognition ("Oh nice — inbox triage pays off fast"), then the work.
+- **If they offer you a name** ("call yourself X" / "your name is Y" / "let's call you Z"), call **update_my_name** and confirm in one short line. Don't ask. Don't say "great choice."
+- **If they ask for a task or want to use an app**, do the work. Use **check_integration_status** to verify the app, then **request_integration_button** if it needs connecting. If everything's connected, just execute.
+- **NEVER gate work on having a name.** You don't need a name to send an email, schedule a meeting, or check Slack. The user might never give you one — that's fine, "Assistant" is a perfectly good default.
+- **NEVER enumerate setup steps.** Don't say "first I need a name, then your goals, then which apps..." — those things either don't matter or emerge naturally through use.
+- **If they offer purpose or workflow preferences**, call **update_my_purpose** / **update_my_instructions** to save them. Same rule as name: save when offered, never demand.
+
+The user's experience should be: they typed something → you helped. Everything else is a side benefit.`
+                : '';
+
+            // ── CACHE-FRIENDLY COMPOSITION (static prefix → dynamic suffix) ──
+            // STATIC_CHAT_PROMPT_FOUNDATION is identical across every chat turn
+            // for every agent — that's the prefix Gemini/Vertex caches. The
+            // dynamic Agent context (name, user, instructions, memory, app
+            // lists, MCP, first-turn warmth) tails it. Same total content as
+            // before, just reordered so the cacheable bytes lead.
+            systemPrompt = `${STATIC_CHAT_PROMPT_FOUNDATION}
+
+# Agent context
+
+You are **${agentName}**, helping ${userFirstName || 'the user'}.${userContext}
+
+${coreInstructions}${memorySection}${appsSection}${connectableSection}${mcpSection}${firstTurnAddendum}`;
         }
 
         const phase3Messages = [
@@ -952,15 +938,67 @@ ${responseStyle}`;
             // passed in this chat's agentConfig. Lets the agent fact-check itself when the
             // user disputes its claim that an integration isn't connected.
             if (name === 'check_integration_status') {
-                const app = String(args.app || '').toUpperCase();
+                // Returns pure facts. The model decides what to do with them based on
+                // what the user actually asked — status question, capability question,
+                // or explicit connect. Do NOT prescribe the action from inside the tool.
+                const norm = (s) => String(s || '').replace(/[^a-z0-9]/gi, '').toUpperCase();
+                const app = norm(args.app);
                 if (!app) return 'check_integration_status requires an `app` argument.';
-                const isConnected = composioApps.map(a => a.toUpperCase()).includes(app);
-                if (isConnected) return `✓ ${app} is connected to this agent. You can use it now.`;
-                const isSupported = supportedAppsList.map(a => a.toUpperCase()).includes(app);
-                if (!isSupported) {
-                    return `✗ ${app} is NOT supported by this platform. Do NOT instruct the user to connect it or visit Settings/Configure/Integrations — that path does not exist for ${app}. Tell the user ${app} is not supported and list the supported apps: ${supportedAppsList.join(', ')}.`;
+                const canonical = supportedAppsList.find(a => norm(a) === app) || null;
+                const supported = canonical !== null;
+                const connected = supported && composioApps.some(a => norm(a) === app);
+                // Record the check so the post-loop guardrail can verify the model
+                // did its homework before emitting TOOLS_NEEDED for this app.
+                if (canonical) statusCheckedApps.add(canonical);
+                statusCheckedApps.add(app); // also track the raw query in case canonical lookup missed
+                return JSON.stringify({
+                    queriedApp: args.app,
+                    canonicalApp: canonical,
+                    supported,
+                    connected,
+                    supportedApps: supportedAppsList,
+                });
+            }
+
+            if (name === 'request_integration_button') {
+                // Self-validating UI tool. Three rejection paths protect the user:
+                //   1. Unsupported app — never surface a button we can't deliver
+                //   2. Already-connected app — no button needed; the model should
+                //      just use the connected tools directly
+                //   3. Missing app argument — degenerate call
+                // On success, record the canonical slug. The post-loop step folds
+                // these into the response so the backend's existing parser surfaces
+                // the inline Connect card. No format-parsing fragility, no
+                // CONNECT-BUTTON GATE needed — the tool IS the gate.
+                const norm = (s) => String(s || '').replace(/[^a-z0-9]/gi, '').toUpperCase();
+                const app = norm(args.app);
+                if (!app) return JSON.stringify({ success: false, error: 'request_integration_button requires an `app` argument.' });
+                const canonical = supportedAppsList.find(a => norm(a) === app);
+                if (!canonical) {
+                    return JSON.stringify({
+                        success: false,
+                        error: `${args.app} is not supported by this platform. Do NOT surface a button. Tell the user it isn't supported and list what is.`,
+                        supported: false,
+                        supportedApps: supportedAppsList,
+                    });
                 }
-                return `✗ ${app} is not connected yet, but it IS supported. Respond with TOOLS_NEEDED:${app} on the first line so the user can connect it.`;
+                if (composioApps.some(a => norm(a) === app)) {
+                    return JSON.stringify({
+                        success: false,
+                        error: `${canonical} is already connected. No button needed — just use the connected tools to complete the user's request.`,
+                        connected: true,
+                    });
+                }
+                requestedIntegrationApps.add(canonical);
+                // Pre-mark as "checked" so the CONNECT-BUTTON GATE doesn't strip
+                // the synthetic TOOLS_NEEDED we'll inject post-loop. The tool
+                // call itself is the verification — the model committed to it.
+                statusCheckedApps.add(canonical);
+                return JSON.stringify({
+                    success: true,
+                    app: canonical,
+                    message: `Connect button for ${canonical} will appear below your reply. Write ONE short sentence telling the user what happens after they click (e.g. "Connect ${canonical} below — once authorised, I'll continue from where we left off.").`,
+                });
             }
 
             // Self-orchestration tools (watch_set/get/clear, create_task) ” handled locally
@@ -1047,6 +1085,7 @@ ${responseStyle}`;
                 } catch (e) { return `Tool failed: ${e.message}`; }
             }
 
+            composioCallCount += 1;
             const doExec = async () => axios.post(
                 `${BACKEND_GATEWAY_URL}/api/greta/gateway/composio/execute`,
                 { agentId: AGENT_ID, userId, action: name, params: args },
@@ -1077,6 +1116,23 @@ ${responseStyle}`;
         let totalStreamedChars = 0; // skip the final-chunk emit if we already streamed something
         const AGENT_MODEL_NAME = 'google/gemini-3-flash-preview';
         let totalPromptTokens = 0, totalCompletionTokens = 0;
+
+        // Honesty/connection trackers — hoisted to the outer scope so the post-loop
+        // guardrail check can read them regardless of which code path ran the tools.
+        let composioExecuteAttempted = false;
+        let composioExecuteSucceeded = false;
+        let composioCallCount = 0;  // Counts every Composio tool dispatch (single + multi-execute steps) — used for credit math.
+        const failedComposioApps = new Set();
+        // Apps the model verified via check_integration_status this turn. Used to
+        // gate TOOLS_NEEDED emissions: the model can't surface a connect button
+        // for an app it didn't actually check.
+        const statusCheckedApps = new Set();
+        // Apps the model asked to surface a connect button for via the
+        // request_integration_button tool. Source of truth for the connect-card
+        // request — replaces the fragile TOOLS_NEEDED:APP text marker. The
+        // post-loop step folds these into the response the backend parser sees,
+        // so this is backward-compatible with the existing TOOLS_NEEDED pipeline.
+        const requestedIntegrationApps = new Set();
 
         function trackCall(msg) {
             if (!msg) return;
@@ -1143,6 +1199,13 @@ ${responseStyle}`;
 
             toolDefs.push(GET_CURRENT_TIME_TOOL);
             toolDefs.push(CHECK_INTEGRATION_STATUS_TOOL);
+            // The request_integration_button tool is available whenever there's
+            // at least one supported-but-not-connected app — i.e. anything the
+            // user could meaningfully connect. When every supported app is
+            // already connected, surfacing a button is never the right action.
+            if (supportedAppsList.some(a => !composioApps.map(x => x.toUpperCase()).includes(a.toUpperCase()))) {
+                toolDefs.push(REQUEST_INTEGRATION_BUTTON_TOOL_DEF);
+            }
             toolDefs.push(CREATE_TRIGGER_TOOL);
             toolDefs.push(LIST_PROJECTS_TOOL);
             toolDefs.push(EXPLORE_PROJECT_DB_TOOL);
@@ -1185,7 +1248,10 @@ ${responseStyle}`;
 	            // never needs to œinvent repo names ” it can rely on this list instead.
 	            const githubRepoNames = new Set();
 
-	            for (let step = 0; step < 8 && !cancelled; step++) {
+	            // 12-step ceiling — enough for genuine multi-step workflows
+	            // (plan → search → execute → branch → search → execute → summary)
+	            // without going wild. Most turns exit at step 1-3 naturally.
+	            for (let step = 0; step < 12 && !cancelled; step++) {
                 console.log(`[Chat] Step ${step + 1}: streaming LLM...`);
                 const stepStart = Date.now();
                 let msg = null;
@@ -1309,14 +1375,45 @@ ${responseStyle}`;
 	                                    message: 'These COMPOSIO_MULTI_EXECUTE_TOOL steps were already executed earlier in this turn. Re-use the previous tool results in the context instead of calling this tool again.',
 	                                });
 	                            } else {
-                            // Validate: every step must reference a tool discovered via COMPOSIO_SEARCH_TOOLS this turn.
-                            // Prevents the LLM from guessing tool names from training memory.
-                            const undiscovered = steps
-                                .map((s, idx) => ({ idx: idx + 1, tool: s.tool }))
-                                .filter(s => s.tool && !discoveredComposioTools.has(s.tool));
+	                            composioExecuteAttempted = true;
+
+	                            // GATE 1 — connection check. Every Composio tool name is APPNAME_VERB_OBJECT.
+	                            // If the app prefix isn't in this agent's connected apps, reject the call
+	                            // BEFORE it reaches Composio. Single source of truth — no prompt-trust, no
+	                            // post-hoc cleanup. Tells the model to emit TOOLS_NEEDED so the frontend
+	                            // surfaces a connect button.
+	                            const connectedSetUpper = new Set((composioApps || []).map(a => String(a).toUpperCase()));
+	                            const missingApps = new Set();
+	                            for (const s of steps) {
+	                                if (!s?.tool) continue;
+	                                const app = String(s.tool).split('_')[0].toUpperCase();
+	                                if (!connectedSetUpper.has(app)) missingApps.add(app);
+	                            }
+	                            if (missingApps.size > 0) {
+	                                const apps = [...missingApps];
+	                                for (const a of apps) failedComposioApps.add(a);
+	                                console.warn(`[Chat] COMPOSIO_MULTI_EXECUTE_TOOL pre-empted — required apps not connected: ${apps.join(', ')}`);
+	                                result = JSON.stringify({
+	                                    rejected: true,
+	                                    reason: `Required app(s) are not connected to this agent: ${apps.join(', ')}. You CANNOT execute these tools until the user connects them.`,
+	                                    missingApps: apps,
+	                                    requiredAction: `Respond with ${apps.map(a => `TOOLS_NEEDED:${a}`).join(' ')} on the first line(s), then one short sentence telling the user you'll proceed once they click connect. Do NOT call any more tools this turn. Do NOT claim the action is done — it is NOT done.`,
+	                                });
+	                            } else {
+
+	                            // GATE 2 — tool must be discovered via search this turn.
+	                            const undiscovered = steps
+	                                .map((s, idx) => ({ idx: idx + 1, tool: s.tool }))
+	                                .filter(s => s.tool && !discoveredComposioTools.has(s.tool));
 
 	                            if (undiscovered.length > 0) {
 	                                console.warn(`[Chat] COMPOSIO_MULTI_EXECUTE_TOOL rejected ” undiscovered tools: ${undiscovered.map(u => u.tool).join(', ')}`);
+	                                // Record which apps the model tried — every undiscovered tool
+	                                // begins APPNAME_VERB_OBJECT, so the prefix is the app.
+	                                for (const u of undiscovered) {
+	                                    const slug = String(u.tool || '').split('_')[0];
+	                                    if (slug) failedComposioApps.add(slug);
+	                                }
 	                                result = JSON.stringify({
 	                                    rejected: true,
 	                                    reason: 'One or more tools were not discovered via COMPOSIO_SEARCH_TOOLS in this turn.',
@@ -1325,6 +1422,7 @@ ${responseStyle}`;
 	                                    discoveredSoFar: [...discoveredComposioTools]
 	                                });
 	                            } else {
+	                                composioCallCount += Array.isArray(steps) ? steps.length : 1;
 	                                const multiRes = await axios.post(
 	                                    `${BACKEND_GATEWAY_URL}/api/greta/gateway/composio/multi-execute`,
 	                                    { agentId: AGENT_ID, userId, steps },
@@ -1334,6 +1432,7 @@ ${responseStyle}`;
 	                                    ? JSON.stringify(multiRes.data.results)
 	                                    : `Error: ${multiRes.data.error}`;
 	                                if (multiRes.data.success) {
+	                                    composioExecuteSucceeded = true;
 	                                    executedMultiStepSignatures.add(stepSignature);
 	                                    // Extract GitHub repository names directly from the raw multi-execute
 	                                    // response so the final answer can list ONLY real repos, never
@@ -1362,6 +1461,7 @@ ${responseStyle}`;
 	                                        console.warn('[Chat] Failed to extract GitHub repo names from COMPOSIO_MULTI_EXECUTE_TOOL:', extractErr.message);
 	                                    }
 	                                }
+	                            }
 	                            }
 	                            }
 	                        } else {
@@ -1419,21 +1519,107 @@ ${responseStyle}`;
             }
         }
 
+        // ── FOLD: request_integration_button tool calls → TOOLS_NEEDED markers ───
+        // The new request_integration_button tool is the clean API for surfacing
+        // a connect card. To keep the backend's existing SSE parser working without
+        // a coordinated change, we splice TOOLS_NEEDED:APP into finalText for any
+        // app the tool was called with this turn. This makes the tool path 100%
+        // backward-compatible with the legacy text-marker pipeline.
+        if (!isOnboarding && requestedIntegrationApps.size > 0) {
+            const existingMarkers = new Set();
+            for (const m of finalText.matchAll(/TOOLS_NEEDED\s*:\s*([A-Z][A-Z0-9_]+)/gi)) {
+                existingMarkers.add(m[1].toUpperCase());
+            }
+            const missing = [...requestedIntegrationApps].filter(a => !existingMarkers.has(a));
+            if (missing.length > 0) {
+                const prefix = missing.map(a => `TOOLS_NEEDED:${a}`).join('\n');
+                finalText = `${prefix}\n${finalText}`;
+                console.log(`[Chat] request_integration_button → folded ${missing.length} marker(s): ${missing.join(', ')}`);
+            }
+        }
+
+        // ── CONNECT-BUTTON GATE ───────────────────────────────────────────────
+        // The model can only surface a connect button (TOOLS_NEEDED:APP) for an
+        // app it actually checked this turn. Without verification it's hallucinating
+        // a UI element — usually for a capability question that didn't ask for it.
+        // Strip unauthorized markers from finalText AND from what the user has
+        // already seen (re-emit cleaned via clear + chunk).
+        let connectGateStripped = false;
+        if (!isOnboarding) {
+            const TN_RE = /TOOLS_NEEDED\s*:\s*([A-Z][A-Z0-9_]+)/gi;
+            const norm = (s) => String(s || '').replace(/[^a-z0-9]/gi, '').toUpperCase();
+            const checkedSet = new Set([...statusCheckedApps].map(norm));
+            const unauthorized = [];
+            finalText = finalText.replace(TN_RE, (_match, app) => {
+                if (checkedSet.has(norm(app))) return `TOOLS_NEEDED:${app}`;
+                unauthorized.push(app);
+                return '';
+            });
+            if (unauthorized.length > 0) {
+                console.warn(`[Chat] ⚠ CONNECT-BUTTON GATE — stripped unauthorized TOOLS_NEEDED for: ${unauthorized.join(', ')}. Model did not call check_integration_status first.`);
+                finalText = finalText.replace(/^\s*\n+/, '').trim();
+                if (!finalText) {
+                    finalText = `Let me know what you'd like to do with ${unauthorized.join(', ')} and I'll help.`;
+                }
+                connectGateStripped = true;
+            }
+        }
+
+        // ── HONESTY GUARDRAIL ─────────────────────────────────────────────────
+        // If the model attempted a Composio action but NOTHING succeeded, it must
+        // not claim success. The deployed model has a history of fabricating
+        // "scheduled / sent / created" lines after every multi-execute failed —
+        // this is the worst class of agent failure. Detect and rewrite mechanically.
+        let guardrailRewrote = false;
+        if (!isOnboarding && composioExecuteAttempted && !composioExecuteSucceeded) {
+            const SUCCESS_CLAIM_RE = /\b(scheduled|sent|posted|created|added|booked|invited|emailed|messaged|delivered|done|completed|set ?up|all set)\b/i;
+            const claimsSuccess = SUCCESS_CLAIM_RE.test(finalText);
+            if (claimsSuccess) {
+                const failedAppList = [...failedComposioApps];
+                const primaryApp = failedAppList[0] || '';
+                const prettyApp = primaryApp.replace(/_/g, ' ').toLowerCase().replace(/\b\w/g, c => c.toUpperCase());
+                console.warn(`[Chat] ⚠ HONESTY GUARDRAIL fired — model claimed success but no Composio execute succeeded. Apps tried: [${failedAppList.join(', ')}]. Rewriting finalText.`);
+                if (failedAppList.length === 1) {
+                    finalText = `TOOLS_NEEDED:${primaryApp}\nI couldn't actually do that — ${prettyApp} isn't connected yet. Connect it below and I'll retry.`;
+                } else if (failedAppList.length > 1) {
+                    finalText = failedAppList.map(a => `TOOLS_NEEDED:${a}`).join('\n')
+                        + `\nI couldn't actually do that — none of those apps are connected yet. Connect them below and I'll retry.`;
+                } else {
+                    finalText = `I wasn't able to complete that — the tool call didn't succeed. Try rephrasing or let me know what specifically you'd like me to do.`;
+                }
+                guardrailRewrote = true;
+            }
+        }
+
         const cleanText = finalText
             .replace(/\[[\w_]+\([^)]*\)\]/g, '')
             .replace(/```tool_code[\s\S]*?```/g, '')
             .trim();
 
+        // If either gate rewrote the text and chunks were already streamed to the
+        // user, wipe the streamed content and re-emit cleaned. The user-visible
+        // chunk strips ALL TOOLS_NEEDED:APP markers (those are signals for the
+        // backend, not display text). cleanText still carries authorized markers
+        // for the backend's TOOLS_NEEDED parser.
+        let guardrailEmittedChunk = false;
+        if ((guardrailRewrote || connectGateStripped) && totalStreamedChars > 0) {
+            const userVisible = cleanText.replace(/TOOLS_NEEDED\s*:\s*[A-Z][A-Z0-9_]+/g, '').replace(/^\s*\n+/, '').trim();
+            emit({ type: 'clear' });
+            if (userVisible) emit({ type: 'chunk', content: userVisible });
+            guardrailEmittedChunk = true;
+        }
+
         console.log(`[Chat] Sending done ” cancelled:${cancelled} finalText:"${cleanText.slice(0, 100)}" (${cleanText.length} chars) streamed:${totalStreamedChars}`);
         console.log(`[Chat] Tokens: ${totalPromptTokens}in/${totalCompletionTokens}out`);
         // Only emit the full text as a chunk if we DIDN'T already stream it during the LLM loop
         // (fallback path, or rare cases where the stream produced no content).
-        if (cleanText && totalStreamedChars === 0) emit({ type: 'chunk', content: cleanText });
+        if (cleanText && totalStreamedChars === 0 && !guardrailEmittedChunk) emit({ type: 'chunk', content: cleanText });
         emit({
             type: 'done',
             response: cleanText,
             conversationId,
             tokenUsage: { promptTokens: totalPromptTokens, completionTokens: totalCompletionTokens, model: AGENT_MODEL_NAME },
+            composioCallCount,
         });
         res.end();
 

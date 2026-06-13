@@ -1,8 +1,10 @@
 const { ChatOpenAI } = require('@langchain/openai');
 const axios = require('axios');
 
+// 🚨 Read from env only. Never hardcode. The previous hardcoded value was
+// committed to source and must be treated as compromised — revoke + rotate.
 const OPEN_ROUTER_API_KEY = process.env.OPEN_ROUTER_API_KEY;
-const DEFAULT_AGENT_MODEL = 'google/gemini-3-flash-preview';
+const DEFAULT_AGENT_MODEL = process.env.AGENT_MODEL || 'google/gemini-3-flash-preview';
 const OPENROUTER_BASE_URL = 'https://openrouter.ai/api/v1';
 
 /**
@@ -21,7 +23,7 @@ function createOpenRouterLLM({ model, temperature } = {}) {
         configuration: {
             baseURL: OPENROUTER_BASE_URL,
             defaultHeaders: {
-                'HTTP-Referer': 'https://questera.ai',
+                'HTTP-Referer': 'https://www.greta.sh/',
                 'X-Title': 'Greta-AI-Agents',
             }
         }
