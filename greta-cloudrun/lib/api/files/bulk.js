@@ -19,6 +19,8 @@ import {
   isBinaryFile,
   getAppStatus,
 } from './helpers.js';
+import { MAX_VIEW_FILE_LINES, MAX_OUTPUT_CHARS } from '../../core/config.js';
+
 const router = express.Router();
 
 
@@ -131,21 +133,55 @@ router.post('/bulk-read-files', async (req, res) => {
           return { path: filePath, success: false, error: 'File not found' };
         }
 
-        const content = await fs.readFile(fullPath, 'utf8');
-        return { path: filePath, success: true, content };
+        const raw = await fs.readFile(fullPath, 'utf8');
+        const lines = raw.split('\n');
+        const totalLines = lines.length;
+        // Per-file line cap so one large file can't dominate the bulk payload.
+        let content = totalLines > MAX_VIEW_FILE_LINES
+          ? lines.slice(0, MAX_VIEW_FILE_LINES).join('\n')
+          : raw;
+        const truncated = totalLines > MAX_VIEW_FILE_LINES;
+        return {
+          path: filePath,
+          success: true,
+          content,
+          total_lines: totalLines,
+          ...(truncated ? {
+            truncated: true,
+            note: `Showing lines 1-${MAX_VIEW_FILE_LINES} of ${totalLines}. Use read-file with view_range to read more.`
+          } : {})
+        };
       } catch (err) {
         return { path: filePath, success: false, error: err.message };
       }
     });
 
     const results = await Promise.all(readPromises);
+
+    // Global output ceiling: stop including file bodies once the combined size
+    // would exceed MAX_OUTPUT_CHARS, so a bulk read of many files stays bounded.
+    let runningChars = 0;
+    let omittedForBudget = 0;
+    for (const r of results) {
+      if (!r.success || typeof r.content !== 'string') continue;
+      if (runningChars >= MAX_OUTPUT_CHARS) {
+        r.content = '';
+        r.truncated = true;
+        r.note = `Omitted — bulk read exceeded ${MAX_OUTPUT_CHARS} char budget. Read this file individually with read-file.`;
+        omittedForBudget += 1;
+        continue;
+      }
+      runningChars += r.content.length;
+    }
+
     const successCount = results.filter(r => r.success).length;
 
     return apiResponse(res, 200, {
       results,
       totalFiles: paths.length,
       successCount,
-      failedCount: paths.length - successCount
+      failedCount: paths.length - successCount,
+      ...(omittedForBudget > 0 ? { omittedForBudget } : {})
     });
   } catch (error) {
     return apiResponse(res, 500, { error: error.message });

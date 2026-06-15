@@ -354,7 +354,9 @@ router.post('/browser-check', async (req, res) => {
           .filter(Boolean)
           .slice(0, 6);
 
-        const bodyText = document.body?.innerText?.replace(/\s+/g, ' ').trim().slice(0, 800) || '';
+        const fullText = document.body?.innerText?.replace(/\s+/g, ' ').trim() || '';
+        // Short snippet only — enough to confirm the page rendered, not the whole DOM.
+        const bodyText = fullText.slice(0, 200);
 
         const errorMessages = Array.from(document.querySelectorAll('[role="alert"], .error, .error-message, [class*="error"], [class*="Error"]'))
           .map(el => el.innerText?.trim())
@@ -365,10 +367,13 @@ router.post('/browser-check', async (req, res) => {
           '[class*="spinner"], [class*="loading"], [class*="skeleton"], [aria-busy="true"], .animate-spin'
         );
 
+        // Empty-state detection runs against the FULL text so the shorter snippet
+        // doesn't weaken it.
+        const lowerFull = fullText.toLowerCase();
         const hasEmptyState = !!document.querySelector('[class*="empty"], [class*="no-data"], [class*="no-results"]')
-          || bodyText.toLowerCase().includes('no data')
-          || bodyText.toLowerCase().includes('nothing here')
-          || bodyText.toLowerCase().includes('no results');
+          || lowerFull.includes('no data')
+          || lowerFull.includes('nothing here')
+          || lowerFull.includes('no results');
 
         return { headings, bodyText, errorMessages, hasSpinner, hasEmptyState };
       }).catch(() => ({ headings: [], bodyText: '', errorMessages: [], hasSpinner: false, hasEmptyState: false }));
@@ -404,28 +409,37 @@ router.post('/browser-check', async (req, res) => {
 
       console.log(`🔍 ${path}: status=${statusCode}, reached=${reachedTarget}, errors=${realErrors.length}/${consoleErrors.length}, blank=${isBlank}`);
 
-      results.push({
-        path,
-        finalPath: landedPath,
-        reachedTarget,
-        redirectedToLogin,
-        statusCode,
-        title,
-        isBlank,
-        hasErrors,
-        domContent,
-        consoleLogs: usefulLogs.slice(-20),
-        consoleErrors: realErrors,
-        allConsoleErrors: consoleErrors,
-        networkErrors: networkErrors.slice(-5),
-        actionResults: actionResults.length > 0 ? actionResults : undefined,
-        status: (hasErrors || isBlank || !reachedTarget) ? 'FAIL' : 'PASS',
-        summary: (!reachedTarget)
-          ? `⚠️ Did not reach ${path} — landed on ${landedPath}${redirectedToLogin ? ' (redirected to login)' : ''}`
-          : (hasErrors || isBlank)
-            ? `⚠️ ${isBlank ? 'blank page ' : ''}${consoleErrors.length > 0 ? `${consoleErrors.length} console error(s)` : ''}`
-            : `✅ OK`
-      });
+      const status = (hasErrors || isBlank || !reachedTarget) ? 'FAIL' : 'PASS';
+      const summary = (!reachedTarget)
+        ? `⚠️ Did not reach ${path} — landed on ${landedPath}${redirectedToLogin ? ' (redirected to login)' : ''}`
+        : (hasErrors || isBlank)
+          ? `⚠️ ${isBlank ? 'blank page ' : ''}${consoleErrors.length > 0 ? `${consoleErrors.length} console error(s)` : ''}`
+          : `✅ OK`;
+
+      // PASS pages only need the verdict — the model has nothing to fix, so don't
+      // ship domContent/bodyText/logs (that's where browser_check bloats context).
+      // FAIL pages get the full diagnostics so the agent can debug.
+      if (status === 'PASS') {
+        results.push({ path, finalPath: landedPath, reachedTarget, statusCode, title, status, summary });
+      } else {
+        results.push({
+          path,
+          finalPath: landedPath,
+          reachedTarget,
+          redirectedToLogin,
+          statusCode,
+          title,
+          isBlank,
+          hasErrors,
+          domContent,
+          consoleErrors: realErrors,
+          networkErrors: networkErrors.slice(-5),
+          ...(usefulLogs.length > 0 ? { consoleLogs: usefulLogs.slice(-20) } : {}),
+          ...(actionResults.length > 0 ? { actionResults } : {}),
+          status,
+          summary
+        });
+      }
     } catch (error) {
       console.error(`❌ Browser check error on ${path}:`, error.message);
       results.push({ path, status: 'ERROR', error: error.message });
