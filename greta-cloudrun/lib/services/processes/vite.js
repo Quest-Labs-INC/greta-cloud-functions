@@ -3,104 +3,76 @@
  * VITE DEV SERVER MANAGEMENT
  * ═══════════════════════════════════════════════════════════════════════════════
  *
- * Manages the Vite development server lifecycle with hot module replacement.
- * Uses Bun as the package manager for improved performance.
+ * Manages the Vite development server via supervisord.
  *
  * @module services/processes/vite
  */
 
-import { spawn } from 'child_process';
+import { exec } from 'child_process';
+import { promisify } from 'util';
 import { rm } from 'fs/promises';
+import http from 'http';
 import path from 'path';
-import { VITE_PORT, FRONTEND_DIR } from '../../core/config.js';
-import { state, addLog } from '../../core/state.js';
+import { FRONTEND_DIR, VITE_PORT } from '../../core/config.js';
 import { viteLogger as log } from '../../core/logger.js';
 
+const execAsync = promisify(exec);
 
-/** Flag to prevent restart during graceful shutdown */
-let shuttingDown = false;
+async function waitForVite(timeoutMs = 15000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const ready = await new Promise(resolve => {
+      const req = http.get(`http://localhost:${VITE_PORT}/`, res => {
+        res.resume();
+        resolve(res.statusCode < 500);
+      });
+      req.on('error', () => resolve(false));
+      req.setTimeout(1000, () => { req.destroy(); resolve(false); });
+    });
+    if (ready) return;
+    await new Promise(r => setTimeout(r, 500));
+  }
+}
 
 export function setShuttingDown() {
-  shuttingDown = true;
+  // No-op: supervisord handles restart prevention via explicit stop
 }
 
 export async function startVite() {
-  if (state.viteProcess) {
-    log.info('Vite already running');
-    return;
-  }
-
   log.emoji('vite', 'Starting Vite dev server...');
-
-  const args = ['run', 'dev', '--', '--host', '0.0.0.0', '--port', String(VITE_PORT)];
-  log.info(`Running: bun ${args.join(' ')}`);
-
-  state.viteProcess = spawn('bun', args, {
-    cwd: FRONTEND_DIR,
-    stdio: ['pipe', 'pipe', 'pipe'],
-    env: { ...process.env },
-  });
-
-  // Capture stdout
-  state.viteProcess.stdout.on('data', (data) => {
-    const message = data.toString().trim();
-    log.info(message);
-    addLog('vite', message);
-  });
-
-  // Capture stderr — filter known noise
-  const VITE_STDERR_NOISE = [
-    'Browserslist', 'caniuse-lite', 'update-browserslist-db',
-    'ExperimentalWarning', 'vite --host', 'VITE v', 'ready in',
-    'Local:', 'Network:', 'press h + enter',
-  ];
-  state.viteProcess.stderr.on('data', (data) => {
-    const message = data.toString().trim();
-    const isNoise = VITE_STDERR_NOISE.some(p => message.includes(p));
-    if (isNoise) {
-      addLog('vite', message);
-    } else {
-      log.error(message);
-      addLog('viteErrors', message);
-    }
-  });
-
-  // Handle process exit
-  state.viteProcess.on('close', (code) => {
-    log.info(`Process exited with code ${code}`);
-    state.viteProcess = null;
-
-    if (!shuttingDown) {
-      log.warn('Vite stopped unexpectedly, auto-restarting in 2 seconds...');
-      setTimeout(() => {
-        if (!shuttingDown) {
-          startVite().catch(err => log.error('Failed to restart:', err.message));
-        }
-      }, 2000);
-    }
-  });
-
-  await new Promise(resolve => setTimeout(resolve, 3000));
-  log.success('Vite dev server started');
+  try {
+    const { stdout } = await execAsync('supervisorctl start frontend');
+    log.info(stdout.trim());
+    log.success('Vite dev server started');
+  } catch (err) {
+    log.error('Failed to start Vite via supervisorctl:', err.message);
+  }
 }
 
 export function stopVite() {
-  if (state.viteProcess) {
-    state.viteProcess.kill();
-    state.viteProcess = null;
-    log.info('Vite stopped');
-  }
+  execAsync('supervisorctl stop frontend').catch(err =>
+    log.error('Failed to stop Vite via supervisorctl:', err.message)
+  );
 }
 
 export async function restartVite() {
   log.emoji('restart', 'Restarting Vite to pick up new dependencies...');
-  stopVite();
+
+  try { await execAsync('supervisorctl stop frontend'); } catch {}
 
   const viteCacheDir = path.join(FRONTEND_DIR, 'node_modules', '.vite');
   await rm(viteCacheDir, { recursive: true, force: true }).catch(() => {});
   log.info('Cleared Vite dep cache');
 
   await new Promise(resolve => setTimeout(resolve, 1000));
-  await startVite();
-  log.success('Vite restarted');
+
+  try {
+    const { stdout } = await execAsync('supervisorctl start frontend');
+    log.info(stdout.trim());
+    log.info('Waiting for Vite to be ready...');
+    await waitForVite(15000);
+    log.success('Vite restarted and ready');
+  } catch (err) {
+    log.error('Failed to restart Vite via supervisorctl:', err.message);
+  }
 }

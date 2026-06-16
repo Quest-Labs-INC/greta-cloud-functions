@@ -79,12 +79,14 @@ router.post('/search-replace', async (req, res) => {
     console.log(`✅ Search-replace in: ${filePath} (${replaceAll ? occurrences : 1} replacements)`);
     scheduleSyncToGCS(filePath);  // Incremental sync
 
+    // previousContent (full old file) intentionally NOT returned: nothing reads it
+    // — rollback uses GCS version snapshots (scheduleSyncToGCS above + restoreFileVersion),
+    // not this response — and it bloated the agent's context on every edit.
     const response = {
       changed: true,
       path: filePath,
       replacements: replaceAll ? occurrences : 1,
-      total_occurrences: occurrences,
-      previousContent: originalContent  // Store original content for rollback
+      total_occurrences: occurrences
     };
 
     if (status) response.status = getAppStatus();

@@ -18,9 +18,8 @@ import {
   scheduleSyncToGCS,
   isBinaryFile,
   getAppStatus,
-  getRecentLogs
 } from './helpers.js';
-import { restartVite } from '../../services/processes/vite.js';
+import { MAX_VIEW_FILE_LINES, MAX_OUTPUT_CHARS } from '../../core/config.js';
 
 const router = express.Router();
 
@@ -42,12 +41,7 @@ const router = express.Router();
  */
 router.post('/bulk-write-files', async (req, res) => {
   try {
-    const {
-      files,
-      capture_logs_backend = false,
-      capture_logs_frontend = false,
-      status = false
-    } = req.body;
+    const { files, status = false } = req.body;
 
     if (!files || !Array.isArray(files)) {
       return apiResponse(res, 400, { error: 'files array required' });
@@ -82,9 +76,6 @@ router.post('/bulk-write-files', async (req, res) => {
 
     results.filter(r => r.success).forEach(r => scheduleSyncToGCS(r.path));
 
-    const hasFrontendFiles = files.some(f => f.path?.includes('frontend/src'));
-    if (hasFrontendFiles) restartVite().catch(() => {});
-
     // Build response
     const response = {
       results,
@@ -92,14 +83,6 @@ router.post('/bulk-write-files', async (req, res) => {
       successCount,
       failedCount: files.length - successCount,
     };
-
-    if (capture_logs_backend) {
-      response.backendLogs = getRecentLogs('backend', 50);
-    }
-
-    if (capture_logs_frontend) {
-      response.frontendLogs = getRecentLogs('frontend', 50);
-    }
 
     if (status) {
       response.status = getAppStatus();
@@ -150,21 +133,55 @@ router.post('/bulk-read-files', async (req, res) => {
           return { path: filePath, success: false, error: 'File not found' };
         }
 
-        const content = await fs.readFile(fullPath, 'utf8');
-        return { path: filePath, success: true, content };
+        const raw = await fs.readFile(fullPath, 'utf8');
+        const lines = raw.split('\n');
+        const totalLines = lines.length;
+        // Per-file line cap so one large file can't dominate the bulk payload.
+        let content = totalLines > MAX_VIEW_FILE_LINES
+          ? lines.slice(0, MAX_VIEW_FILE_LINES).join('\n')
+          : raw;
+        const truncated = totalLines > MAX_VIEW_FILE_LINES;
+        return {
+          path: filePath,
+          success: true,
+          content,
+          total_lines: totalLines,
+          ...(truncated ? {
+            truncated: true,
+            note: `Showing lines 1-${MAX_VIEW_FILE_LINES} of ${totalLines}. Use read-file with view_range to read more.`
+          } : {})
+        };
       } catch (err) {
         return { path: filePath, success: false, error: err.message };
       }
     });
 
     const results = await Promise.all(readPromises);
+
+    // Global output ceiling: stop including file bodies once the combined size
+    // would exceed MAX_OUTPUT_CHARS, so a bulk read of many files stays bounded.
+    let runningChars = 0;
+    let omittedForBudget = 0;
+    for (const r of results) {
+      if (!r.success || typeof r.content !== 'string') continue;
+      if (runningChars >= MAX_OUTPUT_CHARS) {
+        r.content = '';
+        r.truncated = true;
+        r.note = `Omitted — bulk read exceeded ${MAX_OUTPUT_CHARS} char budget. Read this file individually with read-file.`;
+        omittedForBudget += 1;
+        continue;
+      }
+      runningChars += r.content.length;
+    }
+
     const successCount = results.filter(r => r.success).length;
 
     return apiResponse(res, 200, {
       results,
       totalFiles: paths.length,
       successCount,
-      failedCount: paths.length - successCount
+      failedCount: paths.length - successCount,
+      ...(omittedForBudget > 0 ? { omittedForBudget } : {})
     });
   } catch (error) {
     return apiResponse(res, 500, { error: error.message });

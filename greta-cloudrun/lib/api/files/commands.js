@@ -13,12 +13,31 @@ import express from 'express';
 import { spawn } from 'child_process';
 import path from 'path';
 import fs from 'fs/promises';
-import { PROJECT_DIR, FRONTEND_DIR, BACKEND_DIR, GCS_BUCKET, projectId } from '../../core/config.js';
+import http from 'http';
+import { PROJECT_DIR, FRONTEND_DIR, BACKEND_DIR, GCS_BUCKET, projectId, VITE_PORT } from '../../core/config.js';
 import { Storage } from '@google-cloud/storage';
 import { resolveSafePath, apiResponse, execAsync } from './helpers.js';
 import { restartVite } from '../../services/processes/vite.js';
 import { restartBackend } from '../../services/processes/backend.js';
 import { syncToGCS } from '../../services/storage/gcs-sync.js';
+
+// Poll Vite until it responds or timeout (ms). Used after supervisorctl restarts
+// so browser_check works immediately when the agent calls it next.
+async function waitForVite(timeoutMs = 15000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const ready = await new Promise(resolve => {
+      const req = http.get(`http://localhost:${VITE_PORT}/`, res => {
+        res.resume();
+        resolve(res.statusCode < 500);
+      });
+      req.on('error', () => resolve(false));
+      req.setTimeout(1000, () => { req.destroy(); resolve(false); });
+    });
+    if (ready) return;
+    await new Promise(r => setTimeout(r, 500));
+  }
+}
 
 const router = express.Router();
 
@@ -104,6 +123,15 @@ router.post('/execute-bash', async (req, res) => {
 
       const duration = Date.now() - startTime;
       console.log(`✅ Command completed in ${duration}ms`);
+
+      // After any supervisorctl start/restart of the frontend, wait until Vite
+      // is actually serving before returning — so the agent's next browser_check
+      // hits a live server instead of a connection-refused.
+      if (/supervisorctl\s+(start|restart)\s+frontend/.test(command)) {
+        console.log('⏳ Waiting for Vite to be ready...');
+        await waitForVite(15000);
+        console.log('✅ Vite is ready');
+      }
 
       return apiResponse(res, 200, {
         stdout: stdout || '',

@@ -24,7 +24,23 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
  * Used for tracking deployed container versions
  */
 
-export const IMAGE_VERSION = 'v2';
+export const IMAGE_VERSION = 'v6';
+
+
+/* ─────────────────────────────────────────────────────────────────────────────
+ * READ LIMITS
+ * ─────────────────────────────────────────────────────────────────────────────
+ * Caps on file-read output sent back to the agent. Without these, an unranged
+ * read of a large file (or a bulk read of many files) dumps the full content
+ * into the LLM context and bloats it. The agent can page past the cap with
+ * view_range on single reads.
+ * ───────────────────────────────────────────────────────────────────────────── */
+
+/** Max lines returned from a single read when no view_range is supplied. */
+export const MAX_VIEW_FILE_LINES = 2000;
+
+/** Hard ceiling on total characters returned from any read response. */
+export const MAX_OUTPUT_CHARS = 80_000;
 
 
 /* ─────────────────────────────────────────────────────────────────────────────
