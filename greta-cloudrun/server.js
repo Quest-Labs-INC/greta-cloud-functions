@@ -387,7 +387,7 @@ async function shutdown() {
 
   // Stop vite + backend via supervisord; MongoDB is spawn-managed and dies with this process
   try {
-    await execAsync('supervisorctl stop vite backend');
+    await execAsync('supervisorctl stop frontend backend');
     console.log('✅ Supervised services stopped');
   } catch (err) {
     console.error('Failed to stop supervised services:', err.message);

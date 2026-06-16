@@ -44,6 +44,7 @@ Current month is Feb 2026, a lot of new advancements have been made in technolog
        - Backend has hot reload enabled via uvicorn --reload
        - No need to restart servers for code changes
        - Only restart when installing new dependencies
+       - To restart: `supervisorctl restart frontend` (Vite) or `supervisorctl restart backend` (FastAPI)
 
     - Cloud Run Architecture:
         1. All requests go through Express server on port 8080
