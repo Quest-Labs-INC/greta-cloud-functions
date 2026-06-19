@@ -1,25 +1,28 @@
-const { tool } = require('@langchain/core/tools');
-const { z } = require('zod');
 const axios = require('axios');
 
-function createSelfConfigTools({ agentId, userId, gatewayUrl, composioApps = [] }) {
+function createSelfConfigTools({ agentId, userId, gatewayUrl }) {
+    const patch = async (body, okMsg, label) => {
+        try {
+            const res = await axios.patch(
+                `${gatewayUrl}/api/greta/ai-agents/${agentId}/self-configure`,
+                body,
+                { headers: { userid: userId } }
+            );
+            return res.data.success ? okMsg : `Failed to update ${label}: ${res.data.error}`;
+        } catch (e) { return `Failed to update ${label}: ${e.message}`; }
+    };
+
+    const def = (name, description, properties, required) => ({
+        type: 'function',
+        function: { name, description, parameters: { type: 'object', properties, required } },
+    });
+
     return [
-        tool(
-            async ({ name }) => {
-                try {
-                    const res = await axios.patch(
-                        `${gatewayUrl}/api/greta/ai-agents/${agentId}/self-configure`,
-                        { name },
-                        { headers: { userid: userId } }
-                    );
-                    return res.data.success
-                        ? `Successfully updated your name to "${name}".`
-                        : `Failed to update name: ${res.data.error}`;
-                } catch (e) { return `Failed to update name: ${e.message}`; }
-            },
-            {
-                name: 'update_my_name',
-                description: `Persist a NEW name for YOU (the agent). The name is saved to the agent record and used in all future replies.
+        {
+            name: 'update_my_name',
+            def: def(
+                'update_my_name',
+                `Persist a NEW name for YOU (the agent). The name is saved to the agent record and used in all future replies.
 
 Call this ONLY when the user EXPLICITLY names YOU. Trigger phrases:
 - "call yourself X" / "your name is X" / "let's call you X" / "name yourself X"
@@ -32,26 +35,16 @@ Do NOT call this when:
 - The user is just greeting ("Hi", "Hey", "heyhey")
 
 After saving, confirm in ONE short line ("Got it — calling myself Pixie from now on.") and continue with whatever else they asked.`,
-                schema: z.object({ name: z.string().describe('The new name the user has given to the agent. Just the name, no quotes, no greeting.') })
-            }
-        ),
-
-        tool(
-            async ({ description }) => {
-                try {
-                    const res = await axios.patch(
-                        `${gatewayUrl}/api/greta/ai-agents/${agentId}/self-configure`,
-                        { description },
-                        { headers: { userid: userId } }
-                    );
-                    return res.data.success
-                        ? `Successfully updated your purpose to: "${description}"`
-                        : `Failed to update purpose: ${res.data.error}`;
-                } catch (e) { return `Failed to update purpose: ${e.message}`; }
-            },
-            {
-                name: 'update_my_purpose',
-                description: `Persist a NEW high-level purpose/role for YOU (the agent). This is the one-line "what kind of agent am I" that defines your scope across future conversations.
+                { name: { type: 'string', description: 'The new name the user has given to the agent. Just the name, no quotes, no greeting.' } },
+                ['name']
+            ),
+            execute: ({ name }) => patch({ name }, `Successfully updated your name to "${name}".`, 'name'),
+        },
+        {
+            name: 'update_my_purpose',
+            def: def(
+                'update_my_purpose',
+                `Persist a NEW high-level purpose/role for YOU (the agent). This is the one-line "what kind of agent am I" that defines your scope across future conversations.
 
 Call this ONLY when the user EXPLICITLY defines your role. Trigger phrases:
 - "you're an email triage assistant" / "you handle customer support" / "your job is to..."
@@ -64,26 +57,16 @@ Do NOT call this for:
 - Casual conversation about what they're working on — only call this when they're defining YOU, not describing their work.
 
 A purpose is durable — it should apply to every future turn. A task is one-off — do it without changing your purpose.`,
-                schema: z.object({ description: z.string().describe('One sentence describing what kind of agent this is and what scope of work it handles.') })
-            }
-        ),
-
-        tool(
-            async ({ instructions }) => {
-                try {
-                    const res = await axios.patch(
-                        `${gatewayUrl}/api/greta/ai-agents/${agentId}/self-configure`,
-                        { coreInstructions: instructions },
-                        { headers: { userid: userId } }
-                    );
-                    return res.data.success
-                        ? 'Successfully updated your core instructions.'
-                        : `Failed to update instructions: ${res.data.error}`;
-                } catch (e) { return `Failed to update instructions: ${e.message}`; }
-            },
-            {
-                name: 'update_my_instructions',
-                description: `Persist NEW behavioural instructions for YOU (the agent). These are injected into your system prompt for every future turn — durable rules about HOW you work (style, defaults, preferences).
+                { description: { type: 'string', description: 'One sentence describing what kind of agent this is and what scope of work it handles.' } },
+                ['description']
+            ),
+            execute: ({ description }) => patch({ description }, `Successfully updated your purpose to: "${description}"`, 'purpose'),
+        },
+        {
+            name: 'update_my_instructions',
+            def: def(
+                'update_my_instructions',
+                `Persist NEW behavioural instructions for YOU (the agent). These are injected into your system prompt for every future turn — durable rules about HOW you work (style, defaults, preferences).
 
 Call this ONLY when the user explicitly asks you to change how you behave going forward. Trigger phrases:
 - "from now on, always..."
@@ -98,13 +81,11 @@ Do NOT call this for:
 - Task instructions ("schedule the meeting at 9pm") — that's the task, not your instructions
 
 Instructions should compose with existing ones — write them as additions, not full replacements, unless the user is rewriting from scratch.`,
-                schema: z.object({ instructions: z.string().describe('The durable behavioural rule the user is adding. Write it as actionable instructions the agent will follow on every future turn.') })
-            }
-        ),
-        // request_integration, check_integration_status, complete_onboarding —
-        // all removed. Onboarding mode is gone; the post-onboarding chat path uses
-        // the container's built-in CHECK_INTEGRATION_STATUS_TOOL +
-        // REQUEST_INTEGRATION_BUTTON_TOOL instead.
+                { instructions: { type: 'string', description: 'The durable behavioural rule the user is adding. Write it as actionable instructions the agent will follow on every future turn.' } },
+                ['instructions']
+            ),
+            execute: ({ instructions }) => patch({ coreInstructions: instructions }, 'Successfully updated your core instructions.', 'instructions'),
+        },
     ];
 }
 

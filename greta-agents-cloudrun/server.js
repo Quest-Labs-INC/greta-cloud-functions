@@ -1,8 +1,3 @@
-// Sentry must be imported and initialized BEFORE any other modules so it can
-// instrument them. The container image is single (always prod), but the
-// effective environment is determined by which gateway this agent is connected
-// to ” staging URL ’ staging events, production URL ’ production events.
-// Comment out the init block below when running locally for development.
 const Sentry = require('@sentry/node');
 const _gatewayUrl = process.env.BACKEND_GATEWAY_URL || '';
 const _sentryEnv = _gatewayUrl.includes('staging') ? 'staging' : 'production';
@@ -18,10 +13,9 @@ Sentry.setTag('agent_id', process.env.AGENT_ID);
 const express = require('express');
 const axios = require('axios');
 const { AgentExecutor, shapeToolResult } = require('./lib/execution/agentExecutor');
-const { HumanMessage, SystemMessage, ToolMessage, AIMessage } = require('@langchain/core/messages');
-const { createOpenRouterLLM } = require('./lib/llm/openRouterService');
+const { createRawOpenAIClient } = require('./lib/llm/openRouterService');
+const { applyCacheControl, summarizeCachePerformance } = require('./lib/llm/cachingService');
 const { createSelfConfigTools } = require('./lib/tools/selfConfigTools');
-const { getOnboardingPrompt } = require('./lib/tools/onboardingPrompt');
 const { createOrchestrationTools } = require('./lib/tools/agentOrchestrationTools');
 const { SUPPORTED_APPS } = require('./lib/tools/supportedApps');
 
@@ -32,6 +26,12 @@ const AGENT_ID = process.env.AGENT_ID;
 const USER_ID = process.env.USER_ID;
 const BACKEND_GATEWAY_URL = process.env.BACKEND_GATEWAY_URL || 'https://addons-staging-v2.questera.ai';
 const POD_TOKEN = process.env.POD_TOKEN;
+
+// Reasoning effort: 'low' (default) keeps cost/latency low; 'medium'/'high' for complex tasks; 'off' disables thinking entirely.
+const AGENT_REASONING_EFFORT = process.env.AGENT_REASONING_EFFORT || 'low';
+const AGENT_REASONING = AGENT_REASONING_EFFORT === 'off'
+    ? { enabled: false }
+    : { effort: AGENT_REASONING_EFFORT };
 const PORT = process.env.PORT || 8080;
 
 if (!AGENT_ID || !USER_ID || !POD_TOKEN) {
@@ -39,7 +39,11 @@ if (!AGENT_ID || !USER_ID || !POD_TOKEN) {
     process.exit(1);
 }
 
+const SKIP_POD_AUTH = process.env.SKIP_POD_AUTH === 'true';
+if (SKIP_POD_AUTH) console.warn('[Container] SKIP_POD_AUTH=true — pod auth disabled. Local dev only.');
+
 function authorizePodRequest(req) {
+    if (SKIP_POD_AUTH) return true;
     const incomingToken = req.headers['x-pod-token'];
     return !!incomingToken && incomingToken === POD_TOKEN;
 }
@@ -47,16 +51,96 @@ function authorizePodRequest(req) {
 console.log(`[Container] Starting container for Agent ID: ${AGENT_ID}`);
 console.log(`[Container] Backend Gateway: ${BACKEND_GATEWAY_URL}`);
 
-// CACHE STRATEGY CHANGE:
-// - OLD: Cache by apps only ’ same tools for "send email" and "search emails"
-// - NEW: Cache by apps + useCase hash ’ different tools for different requests
-// - TTL: 5 minutes (tools can change as conversation evolves)
-const toolsCacheMap = new Map(); // key: "GMAIL|SLACK|abc123" ’ { tools, expiresAt }
-const TOOLS_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
-
 let mcpToolsCache = null;
 let mcpToolsCacheTime = null;
 const MCP_CACHE_TTL_MS = 10 * 60 * 1000; // 10 minutes
+
+// Persists discovered Composio tool schemas per conversation — avoids re-running
+// COMPOSIO_SEARCH_TOOLS on every turn for the same tools.
+const conversationToolCache = new Map(); // conversationId -> { schemas: Map<slug,{name,description,parameters}>, expiresAt }
+const CONV_TOOL_CACHE_TTL_MS = 30 * 60 * 1000;   // 30 min — a conversation's working tool set
+const CONV_TOOL_CACHE_MAX_TOOLS = 25;            // cap per conversation to bound prompt growth
+const CONV_TOOL_CACHE_MAX_CONVERSATIONS = 200;   // cap total memory footprint
+
+function getConversationTools(conversationId) {
+    if (!conversationId) return null;
+    const entry = conversationToolCache.get(conversationId);
+    if (!entry) return null;
+    if (Date.now() > entry.expiresAt) { conversationToolCache.delete(conversationId); return null; }
+    return entry;
+}
+
+function rememberConversationTools(conversationId, schemas) {
+    if (!conversationId || !Array.isArray(schemas) || schemas.length === 0) return;
+    let entry = conversationToolCache.get(conversationId);
+    if (!entry || Date.now() > entry.expiresAt) {
+        entry = { schemas: new Map(), expiresAt: 0 };
+    }
+    for (const s of schemas) {
+        const name = s.function?.name || s.name;
+        if (!name) continue;
+        entry.schemas.set(name, {
+            name,
+            description: s.function?.description || s.description || '',
+            parameters: s.function?.parameters || s.parameters,
+        });
+    }
+    // Keep only the most-recently-added N (Map preserves insertion order).
+    while (entry.schemas.size > CONV_TOOL_CACHE_MAX_TOOLS) {
+        entry.schemas.delete(entry.schemas.keys().next().value);
+    }
+    entry.expiresAt = Date.now() + CONV_TOOL_CACHE_TTL_MS;
+    conversationToolCache.set(conversationId, entry);
+    // Evict the oldest conversation if we exceed the global cap.
+    if (conversationToolCache.size > CONV_TOOL_CACHE_MAX_CONVERSATIONS) {
+        let oldestKey = null, oldestExp = Infinity;
+        for (const [k, v] of conversationToolCache) { if (v.expiresAt < oldestExp) { oldestExp = v.expiresAt; oldestKey = k; } }
+        if (oldestKey) conversationToolCache.delete(oldestKey);
+    }
+}
+
+// Persists project list + schema per conversation — list_projects/explore_project_db
+// results are not in message history, so without this they re-run every turn.
+const conversationProjectCache = new Map(); // convId -> { projects:[]|null, schemas:Map<projectId,{projectName,collections,existingTasks}>, expiresAt }
+const CONV_PROJECT_CACHE_TTL_MS = 10 * 60 * 1000; // 10 min — projects/collections change rarely within a chat
+
+function getConversationProjects(conversationId) {
+    if (!conversationId) return null;
+    const entry = conversationProjectCache.get(conversationId);
+    if (!entry) return null;
+    if (Date.now() > entry.expiresAt) { conversationProjectCache.delete(conversationId); return null; }
+    return entry;
+}
+
+function _ensureProjectEntry(conversationId) {
+    let entry = conversationProjectCache.get(conversationId);
+    if (!entry || Date.now() > entry.expiresAt) {
+        entry = { projects: null, schemas: new Map(), expiresAt: 0 };
+    }
+    entry.expiresAt = Date.now() + CONV_PROJECT_CACHE_TTL_MS;
+    conversationProjectCache.set(conversationId, entry);
+    if (conversationProjectCache.size > 200) {
+        let oldestKey = null, oldestExp = Infinity;
+        for (const [k, v] of conversationProjectCache) { if (v.expiresAt < oldestExp) { oldestExp = v.expiresAt; oldestKey = k; } }
+        if (oldestKey) conversationProjectCache.delete(oldestKey);
+    }
+    return entry;
+}
+
+function rememberConversationProjects(conversationId, projects) {
+    if (!conversationId || !Array.isArray(projects)) return;
+    _ensureProjectEntry(conversationId).projects = projects;
+}
+
+function rememberConversationProjectSchema(conversationId, projectId, schema) {
+    if (!conversationId || !projectId || !schema) return;
+    _ensureProjectEntry(conversationId).schemas.set(projectId, schema);
+}
+
+function invalidateConversationProjectSchema(conversationId, projectId) {
+    const entry = conversationProjectCache.get(conversationId);
+    if (entry && projectId) entry.schemas.delete(projectId);
+}
 
 let gatewaySignature = null;
 let signatureExpiry = null;
@@ -101,33 +185,33 @@ Use when an external service sends outbound webhooks.
 
 For SCHEDULED — CRITICAL: The runPrompt is a FULL AGENTIC INSTRUCTION executed autonomously with all connected tools.
 
-EXAMPLE — “email negative tone → send meeting request → wait for reply → book calendar”:
-runPrompt: “Check Gmail for new emails from user@example.com (only emails received after the [Run context] timestamp). For each new email: analyze the tone. If negative: (a) check watch_get('meeting_req_'+messageId) — if exists:true, skip. (b) Send a reply asking for their availability. (c) watch_set('meeting_req_'+messageId, the threadId, ttlHours=168). (d) create_task with instruction 'Check Gmail thread [threadId] for a reply from user@example.com. If they gave a time: reply confirming, then create a Google Calendar event. If still no reply: create_task again to check in 30 minutes.' and delayMinutes=30, context={threadId, messageId}.”
+EXAMPLE — "email negative tone → send meeting request → wait for reply → book calendar":
+runPrompt: "Check Gmail for new emails from user@example.com (only emails received after the [Run context] timestamp). For each new email: analyze the tone. If negative: (a) check watch_get('meeting_req_'+messageId) — if exists:true, skip. (b) Send a reply asking for their availability. (c) watch_set('meeting_req_'+messageId, the threadId, ttlHours=168). (d) create_task with instruction 'Check Gmail thread [threadId] for a reply from user@example.com. If they gave a time: reply confirming, then create a Google Calendar event. If still no reply: create_task again to check in 30 minutes.' and delayMinutes=30, context={threadId, messageId}."
 
 KEY RULES:
-- Use create_task (not watch_get polling) for any “wait N hours/minutes then check” workflow
-- Use watch_get/watch_set only for dedup: “have I already acted on this item?”
-- The [Run context] timestamp is automatically injected — reference it as “after [Run context] timestamp” to filter to new items only
+- Use create_task (not watch_get polling) for any "wait N hours/minutes then check" workflow
+- Use watch_get/watch_set only for dedup: "have I already acted on this item?"
+- The [Run context] timestamp is automatically injected — reference it as "after [Run context] timestamp" to filter to new items only
 
 Call this tool after gathering all required parameters for the chosen type.`,
         parameters: {
             type: 'object',
             properties: {
-                name: { type: 'string', description: 'Short descriptive name (e.g. “Signup alert”, “Daily digest”)' },
+                name: { type: 'string', description: 'Short descriptive name (e.g. "Signup alert", "Daily digest")' },
                 description: { type: 'string', description: 'Human-readable description of what this task does' },
                 type: { type: 'string', enum: ['SCHEDULED', 'WEBHOOK_RECEIVED', 'DB_EVENT'], description: 'DB_EVENT for app database triggers, SCHEDULED for time-based polling, WEBHOOK_RECEIVED for inbound webhooks' },
                 // SCHEDULED fields
-                cronExpression: { type: 'string', description: 'Cron expression. REQUIRED for SCHEDULED. Examples: “0 9 * * *” = every day 9am, “*/5 * * * *” = every 5 min. Use empty string for other types.' },
-                timezone: { type: 'string', description: 'Timezone for SCHEDULED tasks (e.g. “America/New_York”, “Asia/Kolkata”, “UTC”). Default UTC.' },
+                cronExpression: { type: 'string', description: 'Cron expression. REQUIRED for SCHEDULED. Examples: "0 9 * * *" = every day 9am, "*/5 * * * *" = every 5 min. Use empty string for other types.' },
+                timezone: { type: 'string', description: 'Timezone for SCHEDULED tasks (e.g. "America/New_York", "Asia/Kolkata", "UTC"). Default UTC.' },
                 runPrompt: { type: 'string', description: 'REQUIRED for SCHEDULED and WEBHOOK_RECEIVED. Full agentic instruction in plain English — NEVER code or pseudocode.' },
                 // Project linkage — REQUIRED for DB_EVENT, OPTIONAL but strongly recommended for SCHEDULED
                 // when the task needs to read the user's app DB (e.g. "daily signup summary").
                 // When set, the agent gains the mongo_query tool at runtime to query the project's DB.
                 projectId: { type: 'string', description: 'REQUIRED for DB_EVENT. For SCHEDULED tasks reading the app DB — pass the project ID. CRITICAL: this MUST be the exact UUID `projectId` value from list_projects output (looks like "8268d524-2f01-4110-8172-dfe1cc5a3a56"). NEVER pass the project name/title here — that will fail. Always copy the `projectId` field verbatim from list_projects.' },
-                collectionName: { type: 'string', description: 'REQUIRED for DB_EVENT. MongoDB collection to watch (e.g. “users”, “orders”).' },
-                events: { type: 'array', items: { type: 'string', enum: ['INSERT', 'UPDATE', 'DELETE'] }, description: 'DB_EVENT: which operations to watch. Default: [“INSERT”].' },
+                collectionName: { type: 'string', description: 'REQUIRED for DB_EVENT. MongoDB collection to watch (e.g. "users", "orders").' },
+                events: { type: 'array', items: { type: 'string', enum: ['INSERT', 'UPDATE', 'DELETE'] }, description: 'DB_EVENT: which operations to watch. Default: ["INSERT"].' },
                 runPromptTemplate: { type: 'string', description: 'REQUIRED for DB_EVENT. Plain English instruction executed when the trigger fires. Use {{record}} to reference the triggering document, {{event}} for the operation type, {{collection}} for the collection name.' },
-                composioApps: { type: 'array', items: { type: 'string' }, description: 'Apps this task needs. Only list apps from your “Connected apps” section.' },
+                composioApps: { type: 'array', items: { type: 'string' }, description: 'Apps this task needs. Only list apps from your "Connected apps" section.' },
                 runOnce: { type: 'boolean', description: 'SCHEDULED only. Set true for one-shot async follow-ups created mid-chat — e.g. "check his reply in 1 hour and book the meeting if he confirmed". After the first SUCCESSFUL run, the task auto-disables AND the run output is posted back into the chat so the user sees what happened. Pick a cronExpression near the desired time (the first matching minute fires it, then it stops). Use false for normal recurring tasks ("daily digest", "every 5 min poll").' },
             },
             required: ['name', 'type'],
@@ -273,6 +357,7 @@ const STATIC_CHAT_PROMPT_FOUNDATION = `You are an AI teammate built on the Greta
      - If they only asked to connect (e.g., "let's connect gmail", "set up calendar") with no concrete task → acknowledge the connection in one short sentence and ask what they'd like to do (vary the phrasing — don't say "What would you like to do with your inbox?" robotically every time). Do NOT call any tools.
      - If unclear → lean toward asking briefly, not executing speculatively.
      Either way, never say "Gmail is already connected" — the user just connected it; they know.
+   - **Confirm before deleting.** Don't delete anything — emails, files, tickets, calendar events, rows, contacts, messages — without first asking the user in one short sentence and waiting for a yes. Example: "About to delete email 'Re: Q3 planning' from Sarah — confirm?" Exception: skip the confirmation if the user's own message already named the exact item to delete ("delete the email from Sarah about Q3" → just do it). The confirmation is for vague requests ("clean up my inbox") and for deletes the agent decides on its own.
 
 3. **Read the conversation before asking.** If the user mentioned a recipient, source, or detail in any prior turn — use it. Don't re-ask "who's the recipient?" if they said "send to Paras" three turns back. This is the single most frustrating failure mode users notice.
 
@@ -282,6 +367,11 @@ const STATIC_CHAT_PROMPT_FOUNDATION = `You are an AI teammate built on the Greta
    Exception: \`create_trigger\` requires explicit Discovery + Confirmation phases before the call (see Scheduled tasks below).
 
 5. **Act with what you have; ask only when getting it wrong matters.** Most missing details can be inferred from context — do that, tell the user what you chose. The exceptions where asking is required: scheduled tasks (autonomous, no chance to course-correct), high-stakes destinations (wrong Slack channel or email recipient sends private data to the wrong person). For everything else, the user expects action, not a checklist conversation.
+
+   **But distinguish reading from sending.** Read/lookup actions (check calendar, fetch emails, list anything) — just do them, always. **Side-effectful actions** (send a message/email, post, create, delete, schedule) carry a higher bar:
+   - Execute immediately ONLY when it's a clear command AND you know the actual content/payload to send (e.g. "send John the Q3 report", "message #eng that the deploy is done").
+   - If the request is phrased as a **capability/hypothetical question** ("would you be able to…", "can you…", "could you…", "is it possible to…") OR **the content to send is not specified**, do NOT perform the action and do NOT invent content. Confirm intent in one short line and ask what to send — e.g. "Yes — I can message you on Slack. What should it say?" Having to make up a "test message" is the signal you were never actually told to send anything.
+   - When in doubt for a send/create/delete, a one-line confirm beats firing into someone's real inbox/channel. This does NOT apply to reads.
 
 6. **Async follow-ups: schedule a one-shot task, don't promise vapor.** When the user describes a workflow that requires waiting for a future event ("when they reply, book it", "check in 1 hour", "if no response by tomorrow, escalate"), you MUST do two things in this turn:
    (a) execute the immediate action now (send the email, post the message), AND
@@ -298,6 +388,7 @@ const STATIC_CHAT_PROMPT_FOUNDATION = `You are an AI teammate built on the Greta
 - When asked who you are or what you do, mention your name (from the Agent context below), that you're built on Greta, and what you can help with — based on your purpose and connected apps. Vary phrasing across turns rather than repeating the same line.
 - About the underlying AI model / "are you GPT/Claude/Gemini": deflect forward — "I keep the underlying model under the hood so it can be swapped without breaking your experience. What I can help with today is…". Never name a specific model or vendor.
 - To rename or re-purpose yourself, call **update_my_name** / **update_my_purpose** / **update_my_instructions** when the user asks.
+- When you learn a **durable fact or preference** about the user — their timezone, a default channel/recipient, a recurring preference, a stable identifier — call **remember_fact** so you recall it next time. Don't use it for one-off task details. If it's already in your "What you remember" list, skip it.
 
 ## Disconnecting an app
 
@@ -319,7 +410,9 @@ Scheduled tasks run autonomously after creation. The agent that runs them cannot
 - **Schedule** — exact frequency, timezone, working-hours filter.
 - **Dedup** — process the same item once, or every run.
 
-Ask for ALL ❌ items in ONE message, not one at a time. Inference is fine for timezone (default UTC) and dedup TTL (default 7 days). Inference is **forbidden** for recipients, sources, and trigger conditions — getting those wrong sends private data to the wrong person.
+Ask for ALL ❌ items in ONE message, not one at a time. Inference is fine ONLY for dedup TTL (default 7 days). Inference is **forbidden** for recipients, sources, trigger conditions, AND timezone — getting those wrong sends private data to the wrong person or fires the task at the wrong hour.
+
+**Timezone is mandatory for any time-based task.** Never assume UTC or guess from context. If the task involves a clock time ("9 AM", "every morning", "end of day", a cron schedule), you MUST ask the user which timezone — unless they already stated one in this conversation (e.g. "9 AM IST", "8pm Pacific"). Reading a timezone they already gave is not inference; assuming one they didn't is.
 
 Reading from prior turns is NOT inference. If the user said "send to Paras" three turns ago, Paras is the recipient — don't ask again.
 
@@ -328,7 +421,8 @@ Reading from prior turns is NOT inference. If the user said "send to Paras" thre
 > Here's what I'll set up:
 >
 > - **Task**: [one-line description]
-> - **Frequency**: [plain English, e.g. "every weekday at 9 AM IST"]
+> - **Frequency**: [plain English, e.g. "every weekday at 9 AM"]
+> - **Timezone**: [the exact timezone the schedule runs in, e.g. "Asia/Kolkata (IST)"]
 > - **Source**: [integration + which account]
 > - **Trigger**: [what counts as matching]
 > - **Recipient**: [exact destination]
@@ -433,13 +527,13 @@ const COMPOSIO_MULTI_EXECUTE_TOOL_DEF = {
         name: 'COMPOSIO_MULTI_EXECUTE_TOOL',
         description: `Execute one or more Composio tools after finding them with COMPOSIO_SEARCH_TOOLS.
 
-**Independent steps** (no data dependency): include all in one call ” they execute in order.
+**Independent steps** (no data dependency): include all in one call " they execute in order.
 
 **Dependent steps** (step 2 needs step 1's output): DO NOT chain in one call. Call this tool twice:
 1. First call: include step 1 only. Read the result to see actual field names and values.
 2. Second call: include step 2, passing the real values from step 1's result as plain hardcoded params.
 
-This two-call approach is reliable because you work with real data ” no guessing field paths or field types.`,
+This two-call approach is reliable because you work with real data " no guessing field paths or field types.`,
         parameters: {
             type: 'object',
             properties: {
@@ -473,10 +567,36 @@ const GET_CURRENT_TIME_TOOL = {
 };
 
 // Local tool: Verify if a specific Composio app is connected for this agent.
-// Available at runtime (not just onboarding) so the agent can fact-check itself
-// when a user disputes connection status. Reads from the connected-apps list
-// passed in the current chat's agentConfig — always reflects the latest DB state
-// because the backend reads fresh on every chat turn.
+// remember_fact — on-signal long-term memory. The model calls this the moment it
+// learns a DURABLE fact/preference about the user; we append it to agent.memory
+// (a deduped bullet list) which is injected into the system prompt next turn.
+// Replaces the old periodic LLM "consolidation" blob — cheaper and higher-signal.
+const REMEMBER_FACT_TOOL = {
+    type: 'function',
+    function: {
+        name: 'remember_fact',
+        description: `Save a DURABLE fact or preference about the user so you recall it in future conversations.
+
+Call this the moment you learn something stable and reusable, e.g.:
+- timezone ("I'm in IST"), working hours, language preference
+- a default destination ("always send to #eng", "my work email is x@y.com")
+- a recurring preference ("keep summaries short", "send the digest on Mondays")
+- a stable identifier (their manager's email, their main repo/project)
+
+Do NOT call this for:
+- one-off task details (a single email's subject/recipient)
+- transient state or anything obvious only for this one request
+- something already in your "What you remember" list
+
+One clear, self-contained fact per call. Keep it short.`,
+        parameters: {
+            type: 'object',
+            properties: { fact: { type: 'string', description: 'The durable fact/preference as one short self-contained sentence.' } },
+            required: ['fact'],
+        },
+    },
+};
+
 const CHECK_INTEGRATION_STATUS_TOOL = {
     type: 'function',
     function: {
@@ -556,53 +676,9 @@ async function initializeAgent() {
     console.log('[Agent] Executor initialized');
 }
 
-async function consolidateMemory({ currentMemory, conversationTurns, agentName }) {
-    try {
-        const llm = createOpenRouterLLM({ temperature: 0 });
-        const prompt = `You are maintaining the long-term memory for an AI agent named "${agentName}".
-
-Memory has two sections. Keep them clearly separated:
-
-## Facts
-Permanent, stable facts about the user ” name, preferences, account identifiers, recurring needs.
-Update only when something genuinely new is learned about the user.
-
-## Recent context
-A short narrative paragraph (2-4 sentences) summarising what topics were discussed and what was done in the recent conversation. Rewrite this section each time to reflect the latest context.
-
----
-
-Current memory:
-${currentMemory || '(none yet)'}
-
-Recent conversation:
-${conversationTurns.map(m => `${m.role}: ${m.content}`).join('\n')}
-
----
-
-Rules:
-- Facts: only user identity, preferences, account info (names, orgs, repos they own). One line each.
-- Recent context: a flowing summary of topics and outcomes ” NOT a list of every message.
-- NEVER store: tool names or parameters, tool errors/failures, "user is aware that..." statements, tool capabilities, one-time questions that won't recur.
-- If nothing new was learned about the user, return the current memory exactly as-is.
-- Keep total memory under 400 words.
-- Return ONLY the memory text with the two sections. No explanation, no preamble.`;
-
-        const response = await llm.invoke([new HumanMessage(prompt)]);
-        const updatedMemory = typeof response.content === 'string' ? response.content.trim() : currentMemory;
-
-        if (!updatedMemory || updatedMemory === currentMemory) return;
-
-        await axios.post(
-            `${BACKEND_GATEWAY_URL}/api/greta/gateway/memory`,
-            { agentId: AGENT_ID, userId: USER_ID, memory: updatedMemory },
-            { headers: { 'x-gateway-signature': gatewaySignature } }
-        );
-        console.log(`[Memory] Consolidated and saved (${updatedMemory.length} chars)`);
-    } catch (e) {
-        console.error('[Memory] Consolidation failed (non-fatal):', e.message);
-    }
-}
+// Memory is now captured on-signal via the remember_fact tool (see handler in the
+// chat loop) instead of a periodic LLM consolidation. Durable facts/preferences are
+// appended to agent.memory and injected into the system prompt as "What you remember".
 
 app.get('/health', (req, res) => {
     res.json({
@@ -624,7 +700,7 @@ app.post('/execute', async (req, res) => {
 
     try {
         if (!agentExecutor) {
-            console.log('[Execute] Agent not initialized ” initializing now...');
+            console.log('[Execute] Agent not initialized " initializing now...');
             await initializeAgent();
             if (!agentExecutor) {
                 return res.status(503).json({ success: false, error: 'Agent executor failed to initialize' });
@@ -663,26 +739,6 @@ app.post('/execute', async (req, res) => {
     }
 });
 
-function toolStatusLabel(toolName) {
-    const n = toolName.toLowerCase();
-    if (n === 'list_projects') return 'Fetching your projects...';
-    if (n === 'explore_project_db') return 'Reading database schema...';
-    if (n === 'create_trigger') return 'Creating task...';
-    if (n.includes('calendar')) return 'Checking your calendar...';
-    if (n.includes('gmail') || n.includes('mail')) return 'Reading emails...';
-    if (n.includes('slack')) return 'Checking Slack...';
-    if (n.includes('github')) return 'Querying GitHub...';
-    if (n.includes('notion')) return 'Checking Notion...';
-    if (n.includes('sheet') || n.includes('spreadsheet')) return 'Reading spreadsheet...';
-    if (n.includes('drive')) return 'Checking Google Drive...';
-    if (n.includes('send')) return 'Sending...';
-    if (n.includes('create') || n.includes('insert') || n.includes('add')) return 'Creating...';
-    if (n.includes('delete') || n.includes('remove')) return 'Deleting...';
-    if (n.includes('update') || n.includes('patch') || n.includes('edit')) return 'Updating...';
-    if (n.includes('search') || n.includes('find') || n.includes('list') || n.includes('get')) return 'Looking up...';
-    return 'Working...';
-}
-
 // Truncate long strings for inline display in tool labels.
 function truncate(s, n) {
     s = String(s ?? '');
@@ -700,68 +756,67 @@ function firstSentence(text, maxLen = 70) {
     return sentence.length > maxLen ? sentence.slice(0, maxLen - 1) + '…' : sentence;
 }
 
-// Describe a Composio step using its own description (from the cache populated when
-// COMPOSIO_SEARCH_TOOLS ran). Appends one piece of param context (recipient/title/query)
-// when an obvious key is present. Zero per-tool/per-app dictionaries.
-function describeComposioStep(step, descriptionCache) {
-    const slug = (step?.tool || '').toUpperCase();
-    const params = step?.params || {};
-    if (!slug) return 'Running step';
-
-    const cached = descriptionCache?.get(slug);
-    const base = cached
-        ? firstSentence(cached)
-        // Last-resort fallback (description not in cache — shouldn't happen in normal flow
-        // since MULTI_EXECUTE always follows a SEARCH that populated the cache).
-        : slug.split('_').slice(1).join(' ').toLowerCase() || slug;
-
-    // Generic param probes — these key names are Composio conventions, not per-tool config.
-    const recipient = params.recipient_email ?? params.recipientEmail ?? params.to ?? params.channel;
-    const subject = params.subject ?? params.summary ?? params.title ?? params.name;
-    const query = params.query ?? params.q ?? params.search_query;
-    let tail = '';
-    if (recipient) tail = ` → ${truncate(recipient, 40)}`;
-    else if (subject) tail = `: "${truncate(subject, 40)}"`;
-    else if (query) tail = `: "${truncate(query, 40)}"`;
-    return base + tail;
+// Tool status label for the UI. Deliberately minimal — just three states:
+//   "Thinking" (emitted per step in the loop), "Finding the right tool" (discovery
+//   via COMPOSIO_SEARCH_TOOLS), and "Executing tool" (any other tool run).
+// No per-tool/per-app labels — the user found those noisy and they don't scale.
+function describeToolCall(name) {
+    if (name === 'COMPOSIO_SEARCH_TOOLS') return 'Finding the right tool';
+    return 'Executing tool';
 }
 
-// Generate a context-rich label for a top-level tool call (with args).
-// `descriptionCache` is the turn-scoped Map of {slug → Composio description} populated
-// when COMPOSIO_SEARCH_TOOLS runs; used by Composio sub-step labelling.
-function describeToolCall(name, args, descriptionCache) {
-    const a = args || {};
-    // Built-in / Greta-internal tools: hand-written labels. These don't come from Composio
-    // schemas, so the description cache won't help them.
-    if (name === 'get_current_time') return 'Checking the current time';
-    if (name === 'check_integration_status') return `Checking if ${String(a.app || '').toUpperCase()} is connected`;
-    if (name === 'request_integration') return `Requesting access to ${String(a.app || '').toUpperCase()}`;
-    if (name === 'list_projects') return 'Fetching your projects';
-    if (name === 'explore_project_db') return 'Reading the project database';
-    if (name === 'create_trigger') return `Creating task: ${truncate(a.name || 'new task', 40)}`;
-    if (name === 'update_my_name') return `Saving name: ${truncate(a.name || '', 30)}`;
-    if (name === 'update_my_purpose') return 'Saving purpose';
-    if (name === 'update_my_instructions') return 'Saving behavior instructions';
-    if (name === 'complete_onboarding') return 'Finalizing setup';
-    if (name === 'COMPOSIO_SEARCH_TOOLS') {
-        const queries = Array.isArray(a.queries) ? a.queries : [];
-        const first = queries[0]?.use_case;
-        if (!first) return 'Looking up the right tool';
-        return queries.length === 1
-            ? `Looking up: ${truncate(first, 60)}`
-            : `Looking up ${queries.length} capabilities`;
+// OpenRouter only accepts direct URLs for PNG/JPEG/WebP/GIF.
+// PDFs and all other formats must be fetched and sent as base64 data URLs.
+const DIRECT_URL_IMAGE_TYPES = new Set(['image/jpeg', 'image/jpg', 'image/png', 'image/gif', 'image/webp']);
+
+// Pod-level cache — documents are fetched once from S3, then reused across all
+// subsequent turns in the same conversation without re-fetching.
+const attachmentBase64Cache = new Map(); // url -> { base64, contentType }
+
+async function fetchAttachmentBase64(att) {
+    if (attachmentBase64Cache.has(att.url)) return attachmentBase64Cache.get(att.url);
+    const res = await axios.get(att.url, { responseType: 'arraybuffer', timeout: 30000 });
+    const cached = { base64: Buffer.from(res.data).toString('base64'), contentType: att.contentType };
+    attachmentBase64Cache.set(att.url, cached);
+    return cached;
+}
+
+async function buildMultimodalContent(text, attachments) {
+    const parts = [];
+    for (const att of attachments) {
+        if (DIRECT_URL_IMAGE_TYPES.has(att.contentType)) {
+            parts.push({ type: 'image_url', image_url: { url: att.url } });
+        } else {
+            try {
+                const { base64, contentType } = await fetchAttachmentBase64(att);
+                parts.push({ type: 'image_url', image_url: { url: `data:${contentType};base64,${base64}` } });
+            } catch (e) {
+                console.warn(`[Chat] Failed to fetch attachment for base64 encoding: ${e.message}`);
+            }
+        }
     }
-    if (name === 'COMPOSIO_MULTI_EXECUTE_TOOL') {
-        const steps = Array.isArray(a.steps) ? a.steps : [];
-        if (!steps.length) return 'Running actions';
-        if (steps.length === 1) return describeComposioStep(steps[0], descriptionCache);
-        return steps.map(s => describeComposioStep(s, descriptionCache)).join(' → ');
+    if (text) parts.push({ type: 'text', text });
+    return parts;
+}
+
+// History variant — images via direct URL (recent turns only), docs via cache (all turns).
+// Documents are always re-included so the model retains full context across a long conversation.
+async function buildMultimodalContentFromHistory(text, attachments) {
+    const parts = [];
+    for (const att of attachments) {
+        if (DIRECT_URL_IMAGE_TYPES.has(att.contentType)) {
+            parts.push({ type: 'image_url', image_url: { url: att.url } });
+        } else {
+            try {
+                const { base64, contentType } = await fetchAttachmentBase64(att);
+                parts.push({ type: 'image_url', image_url: { url: `data:${contentType};base64,${base64}` } });
+            } catch (e) {
+                console.warn(`[Chat] History doc fetch failed (${att.fileName}): ${e.message}`);
+            }
+        }
     }
-    // Bare Composio slug invoked directly (rare — usually goes through MULTI_EXECUTE).
-    if (descriptionCache?.has(name) || /_/.test(name)) {
-        return describeComposioStep({ tool: name, params: a }, descriptionCache);
-    }
-    return toolStatusLabel(name).replace(/\.{3}$/, '');
+    if (text) parts.push({ type: 'text', text });
+    return parts.length > 1 || (parts.length === 1 && parts[0].type === 'image_url') ? parts : text;
 }
 
 app.post('/chat', async (req, res) => {
@@ -769,10 +824,10 @@ app.post('/chat', async (req, res) => {
         return res.status(403).json({ success: false, error: 'Unauthorized' });
     }
 
-    const { message, conversationId, history = [], userId: reqUserId, agentConfig = {} } = req.body;
+    const { message, conversationId, history = [], attachments = [], userId: reqUserId, agentConfig = {} } = req.body;
     const userId = reqUserId || USER_ID;
 
-    if (!message) {
+    if (!message && attachments.length === 0) {
         return res.status(400).json({ success: false, error: 'Missing message' });
     }
 
@@ -784,7 +839,7 @@ app.post('/chat', async (req, res) => {
     const emit = (data) => res.write(`data: ${JSON.stringify(data)}\n\n`);
 
     let cancelled = false;
-    // Use res.on('close') not req.on('close') ” on HTTP/2 (Cloud Run), req closes
+    // Use res.on('close') not req.on('close') " on HTTP/2 (Cloud Run), req closes
     // immediately when the request body END_STREAM is received, which is before
     // Phase 3 starts. res closes only when the response is actually finished or
     // the client truly disconnects.
@@ -806,6 +861,8 @@ app.post('/chat', async (req, res) => {
         const coreInstructions = agentConfig.coreInstructions || 'You are a helpful assistant.';
         const composioApps = agentConfig.composioApps || [];
         const currentMemory = agentConfig.memory || '';
+        // Mutable copy — remember_fact appends durable facts to it during the turn.
+        let liveMemory = currentMemory;
         const isOnboarding = agentConfig.onboardingStatus === 'in_progress';
         const mcpEnabled = agentConfig.mcpEnabled || false;
         const mcpServers = agentConfig.mcpServers || [];
@@ -822,7 +879,10 @@ app.post('/chat', async (req, res) => {
         // mode was retired. The built-in CHECK_INTEGRATION_STATUS_TOOL +
         // REQUEST_INTEGRATION_BUTTON_TOOL_DEF cover those needs in chat.
         selfConfigToolInstances = createSelfConfigTools({ agentId: AGENT_ID, userId, gatewayUrl: BACKEND_GATEWAY_URL, composioApps });
-        toolDefs = [...selfConfigToolInstances];
+        // selfConfigToolInstances are LangChain tool() objects (used for execution via
+        // .invoke). The raw OpenAI SDK needs OpenAI-format function defs, so convert them
+        // for the tools array while keeping the instances for the executor below.
+        toolDefs = selfConfigToolInstances.map(t => t.def);
         console.log(`[Chat] Loaded ${selfConfigToolInstances.length} self-reconfig tools${isOnboarding ? ' (onboarding legacy path)' : ''}`);
 
         // ─────────────────────────────────────────────────────────────────────
@@ -868,9 +928,15 @@ app.post('/chat', async (req, res) => {
             : '';
 
         let systemPrompt;
+        // Per-turn volatile context (time, known tools/projects, first-turn warmth).
+        // Kept OUT of the cached system prefix and prepended to the user message instead
+        // (see cachingService) so it can change each turn without busting Gemini's cache.
+        let volatileContext = '';
 
         if (isOnboarding) {
-            systemPrompt = getOnboardingPrompt();
+            // Onboarding mode was retired — agents are always created 'completed'.
+            // Dead path kept only so the structure stays explicit.
+            systemPrompt = 'You are a helpful assistant.';
         } else {
             const userContext = userFirstName
                 ? `\n\nThe user's first name is **${userFirstName}** — address them by it where it adds warmth. ${userFirstName} is NOT your name; your name is **${agentName}**.`
@@ -905,26 +971,102 @@ The user's experience should be: they typed something → you helped. Everything
             // dynamic Agent context (name, user, instructions, memory, app
             // lists, MCP, first-turn warmth) tails it. Same total content as
             // before, just reordered so the cacheable bytes lead.
+            // Current date/time — injected into the DYNAMIC suffix (after the cacheable
+            // static prefix), so the agent no longer needs a separate get_current_time
+            // round-trip for "today" / "now" / relative-date queries (Phase 1.3).
+            const nowDt = new Date();
+            const currentTimeSection = '\n\n## Current date & time\n'
+                + nowDt.toLocaleString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric', hour: '2-digit', minute: '2-digit', timeZoneName: 'short' })
+                + ' (ISO: ' + nowDt.toISOString() + ')';
+
+            // Cross-turn tool reuse (Phase 1.1) — if this conversation already discovered
+            // Composio tools on a prior turn, list them so the model calls them directly
+            // instead of re-running COMPOSIO_SEARCH_TOOLS for the same intent.
+            const cachedToolsEntry = getConversationTools(conversationId);
+            let knownToolsSection = '';
+            if (cachedToolsEntry && cachedToolsEntry.schemas.size > 0) {
+                const lines = [...cachedToolsEntry.schemas.values()].map(t => {
+                    const props = t.parameters && t.parameters.properties ? Object.keys(t.parameters.properties) : [];
+                    const req = new Set((t.parameters && t.parameters.required) || []);
+                    const paramHint = props.length ? ' — params: ' + props.map(p => req.has(p) ? p + '*' : p).join(', ') : '';
+                    return '- ' + t.name + ': ' + firstSentence(t.description) + paramHint;
+                });
+                knownToolsSection = '\n\n## Tools already loaded this conversation\n'
+                    + 'These Composio tools are already discovered — call them DIRECTLY via COMPOSIO_MULTI_EXECUTE_TOOL. Do NOT call COMPOSIO_SEARCH_TOOLS for these:\n'
+                    + lines.join('\n')
+                    + '\n(* = required param. Only use COMPOSIO_SEARCH_TOOLS if you need a tool NOT listed here.)';
+            }
+
+            // Greta project discovery already done this conversation (Phase 1.1b) —
+            // inject the project list / explored schema so the model doesn't re-run
+            // list_projects / explore_project_db on every message.
+            const projEntry = getConversationProjects(conversationId);
+            let knownProjectsSection = '';
+            if (projEntry && ((projEntry.projects && projEntry.projects.length) || projEntry.schemas.size)) {
+                let ps = '\n\n## Greta projects already fetched this conversation\n';
+                if (projEntry.projects && projEntry.projects.length) {
+                    ps += 'Use these directly — do NOT call list_projects again unless the user names a project not listed here:\n';
+                    ps += projEntry.projects.map(p => `- ${p.name} (projectId: ${p.projectId}, hasBackend: ${p.hasBackend})`).join('\n');
+                }
+                for (const [pid, sch] of projEntry.schemas) {
+                    ps += `\n\nSchema for "${sch.projectName || pid}" (projectId: ${pid}) — do NOT call explore_project_db again for this project:\n`;
+                    const cols = Array.isArray(sch.collections) ? sch.collections : [];
+                    ps += `Collections: ${cols.join(', ') || '(none)'}`;
+                    if (Array.isArray(sch.existingTasks) && sch.existingTasks.length) {
+                        ps += `\nExisting tasks: ${sch.existingTasks.map(t => t.name).join(', ')}`;
+                    }
+                }
+                knownProjectsSection = ps;
+            }
+
             systemPrompt = `${STATIC_CHAT_PROMPT_FOUNDATION}
 
 # Agent context
 
 You are **${agentName}**, helping ${userFirstName || 'the user'}.${userContext}
 
-${coreInstructions}${memorySection}${appsSection}${connectableSection}${mcpSection}${firstTurnAddendum}`;
+${coreInstructions}${memorySection}${appsSection}${connectableSection}${mcpSection}`;
+
+            // Volatile bits live in the user-message prefix, NOT the cached system prompt.
+            volatileContext = [currentTimeSection, knownToolsSection, knownProjectsSection, firstTurnAddendum]
+                .filter(Boolean).join('').trim();
         }
+
+        // Prepend per-turn volatile context to the user message (kept out of the cached
+        // system prefix). The actual user message follows a clear separator.
+        const finalUserText = volatileContext
+            ? `${volatileContext}\n\n---\n\n${message}`
+            : message;
+
+        // Images: only the 3 most-recent user turns (older images waste tokens with no recall benefit).
+        // Documents: always re-included from any history turn so the model retains full context.
+        // The base64 cache means docs are fetched from S3 only once per pod lifetime.
+        const userHistoryIndices = history.reduce((acc, m, i) => m.role === 'user' ? [...acc, i] : acc, []);
+        const recentUserIdxSet = new Set(userHistoryIndices.slice(-3));
+
+        const historyMessages = await Promise.all(history.map(async (m, i) => {
+            if (m.role !== 'user' || !Array.isArray(m.attachments) || m.attachments.length === 0) {
+                return { role: m.role, content: m.content };
+            }
+            const imageAtts = recentUserIdxSet.has(i)
+                ? m.attachments.filter(a => DIRECT_URL_IMAGE_TYPES.has(a.contentType))
+                : [];
+            const docAtts = m.attachments.filter(a => !DIRECT_URL_IMAGE_TYPES.has(a.contentType));
+            const relevantAtts = [...imageAtts, ...docAtts];
+            if (relevantAtts.length === 0) return { role: m.role, content: m.content };
+            return { role: 'user', content: await buildMultimodalContentFromHistory(m.content, relevantAtts) };
+        }));
 
         const phase3Messages = [
             { role: 'system', content: systemPrompt },
-            ...history.map(m => ({ role: m.role, content: m.content })),
-            { role: 'user', content: message }
+            ...historyMessages,
+            {
+                role: 'user',
+                content: attachments.length > 0
+                    ? await buildMultimodalContent(finalUserText, attachments)
+                    : finalUserText,
+            },
         ];
-
-        // Both onboarding and chat use LangChain ” consistent with main backend
-        const llm = createOpenRouterLLM({ temperature: 0.2 });
-        const llmWithOnboarding = isOnboarding
-            ? (toolDefs.length > 0 ? llm.bindTools(toolDefs) : llm)
-            : null;
 
         async function executeExternalTool(tc) {
             // LangChain format: tc.name / tc.args (already-parsed object)
@@ -935,8 +1077,26 @@ ${coreInstructions}${memorySection}${appsSection}${connectableSection}${mcpSecti
             // loaded post-onboarding so the user can rename or re-purpose the agent mid-chat.
             const selfConfigTool = selfConfigToolInstances.find(t => t.name === name);
             if (selfConfigTool) {
-                try { return String(await selfConfigTool.invoke(args)); }
+                try { return String(await selfConfigTool.execute(args)); }
                 catch (e) { return `Tool failed: ${e.message}`; }
+            }
+
+            // remember_fact — append a durable fact to agent memory (deduped) and persist.
+            if (name === 'remember_fact') {
+                const fact = String(args.fact || '').trim();
+                if (!fact) return 'No fact provided.';
+                if ((liveMemory || '').toLowerCase().includes(fact.toLowerCase())) {
+                    return 'Already remembered that.';
+                }
+                liveMemory = liveMemory ? `${liveMemory}\n- ${fact}` : `- ${fact}`;
+                try {
+                    await axios.post(
+                        `${BACKEND_GATEWAY_URL}/api/greta/gateway/memory`,
+                        { agentId: AGENT_ID, userId, memory: liveMemory },
+                        { headers: { 'x-gateway-signature': gatewaySignature } }
+                    );
+                    return `Remembered: ${fact}`;
+                } catch (e) { return `Couldn't save that to memory: ${e.message}`; }
             }
 
             // check_integration_status — pure local check against the connected-apps list
@@ -1006,7 +1166,7 @@ ${coreInstructions}${memorySection}${appsSection}${connectableSection}${mcpSecti
                 });
             }
 
-            // Self-orchestration tools (watch_set/get/clear, create_task) ” handled locally
+            // Self-orchestration tools (watch_set/get/clear, create_task) " handled locally
             if (['watch_set', 'watch_get', 'watch_clear', 'create_task'].includes(name)) {
                 try {
                     const orchTools = createOrchestrationTools({
@@ -1020,6 +1180,12 @@ ${coreInstructions}${memorySection}${appsSection}${connectableSection}${mcpSecti
 
             // list_projects — fetch user's Greta projects with backend status
             if (name === 'list_projects') {
+                // NOTE: we deliberately do NOT serve list_projects from cache. The cached
+                // list is injected into the system prompt to PREVENT redundant calls, but
+                // if the model still calls it (e.g. the user just created a new project),
+                // it must get a FRESH list from the backend — serving stale cache here
+                // could hide a newly-created project. We only `remember` the fresh result
+                // so the next turn's prompt injection is populated. (Phase 1.1b)
                 try {
                     const res = await axios.post(
                         `${BACKEND_GATEWAY_URL}/api/greta/gateway/projects`,
@@ -1029,12 +1195,20 @@ ${coreInstructions}${memorySection}${appsSection}${connectableSection}${mcpSecti
                     if (!res.data?.success) return `Error (${res.status}): ${res.data?.error || 'unknown'}`;
                     const projects = res.data.projects || [];
                     if (!projects.length) return 'No projects found for this user.';
+                    rememberConversationProjects(conversationId, projects);
                     return JSON.stringify({ projects });
                 } catch (e) { console.log('[list_projects] error:', e.message); return `Tool failed: ${e.message}`; }
             }
 
             // explore_project_db — fetch collections + existing tasks for a project
             if (name === 'explore_project_db') {
+                // Serve from cache if this project's schema was already explored this
+                // conversation (Phase 1.1b). Also injected into the system prompt.
+                const _cachedSchema = getConversationProjects(conversationId)?.schemas?.get(args.projectId);
+                if (_cachedSchema) {
+                    console.log(`[explore_project_db] served from conversation cache for ${args.projectId}`);
+                    return JSON.stringify({ projectId: args.projectId, ..._cachedSchema, cached: true });
+                }
                 try {
                     const res = await axios.post(
                         `${BACKEND_GATEWAY_URL}/api/greta/gateway/projects/${args.projectId}/schema`,
@@ -1042,12 +1216,13 @@ ${coreInstructions}${memorySection}${appsSection}${connectableSection}${mcpSecti
                         { headers: { 'x-gateway-signature': gatewaySignature }, validateStatus: s => s < 500 }
                     );
                     if (!res.data?.success) return `Error (${res.status}): ${res.data?.error || 'unknown'}. Make sure projectId is one returned by list_projects.`;
-                    return JSON.stringify({
-                        projectId: args.projectId,
+                    const schema = {
                         projectName: res.data.projectName,
-                        collections: res.data.collections || [],
-                        existingTasks: res.data.existingTasks || [],
-                    });
+                        collections: Array.isArray(res.data.collections) ? res.data.collections : [],
+                        existingTasks: Array.isArray(res.data.existingTasks) ? res.data.existingTasks : [],
+                    };
+                    rememberConversationProjectSchema(conversationId, args.projectId, schema);
+                    return JSON.stringify({ projectId: args.projectId, ...schema });
                 } catch (e) { console.log('[explore_project_db] error:', e.message); return `Tool failed: ${e.message}`; }
             }
 
@@ -1066,6 +1241,9 @@ ${coreInstructions}${memorySection}${appsSection}${connectableSection}${mcpSecti
                     );
                     if (trigRes.data?.success) {
                         emit({ type: 'trigger_created', triggerId: trigRes.data.triggerId, name: args.name });
+                        // A new task changes the project's existingTasks — drop the cached
+                        // schema so a later explore_project_db reflects it.
+                        if (args.projectId) invalidateConversationProjectSchema(conversationId, args.projectId);
                         return JSON.stringify({ success: true, message: `Task "${args.name}" created successfully.` });
                     }
                     const backendError = trigRes.data?.error || `HTTP ${trigRes.status}`;
@@ -1121,6 +1299,9 @@ ${coreInstructions}${memorySection}${appsSection}${connectableSection}${mcpSecti
         let totalStreamedChars = 0; // skip the final-chunk emit if we already streamed something
         const AGENT_MODEL_NAME = 'google/gemini-3-flash-preview';
         let totalPromptTokens = 0, totalCompletionTokens = 0;
+        let totalCacheReadTokens = 0;   // cached input tokens (for cache hit-rate logging)
+        let totalReasoningTokens = 0;   // hidden thinking tokens (proves the reasoning setting works)
+        let totalActualCostUSD = 0;     // real OpenRouter cost summed across steps (for credit math)
 
         // Honesty/connection trackers — hoisted to the outer scope so the post-loop
         // guardrail check can read them regardless of which code path ran the tools.
@@ -1148,35 +1329,13 @@ ${coreInstructions}${memorySection}${appsSection}${connectableSection}${mcpSecti
         }
 
         if (isOnboarding) {
-            //  Onboarding: LangChain path unchanged 
-            const lcMessages = [
-                new SystemMessage(systemPrompt),
-                ...history.map(m => m.role === 'user' ? new HumanMessage(m.content) : new AIMessage(m.content)),
-                new HumanMessage(message)
-            ];
-            for (let attempt = 0; attempt < 3 && !cancelled; attempt++) {
-                let response;
-                try { response = await llmWithOnboarding.invoke(lcMessages); }
-                catch (e) { console.error('[Chat] Onboarding LLM failed:', e.message); break; }
-                const text = extractText(response);
-                const hasTools = response.tool_calls?.length > 0;
-                lcMessages.push(response);
-                if (!hasTools) { finalText = text; break; }
-                const selfConfigResults = await Promise.all(
-                    response.tool_calls.map(async (tc) => {
-                        const localTool = selfConfigToolInstances.find(t => t.name === tc.name);
-                        const result = localTool ? String(await localTool.invoke(tc.args)) : `Tool ${tc.name} not found`;
-                        return { tc, result };
-                    })
-                );
-                for (const { tc, result } of selfConfigResults) {
-                    lcMessages.push(new ToolMessage({ tool_call_id: tc.id, content: result }));
-                }
-            }
+            // Onboarding mode was retired (agents are always created 'completed').
+            // This branch is dead and intentionally unsupported.
+            throw new Error('Onboarding mode is no longer supported');
         } else {
-            //  Direct Phase 3 ” no sentinel, no pre-load 
+            //  Direct Phase 3 " no sentinel, no pre-load 
             // Phase 1 removed: the sentinel approach was fragile with conversation history.
-            // The LLM now decides tool use naturally ” COMPOSIO_SEARCH_TOOLS handles discovery.
+            // The LLM now decides tool use naturally " COMPOSIO_SEARCH_TOOLS handles discovery.
 
             // Load MCP tools if enabled
             if (mcpEnabled && mcpServers.filter(s => s.enabled !== false).length > 0) {
@@ -1202,8 +1361,13 @@ ${coreInstructions}${memorySection}${appsSection}${connectableSection}${mcpSecti
                 }
             }
 
-            toolDefs.push(GET_CURRENT_TIME_TOOL);
+            // get_current_time is intentionally NOT bound in chat anymore: the current
+            // date/time is injected straight into the system prompt (see "## Current
+            // date & time"), removing a full LLM round-trip on every time-aware query.
+            // The executor below still recognizes the name defensively if the model ever
+            // emits it, but it has no reason to.
             toolDefs.push(CHECK_INTEGRATION_STATUS_TOOL);
+            toolDefs.push(REMEMBER_FACT_TOOL);
             // The request_integration_button tool is available whenever there's
             // at least one supported-but-not-connected app — i.e. anything the
             // user could meaningfully connect. When every supported app is
@@ -1226,17 +1390,14 @@ ${coreInstructions}${memorySection}${appsSection}${connectableSection}${mcpSecti
                 getSignature: () => gatewaySignature,
             });
             toolDefs.push(...orchestration.toolDefs);
-            console.log(`[Chat] ${toolDefs.length} tools ready ” entering ReAct loop`);
+            console.log(`[Chat] ${toolDefs.length} tools ready " entering ReAct loop`);
 
-            let llmWithTools;
-            try {
-                llmWithTools = toolDefs.length > 0 ? llm.bindTools(toolDefs) : llm;
-            } catch (bindErr) {
-                console.error('[Chat] bindTools failed:', bindErr.message);
-                llmWithTools = llm;
-            }
+            // Raw OpenRouter client (OpenAI SDK) — replaces LangChain ChatOpenAI for the
+            // chat loop so we can apply cache_control breakpoints + read usage/cost directly.
+            // toolDefs are already OpenAI function-format (selfConfig converted above).
+            const openaiClient = createRawOpenAIClient();
 
-	            // Track Composio tools discovered via search this turn ” used to validate MULTI_EXECUTE_TOOL calls.
+	            // Track Composio tools discovered via search this turn " used to validate MULTI_EXECUTE_TOOL calls.
 	            // The LLM cannot bypass discovery by guessing tool names from training.
 	            const discoveredComposioTools = new Set();
 	            // Composio's own human-written description per discovered tool slug.
@@ -1250,32 +1411,84 @@ ${coreInstructions}${memorySection}${appsSection}${connectableSection}${mcpSecti
 	            const executedMultiStepSignatures = new Set(); // key: JSON.stringify(steps)
 	            // Structured facts extracted from raw tool results for safer, grounded answers.
 	            // For now we track GitHub repository names explicitly so the final response
-	            // never needs to œinvent repo names ” it can rely on this list instead.
+	            // never needs to œinvent repo names " it can rely on this list instead.
 	            const githubRepoNames = new Set();
+
+	            // Hydrate discovery from the conversation tool cache (Phase 1.1) so tools
+	            // found on a PRIOR turn count as already-discovered — the model can call
+	            // them directly via COMPOSIO_MULTI_EXECUTE_TOOL (GATE 2 passes) and skip a
+	            // redundant COMPOSIO_SEARCH_TOOLS round-trip.
+	            const _convToolCache = getConversationTools(conversationId);
+	            if (_convToolCache) {
+	                for (const [slug, sch] of _convToolCache.schemas) {
+	                    discoveredComposioTools.add(slug);
+	                    if (sch.description) toolDescriptions.set(slug.toUpperCase(), sch.description);
+	                }
+	                console.log(`[Chat] Hydrated ${_convToolCache.schemas.size} tool(s) from conversation cache`);
+	            }
 
 	            // 12-step ceiling — enough for genuine multi-step workflows
 	            // (plan → search → execute → branch → search → execute → summary)
 	            // without going wild. Most turns exit at step 1-3 naturally.
 	            for (let step = 0; step < 12 && !cancelled; step++) {
                 console.log(`[Chat] Step ${step + 1}: streaming LLM...`);
+                // Surface a "Thinking" status while the model decides its next move
+                // (before any tool_use/chunk arrives). Frontend renders type:'status'.
+                emit({ type: 'status', label: 'Thinking' });
                 const stepStart = Date.now();
-                let msg = null;
                 let firstTokenAt = null;
                 let stepStreamedChars = 0;
+                let streamText = '';
+                const toolCallAcc = new Map(); // delta index -> { id, name, argsStr }
+                let stepUsage = null;
+                let streamErrored = false;
                 try {
-                    const stream = await llmWithTools.stream(phase3Messages);
-                    for await (const chunk of stream) {
+                    // cache_control on the (stable) system prompt — Gemini caches that prefix
+                    // across this turn's steps AND across turns (volatile bits live in the user msg).
+                    const cachedMessages = applyCacheControl(phase3Messages, AGENT_MODEL_NAME);
+                    const stream = await openaiClient.chat.completions.create({
+                        model: AGENT_MODEL_NAME,
+                        messages: cachedMessages,
+                        tools: toolDefs.length > 0 ? toolDefs : undefined,
+                        temperature: 0.2,
+                        stream: true,
+                        stream_options: { include_usage: true },
+                        provider: { order: ['google-vertex'], allow_fallbacks: false },
+                        reasoning: AGENT_REASONING,
+                    });
+                    for await (const part of stream) {
                         if (cancelled) break;
-                        if (firstTokenAt === null) firstTokenAt = Date.now();
-                        const chunkText = extractText(chunk);
-                        if (chunkText) {
-                            stepStreamedChars += chunkText.length;
-                            emit({ type: 'chunk', content: chunkText });
+                        const choice = part.choices?.[0];
+                        if (choice) {
+                            const delta = choice.delta || {};
+                            // Capture time-to-first-token for ANY first delta (content OR tool_call),
+                            // so tool-call-only steps (no text) still report TTFT.
+                            if (firstTokenAt === null && (delta.content || (Array.isArray(delta.tool_calls) && delta.tool_calls.length))) {
+                                firstTokenAt = Date.now();
+                            }
+                            if (delta.content) {
+                                streamText += delta.content;
+                                stepStreamedChars += delta.content.length;
+                                emit({ type: 'chunk', content: delta.content });
+                            }
+                            // Assemble tool calls from streamed deltas. The first delta for an
+                            // index carries id+name; later deltas append argument fragments.
+                            if (Array.isArray(delta.tool_calls)) {
+                                for (const d of delta.tool_calls) {
+                                    const idx = d.index ?? 0;
+                                    let acc = toolCallAcc.get(idx);
+                                    if (!acc) { acc = { id: d.id || `call_${idx}`, name: '', argsStr: '' }; toolCallAcc.set(idx, acc); }
+                                    if (d.id) acc.id = d.id;
+                                    if (d.function?.name) acc.name = d.function.name;
+                                    if (d.function?.arguments) acc.argsStr += d.function.arguments;
+                                }
+                            }
                         }
-                        msg = msg ? msg.concat(chunk) : chunk;
+                        if (part.usage) stepUsage = part.usage; // final chunk carries usage
                     }
                     totalStreamedChars += stepStreamedChars;
                 } catch (e) {
+                    streamErrored = true;
                     console.error('[Chat] LLM stream failed:', e.message, e.stack?.slice(0, 300));
                     Sentry.captureException(e, {
                         tags: { agent_id: AGENT_ID, phase: 'llm_stream', step: step + 1 },
@@ -1284,25 +1497,62 @@ ${coreInstructions}${memorySection}${appsSection}${connectableSection}${mcpSecti
                     });
                     break;
                 }
-                if (!msg) {
+
+                if (cancelled) break; // client disconnected mid-stream — don't execute tools
+
+                const assembledToolCalls = [...toolCallAcc.values()].filter(t => t.name);
+                if (!streamErrored && !streamText && assembledToolCalls.length === 0) {
                     console.warn(`[Chat] Step ${step + 1} produced no stream output`);
                     break;
                 }
 
-                trackCall(msg);
-                const text = extractText(msg).trim();
-                const toolCalls = msg.tool_calls || [];
+                // Token + cache accounting from the final usage chunk.
+                if (stepUsage) {
+                    totalPromptTokens     += stepUsage.prompt_tokens     || 0;
+                    totalCompletionTokens += stepUsage.completion_tokens || 0;
+                    const perf = summarizeCachePerformance(stepUsage, AGENT_MODEL_NAME);
+                    if (perf) {
+                        totalCacheReadTokens += perf.cacheReadTokens;
+                        totalReasoningTokens += perf.reasoningTokens;
+                        if (typeof perf.cost === 'number') totalActualCostUSD += perf.cost;
+                        const ttft = firstTokenAt ? firstTokenAt - stepStart : null;
+                        console.log(`[Chat] Step ${step + 1} cache: ${perf.cacheReadTokens}/${perf.inputTokens} cached (${perf.cacheHitRate}% hit), reasoning:${perf.reasoningTokens}tok [effort=${AGENT_REASONING_EFFORT}], ttft:${ttft ?? '?'}ms, step:${Date.now() - stepStart}ms`);
+                    }
+                }
+
+                const text = streamText.trim();
+                // Normalize to the shape the rest of the loop expects (tc.name / tc.args / tc.id).
+                const toolCalls = assembledToolCalls.map(t => {
+                    let args = {};
+                    try { args = t.argsStr ? JSON.parse(t.argsStr) : {}; }
+                    catch (pe) { console.warn(`[Chat] Bad tool args JSON for ${t.name}: ${pe.message}`); args = {}; }
+                    return { id: t.id, name: t.name, args };
+                });
 
                 const isHallucinatedAction = toolCalls.length > 0 && text &&
                     /\b(i have|i've|i sent|i created|i drafted|i scheduled|i added|i deleted|i updated)\b/i.test(text);
                 if (isHallucinatedAction) {
-                    console.warn(`[Chat] Step ${step + 1} ” discarding hallucinated action text: "${text.slice(0, 80)}"`);
+                    console.warn(`[Chat] Step ${step + 1} " discarding hallucinated action text: "${text.slice(0, 80)}"`);
                 }
 
                 const stepMs = Date.now() - stepStart;
                 timings.llmSteps.push({ step: step + 1, ms: stepMs, tools: toolCalls.length });
-                console.log(`[Chat] Step ${step + 1} (${stepMs}ms) ” "${text.slice(0, 100)}", tool_calls: ${toolCalls.length}`);
-                phase3Messages.push(msg);
+                console.log(`[Chat] Step ${step + 1} (${stepMs}ms) " "${text.slice(0, 100)}", tool_calls: ${toolCalls.length}`);
+                // Push the assistant turn in OpenAI format so the next step (and history
+                // replay) see a valid assistant message. tool_calls carry the raw argument
+                // strings; ids match the role:tool messages pushed during execution.
+                const assistantMsg = toolCalls.length > 0
+                    ? {
+                        role: 'assistant',
+                        content: text || null,
+                        tool_calls: assembledToolCalls.map(t => ({
+                            id: t.id,
+                            type: 'function',
+                            function: { name: t.name, arguments: t.argsStr || '{}' },
+                        })),
+                      }
+                    : { role: 'assistant', content: text };
+                phase3Messages.push(assistantMsg);
 
                 if (toolCalls.length === 0) { finalText = text; break; }
 
@@ -1310,7 +1560,7 @@ ${coreInstructions}${memorySection}${appsSection}${connectableSection}${mcpSecti
                 const toolBatchStart = Date.now();
 	                await Promise.all(toolCalls.map(async (tc) => {
                     const toolStart = Date.now();
-                    const label = describeToolCall(tc.name, tc.args, toolDescriptions);
+                    const label = describeToolCall(tc.name);
                     emit({ type: 'tool_use', toolCallId: tc.id, name: tc.name, label });
                     let ok = true;
                     let errorMessage = null;
@@ -1323,7 +1573,7 @@ ${coreInstructions}${memorySection}${appsSection}${connectableSection}${mcpSecti
 	                            // single user turn, instruct the LLM to re-use already discovered tools
 	                            // instead of searching again.
 	                            if (composioSearchCount >= 2) {
-	                                console.warn('[Chat] COMPOSIO_SEARCH_TOOLS limit reached ” returning searchLimitReached stub');
+	                                console.warn('[Chat] COMPOSIO_SEARCH_TOOLS limit reached " returning searchLimitReached stub');
 	                                result = JSON.stringify({
 	                                    searchLimitReached: true,
 	                                    message: 'COMPOSIO_SEARCH_TOOLS has already been used 2 times in this turn. Re-use the tools you have already discovered instead of searching again. Plan with the current tool set and call COMPOSIO_MULTI_EXECUTE_TOOL using those tools.',
@@ -1338,7 +1588,7 @@ ${coreInstructions}${memorySection}${appsSection}${connectableSection}${mcpSecti
 	                                );
 	                                const newSchemas = searchRes.data.success ? (searchRes.data.tools || []) : [];
 	                                // Track discovered tool names for MULTI_EXECUTE_TOOL validation.
-	                                // Do NOT bind them as callable tools ” the LLM can only execute Composio
+	                                // Do NOT bind them as callable tools " the LLM can only execute Composio
 	                                // tools via COMPOSIO_MULTI_EXECUTE_TOOL. This prevents bypass, keeps the
 	                                // per-call tool definitions small, and forces a single validated path.
 	                                for (const schema of newSchemas) {
@@ -1349,8 +1599,25 @@ ${coreInstructions}${memorySection}${appsSection}${connectableSection}${mcpSecti
 	                                        if (desc) toolDescriptions.set(tName.toUpperCase(), desc);
 	                                    }
 	                                }
-	                                console.log(`[Chat] COMPOSIO_SEARCH_TOOLS found ${newSchemas.length} tools ” schemas returned to LLM, not bound`);
+	                                // Persist to the conversation cache (Phase 1.1) so the NEXT turn
+	                                // reuses these schemas instead of searching again.
+	                                rememberConversationTools(conversationId, newSchemas);
+	                                console.log(`[Chat] COMPOSIO_SEARCH_TOOLS found ${newSchemas.length} tools " schemas returned to LLM, not bound`);
 	                                const planGuidance = searchRes.data.planGuidance || [];
+                                // Composio returns recommendedPlanSteps + knownPitfalls per use-case.
+                                // Surface them as an explicit PLAN the model is told to follow — this is
+                                // the planning the agent relies on instead of its own reasoning.
+                                const planText = (planGuidance || []).map(g => {
+                                    const st = (g.steps || []).map((s, i) => `${i + 1}. ${s}`).join('\n');
+                                    const pit = (g.pitfalls || []).map(p => `- ${p}`).join('\n');
+                                    return `For "${g.useCase || ''}":\nRECOMMENDED PLAN:\n${st || '(none)'}${pit ? `\nKNOWN PITFALLS TO AVOID:\n${pit}` : ''}`;
+                                }).join('\n\n');
+                                // Log the actual plan Composio returned so we can see how it's steering the agent.
+                                if (planText) {
+                                    console.log(`[Chat] COMPOSIO plan guidance (${planGuidance.length} use-case(s)):\n${planText}`);
+                                } else {
+                                    console.log(`[Chat] COMPOSIO returned NO plan guidance for this search`);
+                                }
 	                                result = JSON.stringify({
 	                                    found: newSchemas.length,
 	                                    // Full schemas (name + description + parameters) so the LLM can build
@@ -1362,7 +1629,7 @@ ${coreInstructions}${memorySection}${appsSection}${connectableSection}${mcpSecti
 	                                    })),
 	                                    ...(planGuidance.length > 0 && { planGuidance }),
 	                                    message: newSchemas.length > 0
-	                                        ? `Found ${newSchemas.length} tools. Each tool's name, description, and parameter schema is in the "tools" field. Call them via COMPOSIO_MULTI_EXECUTE_TOOL using the exact name and schema-correct params. Tools are NOT bound directly ” MULTI_EXECUTE_TOOL is the only execution path.`
+	                                        ? `${planText ? planText + '\n\n' : ''}Found ${newSchemas.length} tools (name, description, params in the "tools" field). Execute via COMPOSIO_MULTI_EXECUTE_TOOL. ${planText ? 'FOLLOW THE PLAN ABOVE step by step — execute the Required/Prerequisite steps in order via COMPOSIO_MULTI_EXECUTE_TOOL. SKIP any step marked Optional unless the request specifically needs it (e.g. a permalink or an edit). Do NOT explore other tools and do NOT call COMPOSIO_SEARCH_TOOLS again.' : 'Do ONLY the minimal steps needed to complete the task — do not over-explore or re-search.'} Tools are NOT bound directly " MULTI_EXECUTE_TOOL is the only execution path.`
 	                                        : 'No tools found. Re-think the request, decompose into sub-goals, and search again with different terms.'
 	                                });
 	                            }
@@ -1374,7 +1641,7 @@ ${coreInstructions}${memorySection}${appsSection}${connectableSection}${mcpSecti
 	                            // in this user turn, return a lightweight stub instead of calling Composio
 	                            // again. The original full results are still in the conversation context.
 	                            if (executedMultiStepSignatures.has(stepSignature)) {
-	                                console.warn('[Chat] COMPOSIO_MULTI_EXECUTE_TOOL skipped ” identical steps already executed this turn');
+	                                console.warn('[Chat] COMPOSIO_MULTI_EXECUTE_TOOL skipped " identical steps already executed this turn');
 	                                result = JSON.stringify({
 	                                    duplicate: true,
 	                                    message: 'These COMPOSIO_MULTI_EXECUTE_TOOL steps were already executed earlier in this turn. Re-use the previous tool results in the context instead of calling this tool again.',
@@ -1412,7 +1679,7 @@ ${coreInstructions}${memorySection}${appsSection}${connectableSection}${mcpSecti
 	                                .filter(s => s.tool && !discoveredComposioTools.has(s.tool));
 
 	                            if (undiscovered.length > 0) {
-	                                console.warn(`[Chat] COMPOSIO_MULTI_EXECUTE_TOOL rejected ” undiscovered tools: ${undiscovered.map(u => u.tool).join(', ')}`);
+	                                console.warn(`[Chat] COMPOSIO_MULTI_EXECUTE_TOOL rejected " undiscovered tools: ${undiscovered.map(u => u.tool).join(', ')}`);
 	                                // Record which apps the model tried — every undiscovered tool
 	                                // begins APPNAME_VERB_OBJECT, so the prefix is the app.
 	                                for (const u of undiscovered) {
@@ -1472,7 +1739,7 @@ ${coreInstructions}${memorySection}${appsSection}${connectableSection}${mcpSecti
 	                        } else {
 	                            result = await executeExternalTool(tc);
 	                        }
-	                        // Central shaping ” strips email headers, MIME parts, ARC sigs, and other
+	                        // Central shaping " strips email headers, MIME parts, ARC sigs, and other
 	                        // tool-response bloat before the result enters the LLM context. Applies to
 	                        // ALL paths (MULTI_EXECUTE_TOOL, direct Composio calls, MCP, orchestration).
 	                        // shapeToolResult is a no-op for small results, so it's safe everywhere.
@@ -1502,20 +1769,26 @@ ${coreInstructions}${memorySection}${appsSection}${connectableSection}${mcpSecti
             `tools:${toolTotal}ms across ${timings.tools.length} calls, ` +
             `overhead:${totalChatMs - llmTotal - toolTotal}ms)`
         );
-        console.log(`[Chat] After all phases ” finalText.length:${finalText.length}, toolsExecuted:${toolsExecuted}, cancelled:${cancelled}`);
+        console.log(`[Chat] After all phases " finalText.length:${finalText.length}, toolsExecuted:${toolsExecuted}, cancelled:${cancelled}`);
 
-        // Last-resort fallback ” tools loaded but LLM produced nothing at all.
+        // Last-resort fallback " tools loaded but LLM produced nothing at all.
         // CRITICAL: Use a safe prompt that won't trigger sentinel values or tool hallucinations
         if (!finalText && !cancelled) {
-            console.warn('[Chat] âš ï¸  FALLBACK TRIGGERED ” Empty finalText after all phases');
+            console.warn('[Chat] âš ï¸  FALLBACK TRIGGERED " Empty finalText after all phases');
             try {
                 const safeFallbackPrompt = `You are ${agentName}. ${coreInstructions}\n\nThe user sent a message but you produced no response. Apologize briefly and ask them to rephrase their request. Be concise and helpful.`;
-                const fallbackMsg = await llm.invoke([
-                    { role: 'system', content: safeFallbackPrompt },
-                    { role: 'user', content: message }
-                ]);
-                trackCall(fallbackMsg);
-                finalText = extractText(fallbackMsg).trim();
+                const fbClient = createRawOpenAIClient();
+                const fbResp = await fbClient.chat.completions.create({
+                    model: AGENT_MODEL_NAME,
+                    messages: [
+                        { role: 'system', content: safeFallbackPrompt },
+                        { role: 'user', content: message },
+                    ],
+                    temperature: 0.2,
+                    provider: { order: ['google-vertex'], allow_fallbacks: false },
+                });
+                if (fbResp.usage) { totalPromptTokens += fbResp.usage.prompt_tokens || 0; totalCompletionTokens += fbResp.usage.completion_tokens || 0; }
+                finalText = (fbResp.choices?.[0]?.message?.content || '').trim();
                 console.log(`[Chat] Fallback response: "${finalText.slice(0, 100)}"`);
             } catch (e) {
                 // Ultimate fallback - static error message
@@ -1614,8 +1887,11 @@ ${coreInstructions}${memorySection}${appsSection}${connectableSection}${mcpSecti
             guardrailEmittedChunk = true;
         }
 
-        console.log(`[Chat] Sending done ” cancelled:${cancelled} finalText:"${cleanText.slice(0, 100)}" (${cleanText.length} chars) streamed:${totalStreamedChars}`);
-        console.log(`[Chat] Tokens: ${totalPromptTokens}in/${totalCompletionTokens}out`);
+        console.log(`[Chat] Sending done " cancelled:${cancelled} finalText:"${cleanText.slice(0, 100)}" (${cleanText.length} chars) streamed:${totalStreamedChars}`);
+        {
+            const hitRate = totalPromptTokens > 0 ? Math.round((totalCacheReadTokens / totalPromptTokens) * 1000) / 10 : 0;
+            console.log(`[Chat] Tokens: ${totalPromptTokens}in/${totalCompletionTokens}out, cache:${totalCacheReadTokens}read (${hitRate}% hit), reasoning:${totalReasoningTokens}tok [effort=${AGENT_REASONING_EFFORT}], cost:$${totalActualCostUSD.toFixed(5)}`);
+        }
         // Only emit the full text as a chunk if we DIDN'T already stream it during the LLM loop
         // (fallback path, or rare cases where the stream produced no content).
         if (cleanText && totalStreamedChars === 0 && !guardrailEmittedChunk) emit({ type: 'chunk', content: cleanText });
@@ -1623,23 +1899,13 @@ ${coreInstructions}${memorySection}${appsSection}${connectableSection}${mcpSecti
             type: 'done',
             response: cleanText,
             conversationId,
-            tokenUsage: { promptTokens: totalPromptTokens, completionTokens: totalCompletionTokens, model: AGENT_MODEL_NAME },
+            tokenUsage: { promptTokens: totalPromptTokens, completionTokens: totalCompletionTokens, cacheReadTokens: totalCacheReadTokens, model: AGENT_MODEL_NAME },
+            actualCostUSD: totalActualCostUSD || undefined,
             composioCallCount,
         });
         res.end();
-
-        // Consolidate memory every 4 turns so facts are captured early in short conversations.
-        // history.length is the number of prior messages before this turn.
-        // Adding 2 (user + assistant) gives total turns after this message.
-        if (!isOnboarding && (history.length + 2) % 8 === 0) {
-            const conversationTurns = [
-                ...history.slice(-12),
-                { role: 'user', content: message },
-                { role: 'assistant', content: cleanText }
-            ];
-            consolidateMemory({ currentMemory, conversationTurns, agentName });
-            console.log(`[Memory] Consolidation triggered at turn ${history.length + 2}`);
-        }
+        // Memory is captured live via the remember_fact tool during the turn — no
+        // periodic consolidation pass needed.
 
     } catch (error) {
         console.error('[Chat] Error:', error);
@@ -1659,7 +1925,7 @@ async function start() {
         console.log(`[Container] Endpoints: GET /health  POST /chat  POST /execute`);
     });
 
-    // Load apps catalog from backend (non-blocking ” falls back to local list if it fails)
+    // Load apps catalog from backend (non-blocking " falls back to local list if it fails)
     loadAppsCatalog();
 
     try {
@@ -1670,7 +1936,7 @@ async function start() {
     }
 }
 
-process.on('SIGTERM', () => { console.log('[Container] SIGTERM ” shutting down'); process.exit(0); });
-process.on('SIGINT', () => { console.log('[Container] SIGINT ” shutting down'); process.exit(0); });
+process.on('SIGTERM', () => { console.log('[Container] SIGTERM " shutting down'); process.exit(0); });
+process.on('SIGINT', () => { console.log('[Container] SIGINT " shutting down'); process.exit(0); });
 
 start();
