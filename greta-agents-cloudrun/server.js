@@ -24,7 +24,7 @@ app.use(express.json({ limit: '10mb' }));
 
 const AGENT_ID = process.env.AGENT_ID;
 const USER_ID = process.env.USER_ID;
-const BACKEND_GATEWAY_URL = process.env.BACKEND_GATEWAY_URL || 'https://addons-staging-v2.questera.ai';
+const BACKEND_GATEWAY_URL = process.env.BACKEND_GATEWAY_URL;
 const POD_TOKEN = process.env.POD_TOKEN;
 
 // Reasoning effort: 'low' (default) keeps cost/latency low; 'medium'/'high' for complex tasks; 'off' disables thinking entirely.
@@ -34,16 +34,16 @@ const AGENT_REASONING = AGENT_REASONING_EFFORT === 'off'
     : { effort: AGENT_REASONING_EFFORT };
 const PORT = process.env.PORT || 8080;
 
-if (!AGENT_ID || !USER_ID || !POD_TOKEN) {
-    console.error('[Container] FATAL: AGENT_ID, USER_ID, and POD_TOKEN must be set');
+if (!AGENT_ID || !USER_ID || !POD_TOKEN || !BACKEND_GATEWAY_URL) {
+    console.error('[Container] FATAL: AGENT_ID, USER_ID, POD_TOKEN, and BACKEND_GATEWAY_URL must be set');
     process.exit(1);
 }
 
-const SKIP_POD_AUTH = process.env.SKIP_POD_AUTH === 'true';
-if (SKIP_POD_AUTH) console.warn('[Container] SKIP_POD_AUTH=true — pod auth disabled. Local dev only.');
+// const SKIP_POD_AUTH = process.env.SKIP_POD_AUTH === 'true';
+// if (SKIP_POD_AUTH) console.warn('[Container] SKIP_POD_AUTH=true — pod auth disabled. Local dev only.');
 
 function authorizePodRequest(req) {
-    if (SKIP_POD_AUTH) return true;
+    // if (SKIP_POD_AUTH) return true;
     const incomingToken = req.headers['x-pod-token'];
     return !!incomingToken && incomingToken === POD_TOKEN;
 }
