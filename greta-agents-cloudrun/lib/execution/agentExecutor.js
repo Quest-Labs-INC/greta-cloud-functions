@@ -1,9 +1,12 @@
 const axios = require('axios');
 const Sentry = require('@sentry/node');
-const { createOpenRouterLLM } = require('../llm/openRouterService');
+const { createRawOpenAIClient } = require('../llm/openRouterService');
+const { applyCacheControl, summarizeCachePerformance } = require('../llm/cachingService');
 const { createMongoQueryTool } = require('../tools/mongoQueryTool');
 const { createOrchestrationTools } = require('../tools/agentOrchestrationTools');
-const { SystemMessage, HumanMessage, ToolMessage, AIMessage } = require('@langchain/core/messages');
+
+const AGENT_REASONING_EFFORT = process.env.AGENT_REASONING_EFFORT || 'low';
+const AGENT_REASONING = AGENT_REASONING_EFFORT === 'off' ? { enabled: false } : { effort: AGENT_REASONING_EFFORT };
 
 const GET_CURRENT_TIME_TOOL = {
     type: 'function',
@@ -125,8 +128,6 @@ function executeGetCurrentTime() {
     });
 }
 
-const triggerToolsCacheMap = new Map();
-const TRIGGER_TOOLS_CACHE_TTL_MS = 30 * 60 * 1000;
 const AGENT_CONFIG_TTL_MS = 5 * 60 * 1000; // 5 minutes — picks up new integrations without restart
 
 class AgentExecutor {
@@ -222,55 +223,17 @@ class AgentExecutor {
         }
     }
 
-    async loadTools(composioApps) {
-        if (!composioApps.length) return [];
-
-        const cacheKey = composioApps.slice().sort().join(',');
-        const cached = triggerToolsCacheMap.get(cacheKey);
-        const now = Date.now();
-
-        if (cached && now < cached.expiresAt) {
-            console.log(`[AgentExecutor] Using cached tools (${cached.tools.length}) for [${cacheKey}]`);
-            return [...cached.tools];
-        }
-
-        const results = await Promise.allSettled(
-            composioApps.map(app =>
-                axios.post(
-                    `${this.backendGatewayUrl}/api/greta/gateway/composio/tools`,
-                    { agentId: this.agentId, userId: this.userId, apps: [app] },
-                    { headers: { 'x-gateway-signature': this.gatewaySignature } }
-                )
-            )
-        );
-
-        const toolDefs = [];
-        for (let i = 0; i < results.length; i++) {
-            if (results[i].status === 'fulfilled' && results[i].value.data.success) {
-                toolDefs.push(...results[i].value.data.tools);
-                console.log(`[AgentExecutor] Loaded ${results[i].value.data.tools.length} tools for ${composioApps[i]}`);
-            } else {
-                console.error(`[AgentExecutor] Failed tools for ${composioApps[i]}:`, results[i].reason?.message);
-            }
-        }
-
-        triggerToolsCacheMap.set(cacheKey, { tools: toolDefs, expiresAt: now + TRIGGER_TOOLS_CACHE_TTL_MS });
-        if (triggerToolsCacheMap.size > 10) {
-            const oldest = [...triggerToolsCacheMap.entries()].sort((a, b) => a[1].expiresAt - b[1].expiresAt)[0];
-            triggerToolsCacheMap.delete(oldest[0]);
-        }
-
-        return toolDefs;
-    }
-
     async runAgentLoop({ systemPrompt, userPrompt, toolDefs, localTools = new Map(), connectedComposioApps = [] }) {
-        const llm = createOpenRouterLLM({ temperature: 0 });
-        // Mutable: COMPOSIO_SEARCH_TOOLS injects discovered schemas at runtime and rebinds.
+        // Raw OpenAI SDK (OpenRouter) — replaces LangChain so triggers get cache_control,
+        // provider pinning, and reasoning control just like the chat path.
+        const client = createRawOpenAIClient();
+        // Mutable: COMPOSIO_SEARCH_TOOLS injects discovered schemas at runtime; the next
+        // create() call simply passes the grown dynamicTools array (no re-bind needed).
         // task_complete is always present — the agent MUST call it to end the task.
         let dynamicTools = [GET_CURRENT_TIME_TOOL, TASK_COMPLETE_TOOL, ...toolDefs, COMPOSIO_SEARCH_TOOL_DEF];
-        let llmWithTools = dynamicTools.length > 0 ? llm.bindTools(dynamicTools) : llm;
         const AGENT_MODEL_NAME = 'google/gemini-3-flash-preview';
         let totalPromptTokens = 0, totalCompletionTokens = 0;
+        let totalCacheReadTokens = 0, totalReasoningTokens = 0;
         // Honesty + pre-flight trackers (parity with chat path).
         // - composioExecuteAttempted: any Composio tool was called this run
         // - composioExecuteSucceeded: at least one Composio call returned ok
@@ -281,17 +244,17 @@ class AgentExecutor {
         let composioCallCount = 0;
         const failedComposioApps = new Set();
         const connectedAppsUpper = new Set((connectedComposioApps || []).map(a => String(a).toUpperCase()));
-        function trackCall(msg) {
-            if (!msg) return;
-            const u = msg.usage_metadata || msg.response_metadata?.tokenUsage || msg.response_metadata?.usage;
-            if (!u) return;
-            totalPromptTokens     += u.input_tokens  || u.promptTokens  || u.prompt_tokens  || 0;
-            totalCompletionTokens += u.output_tokens || u.completionTokens || u.completion_tokens || 0;
+        function trackUsage(usage) {
+            if (!usage) return;
+            totalPromptTokens     += usage.prompt_tokens     || 0;
+            totalCompletionTokens += usage.completion_tokens || 0;
+            totalCacheReadTokens  += usage.prompt_tokens_details?.cached_tokens || 0;
+            totalReasoningTokens  += usage.completion_tokens_details?.reasoning_tokens || 0;
         }
 
         const messages = [
-            new SystemMessage(systemPrompt),
-            new HumanMessage(userPrompt)
+            { role: 'system', content: systemPrompt },
+            { role: 'user', content: userPrompt },
         ];
 
         // Tracks consecutive failures per tool name within this run.
@@ -324,7 +287,8 @@ class AgentExecutor {
                         }
                     }
                     if (added.length > 0) {
-                        llmWithTools = llm.bindTools(dynamicTools);
+                        // No re-bind needed with the raw SDK — the next create() call passes
+                        // the grown dynamicTools array directly as `tools`.
                         console.log(`[AgentExecutor] COMPOSIO_SEARCH_TOOLS injected ${added.length} tools: ${added.slice(0, 5).join(', ')}`);
                     }
                     return JSON.stringify({
@@ -409,9 +373,21 @@ class AgentExecutor {
             // Network errors, content filter, rate limits, and 400 token-limit errors all surface here.
             let msg;
             try {
-                msg = await llmWithTools.invoke(messages);
+                const cachedMessages = applyCacheControl(messages, AGENT_MODEL_NAME);
+                const resp = await client.chat.completions.create({
+                    model: AGENT_MODEL_NAME,
+                    messages: cachedMessages,
+                    tools: dynamicTools.length > 0 ? dynamicTools : undefined,
+                    temperature: 0,
+                    provider: { order: ['google-vertex'], allow_fallbacks: false },
+                    reasoning: AGENT_REASONING,
+                });
+                msg = resp.choices?.[0]?.message;
+                trackUsage(resp.usage);
+                const perf = summarizeCachePerformance(resp.usage, AGENT_MODEL_NAME);
+                if (perf) console.log(`[AgentExecutor] Step ${step + 1} cache:${perf.cacheReadTokens}/${perf.inputTokens} (${perf.cacheHitRate}% hit), reasoning:${perf.reasoningTokens}tok [effort=${AGENT_REASONING_EFFORT}]`);
             } catch (err) {
-                console.error(`[AgentExecutor] LLM invoke failed at step ${step + 1}:`, err.message);
+                console.error(`[AgentExecutor] LLM call failed at step ${step + 1}:`, err.message);
                 Sentry.captureException(err, {
                     tags: { agent_id: this.agentId, phase: 'llm_invoke_executor', step: step + 1 },
                     user: { id: this.userId },
@@ -425,11 +401,16 @@ class AgentExecutor {
                 const tokenUsage = { promptTokens: totalPromptTokens, completionTokens: totalCompletionTokens, model: AGENT_MODEL_NAME };
                 return { output: `Task failed at step ${step + 1}: invalid LLM response`, tokenUsage, composioCallCount, failed: true };
             }
-            trackCall(msg);
             messages.push(msg);
 
             const text = typeof msg.content === 'string' ? msg.content : '';
-            const toolCalls = msg.tool_calls || [];
+            // Normalize OpenAI tool_calls ({id, function:{name, arguments(string)}}) → {id, name, args}.
+            const toolCalls = (msg.tool_calls || []).map(tc => {
+                let args = {};
+                try { args = tc.function?.arguments ? JSON.parse(tc.function.arguments) : {}; }
+                catch (pe) { console.warn(`[AgentExecutor] Bad tool args JSON for ${tc.function?.name}: ${pe.message}`); args = {}; }
+                return { id: tc.id, name: tc.function?.name, args };
+            });
             console.log(`[AgentExecutor] Step ${step + 1} — tools:${toolCalls.length} text:"${text.substring(0, 80)}"`);
 
             // Fix 3: task_complete is the explicit completion signal. If the agent calls it,
@@ -471,7 +452,7 @@ class AgentExecutor {
                 if (nudgeCount < 1 && toolsCalledCount > 0 && step < 19) {
                     nudgeCount++;
                     console.log(`[AgentExecutor] Step ${step + 1} — LLM gave text without task_complete, nudging once`);
-                    messages.push(new HumanMessage('You must signal completion explicitly. Call task_complete with a summary if you are done, or continue with the next action.'));
+                    messages.push({ role: 'user', content: 'You must signal completion explicitly. Call task_complete with a summary if you are done, or continue with the next action.' });
                     continue;
                 }
 
@@ -489,7 +470,7 @@ class AgentExecutor {
                     // Fix 2: shape tool result before pushing to context.
                     // Strips email headers, MIME parts, large arrays, etc. Prevents 1M-token explosion.
                     const result = shapeToolResult(rawResult);
-                    messages.push(new ToolMessage({ tool_call_id: tc.id, content: result }));
+                    messages.push({ role: 'tool', tool_call_id: tc.id, content: result });
                     if (result.startsWith('Tool failed:') || result.startsWith('Error:')) {
                         errors.push(`${tc.name}: ${result}`);
                     } else {
