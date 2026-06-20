@@ -110,7 +110,7 @@ router.post('/bulk-write-files', async (req, res) => {
  */
 router.post('/bulk-read-files', async (req, res) => {
   try {
-    const { paths } = req.body;
+    const { paths, skipBudget = false } = req.body;
 
     if (!paths || !Array.isArray(paths)) {
       return apiResponse(res, 400, { error: 'paths array required' });
@@ -137,10 +137,11 @@ router.post('/bulk-read-files', async (req, res) => {
         const lines = raw.split('\n');
         const totalLines = lines.length;
         // Per-file line cap so one large file can't dominate the bulk payload.
-        let content = totalLines > MAX_VIEW_FILE_LINES
+        // skipBudget bypasses this cap (e.g. for GitHub commit reads).
+        const truncated = !skipBudget && totalLines > MAX_VIEW_FILE_LINES;
+        let content = truncated
           ? lines.slice(0, MAX_VIEW_FILE_LINES).join('\n')
           : raw;
-        const truncated = totalLines > MAX_VIEW_FILE_LINES;
         return {
           path: filePath,
           success: true,
@@ -160,9 +161,10 @@ router.post('/bulk-read-files', async (req, res) => {
 
     // Global output ceiling: stop including file bodies once the combined size
     // would exceed MAX_OUTPUT_CHARS, so a bulk read of many files stays bounded.
+    // skipBudget bypasses this (used for server-side operations like GitHub commits).
     let runningChars = 0;
     let omittedForBudget = 0;
-    for (const r of results) {
+    for (const r of skipBudget ? [] : results) {
       if (!r.success || typeof r.content !== 'string') continue;
       if (runningChars >= MAX_OUTPUT_CHARS) {
         r.content = '';
