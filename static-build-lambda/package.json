@@ -1,0 +1,12 @@
+{
+  "name": "static-build-lambda",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Off-pod frontend build for greta_agentic: source zip in -> dist zip out.",
+  "main": "index.mjs",
+  "dependencies": {
+    "archiver": "^6.0.1",
+    "extract-zip": "^2.0.1",
+    "glob": "^10.3.10"
+  }
+}

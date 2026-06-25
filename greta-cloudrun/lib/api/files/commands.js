@@ -13,12 +13,16 @@ import express from 'express';
 import { spawn } from 'child_process';
 import path from 'path';
 import fs from 'fs/promises';
+import { PassThrough } from 'stream';
+import archiver from 'archiver';
+import extractZip from 'extract-zip';
+import { glob } from 'glob';
 import { PROJECT_DIR, FRONTEND_DIR, BACKEND_DIR, GCS_BUCKET, projectId } from '../../core/config.js';
 import { Storage } from '@google-cloud/storage';
 import { resolveSafePath, apiResponse, execAsync } from './helpers.js';
 import { restartVite } from '../../services/processes/vite.js';
 import { restartBackend } from '../../services/processes/backend.js';
-import { syncToGCS } from '../../services/storage/gcs-sync.js';
+import { syncToGCS, syncFilesToGCS } from '../../services/storage/gcs-sync.js';
 
 const router = express.Router();
 
@@ -175,6 +179,35 @@ async function retryWithDelay(fn, maxAttempts, delayMs, operationName) {
  */
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+/**
+ * Zip a directory into an in-memory Buffer, excluding heavy/irrelevant paths.
+ *
+ * Used to package the frontend SOURCE (no node_modules) for the build Lambda.
+ * Source is tiny (~0.1MB gzipped for a template project), so an in-memory
+ * buffer is fine. Uses fast compression (level 1) since the payload is small.
+ *
+ * @param {string} dir - Absolute directory to archive
+ * @param {string[]} ignore - Glob patterns to exclude
+ * @returns {Promise<Buffer>} Zip archive bytes
+ */
+function zipDirToBuffer(dir, ignore) {
+  return new Promise((resolve, reject) => {
+    const archive = archiver('zip', { zlib: { level: 1 } });
+    const chunks = [];
+    const collector = new PassThrough();
+
+    collector.on('data', (c) => chunks.push(c));
+    collector.on('end', () => resolve(Buffer.concat(chunks)));
+    collector.on('error', reject);
+    archive.on('error', reject);
+    archive.on('warning', (err) => { if (err.code !== 'ENOENT') reject(err); });
+
+    archive.pipe(collector);
+    archive.glob('**/*', { cwd: dir, ignore, dot: true });
+    archive.finalize();
+  });
 }
 
 
@@ -368,6 +401,140 @@ router.post('/build', (req, res) => {
   runBuild().catch(err => {
     const errorMsg = err?.message || String(err) || 'Unknown error';
     console.error(`❌ Unexpected error in build process: ${errorMsg}`);
+  });
+});
+
+
+/* ─────────────────────────────────────────────────────────────────────────────
+ * BUILD FRONTEND (OFF-POD, via Lambda)
+ * ───────────────────────────────────────────────────────────────────────────── */
+
+/**
+ * POST /build-static - Build the frontend OFF the container, on a build Lambda.
+ *
+ * Why: running `bun run build` in-pod pins the single CPU and throttles Vite /
+ * backend / mongo, making the container feel slow while the user is editing.
+ * This endpoint moves the heavy build off-pod: it zips the frontend SOURCE
+ * (no node_modules — ~20ms, ~4MB RAM), POSTs it to the build Lambda, gets the
+ * built `dist` back, and writes it to GCS at frontend/dist-static/${buildId}.
+ *
+ * The Lambda is a pure compute function: source-zip in → dist-zip out. It holds
+ * NO GCP credentials; the container does the GCS write (it already has them).
+ *
+ * IMPORTANT: Responds 202 immediately and does the work in background — check
+ * logs for completion. The live preview (Vite/HMR) is unaffected; this only
+ * refreshes the static GCS fallback served when the pod scales to 0.
+ *
+ * Lambda contract:
+ *   Request : POST, body = zip archive of frontend source (no node_modules)
+ *   Response: 2xx, body = zip archive whose root IS the dist contents
+ *             (index.html, assets/, …). Non-2xx ⇒ build failed.
+ *
+ * @body {string} buildId - Required. Identifies this build; output goes to
+ *                          frontend/dist-static/${buildId}.
+ */
+router.post('/build-static', async (req, res) => {
+  const { buildId } = req.body;
+
+  if (!buildId) {
+    return apiResponse(res, 400, { error: 'buildId is required' });
+  }
+
+  const lambdaUrl = process.env.STATIC_BUILD_LAMBDA_URL;
+  if (!lambdaUrl) {
+    console.error('❌ STATIC_BUILD_LAMBDA_URL is not configured');
+    return apiResponse(res, 500, { error: 'Build service not configured' });
+  }
+
+  // Respond immediately; build happens in background (logs report completion).
+  apiResponse(res, 202, { success: true, buildId, message: 'Build started' });
+
+  const outDir = `dist-static/${buildId}`;
+  const distStaticRoot = path.join(FRONTEND_DIR, 'dist-static');
+  const distDir = path.join(FRONTEND_DIR, outDir);
+  const tmpZip = path.join('/tmp', `dist-${buildId}.zip`);
+
+  const runBuild = async () => {
+    const startTime = Date.now();
+
+    // 1. Zip the frontend source (exclude node_modules / git / prior builds).
+    console.log(`📦 Zipping frontend source for build ${buildId}...`);
+    const sourceZip = await zipDirToBuffer(FRONTEND_DIR, [
+      'node_modules/**',
+      '**/node_modules/**',
+      '.git/**',
+      'dist/**',
+      'dist-static/**',
+    ]);
+    console.log(`📦 Source zip: ${(sourceZip.length / 1048576).toFixed(2)}MB`);
+
+    // 2. Ship it to the build Lambda and get the dist zip back.
+    console.log(`🚀 Sending to build Lambda...`);
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 180000); // 3 min ceiling
+    let lambdaRes;
+    try {
+      lambdaRes = await fetch(lambdaUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/zip', 'x-build-id': buildId },
+        body: sourceZip,
+        signal: controller.signal,
+      });
+    } finally {
+      clearTimeout(timeout);
+    }
+
+    if (!lambdaRes.ok) {
+      const errText = await lambdaRes.text().catch(() => '');
+      throw new Error(`Lambda build failed (${lambdaRes.status}): ${errText.slice(0, 500)}`);
+    }
+
+    const distBuffer = Buffer.from(await lambdaRes.arrayBuffer());
+    console.log(`📥 Received dist zip: ${(distBuffer.length / 1048576).toFixed(2)}MB`);
+
+    // 3. Extract the returned dist into frontend/dist-static/${buildId}.
+    await fs.rm(distDir, { recursive: true, force: true });
+    await fs.mkdir(distDir, { recursive: true });
+    await fs.writeFile(tmpZip, distBuffer);
+    await extractZip(tmpZip, { dir: distDir });
+    await fs.rm(tmpZip, { force: true });
+
+    // 4. Write the dist files to GCS (incremental — CLAUDE.md: not syncDirectoryToGCS).
+    const distFiles = await glob('**/*', { cwd: distDir, nodir: true, dot: true });
+    if (distFiles.length === 0) {
+      throw new Error('Lambda returned an empty dist (no files extracted)');
+    }
+    const relPaths = distFiles.map((f) => path.relative(PROJECT_DIR, path.join(distDir, f)));
+    console.log(`📤 Syncing ${relPaths.length} dist file(s) to GCS...`);
+    await syncFilesToGCS(PROJECT_DIR, relPaths);
+
+    // 5. Clean up older build folders (local + GCS), keep only the current one.
+    try {
+      const entries = await fs.readdir(distStaticRoot).catch(() => []);
+      const oldEntries = entries.filter((e) => e !== buildId);
+
+      await Promise.all(oldEntries.map((e) =>
+        fs.rm(path.join(distStaticRoot, e), { recursive: true, force: true })
+      ));
+
+      const bucket = new Storage().bucket(GCS_BUCKET);
+      await Promise.all(oldEntries.map(async (e) => {
+        const prefix = `projects/${projectId}/files/frontend/dist-static/${e}/`;
+        const [files] = await bucket.getFiles({ prefix });
+        await Promise.all(files.map((f) => f.delete().catch(() => { })));
+      }));
+    } catch (err) {
+      const errorMsg = err?.message || String(err) || 'Unknown error';
+      console.error(`⚠️ Old build cleanup failed: ${errorMsg}`);
+    }
+
+    console.log(`✅ Off-pod build ${buildId} complete in ${Date.now() - startTime}ms`);
+  };
+
+  runBuild().catch(async (err) => {
+    const errorMsg = err?.message || String(err) || 'Unknown error';
+    console.error(`❌ Off-pod build ${buildId} failed: ${errorMsg}`);
+    await fs.rm(tmpZip, { force: true }).catch(() => { });
   });
 });
 

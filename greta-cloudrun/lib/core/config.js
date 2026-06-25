@@ -175,6 +175,7 @@ export const EXPRESS_API_ENDPOINTS = [
 
   // Build
   '/_greta/build',
+  '/_greta/build-static',
 
   // Environment & Server Management
   '/_greta/update-env-and-restart',
