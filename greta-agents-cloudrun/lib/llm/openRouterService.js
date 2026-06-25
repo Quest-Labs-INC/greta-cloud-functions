@@ -1,40 +1,23 @@
-const { ChatOpenAI } = require('@langchain/openai');
+const OpenAI = require('openai');
 const axios = require('axios');
 
 const OPEN_ROUTER_API_KEY = process.env.OPEN_ROUTER_API_KEY;
-const DEFAULT_AGENT_MODEL = 'google/gemini-3-flash-preview';
 const OPENROUTER_BASE_URL = 'https://openrouter.ai/api/v1';
 
-/**
- * Create OpenRouter LLM client for LangChain
- * Used by both agent containers and backend for consistent LLM access
- */
-function createOpenRouterLLM({ model, temperature } = {}) {
+function createRawOpenAIClient() {
     if (!OPEN_ROUTER_API_KEY) {
         throw new Error('OPEN_ROUTER_API_KEY not configured in container');
     }
-
-    return new ChatOpenAI({
-        modelName: model || DEFAULT_AGENT_MODEL,
-        temperature: temperature ?? 0.2,
-        openAIApiKey: OPEN_ROUTER_API_KEY,
-        configuration: {
-            baseURL: OPENROUTER_BASE_URL,
-            defaultHeaders: {
-                'HTTP-Referer': 'https://questera.ai',
-                'X-Title': 'Greta-AI-Agents',
-            }
-        }
+    return new OpenAI({
+        baseURL: OPENROUTER_BASE_URL,
+        apiKey: OPEN_ROUTER_API_KEY,
+        defaultHeaders: {
+            'HTTP-Referer': 'https://www.greta.sh/',
+            'X-Title': 'Greta-AI-Agents',
+        },
     });
 }
 
-/**
- * Fetch the actual USD cost of a completed generation from OpenRouter.
- * Returns null if unavailable (caller should fall back to token-based estimation).
- *
- * OpenRouter generation data is usually available within ~2s after the call completes.
- * Pass the generation ID from msg.id (e.g. "gen-xxxxxxxx").
- */
 async function fetchGenerationCost(generationId, { retryOn404 = true } = {}) {
     if (!generationId) return null;
     console.log(`[OpenRouter] Fetching cost for id: "${generationId}"`);
@@ -60,11 +43,6 @@ async function fetchGenerationCost(generationId, { retryOn404 = true } = {}) {
     }
 }
 
-/**
- * Fetch actual USD costs for multiple generations and return the total.
- * Waits 2s first to let OpenRouter finalize the generation data.
- * Returns null if none of the IDs resolve successfully.
- */
 async function fetchTotalRunCost(generationIds) {
     const ids = generationIds.filter(Boolean);
     if (!ids.length) return null;
@@ -75,4 +53,4 @@ async function fetchTotalRunCost(generationIds) {
     return valid.reduce((sum, c) => sum + c, 0);
 }
 
-module.exports = { createOpenRouterLLM, fetchGenerationCost, fetchTotalRunCost };
+module.exports = { createRawOpenAIClient, OPENROUTER_BASE_URL, fetchGenerationCost, fetchTotalRunCost };

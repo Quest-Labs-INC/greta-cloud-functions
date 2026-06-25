@@ -3,6 +3,9 @@
 
 set -e
 
+# Always run from the script's own directory so cloudbuild.yaml and Dockerfile are found
+cd "$(dirname "$0")"
+
 # Load .env from repo root if it exists
 if [ -f "$(dirname "$0")/../.env" ]; then
   export $(grep -v '^#' "$(dirname "$0")/../.env" | xargs)

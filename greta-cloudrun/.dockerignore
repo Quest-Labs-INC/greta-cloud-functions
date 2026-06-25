@@ -1,6 +1,8 @@
 # Dependencies
 node_modules
-template/node_modules
+main-template/**/node_modules
+main-template/**/__pycache__
+main-template/**/*.pyc
 
 # Build outputs
 dist

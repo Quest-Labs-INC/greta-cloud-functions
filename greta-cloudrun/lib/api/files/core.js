@@ -12,7 +12,7 @@
 import express from 'express';
 import fs from 'fs-extra';
 import path from 'path';
-import { PROJECT_DIR } from '../../core/config.js';
+import { PROJECT_DIR, MAX_VIEW_FILE_LINES, MAX_OUTPUT_CHARS } from '../../core/config.js';
 import {
   syncToGCS,
   syncFilesToGCS,
@@ -28,6 +28,23 @@ import {
 } from './helpers.js';
 
 const router = express.Router();
+
+
+/**
+ * Cap a string to MAX_OUTPUT_CHARS. Returns { content, truncated, note }.
+ * Used as the hard ceiling on any read response so large lines/files can't
+ * blow past the output budget even within the line cap.
+ */
+function capChars(str) {
+  if (str.length <= MAX_OUTPUT_CHARS) {
+    return { content: str, truncated: false };
+  }
+  return {
+    content: str.slice(0, MAX_OUTPUT_CHARS),
+    truncated: true,
+    note: `Output truncated at ${MAX_OUTPUT_CHARS} chars (was ${str.length}). Use view_range to page through the file.`
+  };
+}
 
 
 /* ─────────────────────────────────────────────────────────────────────────────
@@ -121,24 +138,44 @@ router.get('/read-file', async (req, res) => {
         const start = Math.max(1, range[0] || 1);
         const end = Math.min(totalLines, range[1] || totalLines);
         const selectedLines = lines.slice(start - 1, end);
+        const capped = capChars(selectedLines.join('\n'));
 
         return apiResponse(res, 200, {
-          content: selectedLines.join('\n'),
+          content: capped.content,
           path: filePath,
           view_range: [start, end],
           total_lines: totalLines,
-          lines_returned: selectedLines.length
+          lines_returned: selectedLines.length,
+          ...(capped.truncated ? { truncated: true, note: capped.note } : {})
         });
       } catch (e) {
         return apiResponse(res, 400, { error: 'Invalid view_range format. Use [start, end]' });
       }
     }
 
+    // No view_range: cap to MAX_VIEW_FILE_LINES (then MAX_OUTPUT_CHARS) so a large
+    // file doesn't dump its full content into the agent's context. The agent can
+    // page past the cap with view_range.
+    if (totalLines > MAX_VIEW_FILE_LINES) {
+      const capped = capChars(lines.slice(0, MAX_VIEW_FILE_LINES).join('\n'));
+      return apiResponse(res, 200, {
+        type: 'file',
+        content: capped.content,
+        path: filePath,
+        total_lines: totalLines,
+        lines_returned: Math.min(MAX_VIEW_FILE_LINES, totalLines),
+        truncated: true,
+        note: `Showing lines 1-${MAX_VIEW_FILE_LINES} of ${totalLines}. Use view_range to read more, e.g. view_range=[${MAX_VIEW_FILE_LINES + 1}, ${Math.min(totalLines, MAX_VIEW_FILE_LINES * 2)}].`
+      });
+    }
+
+    const cappedFull = capChars(content);
     return apiResponse(res, 200, {
       type: 'file',
-      content,
+      content: cappedFull.content,
       path: filePath,
-      total_lines: totalLines
+      total_lines: totalLines,
+      ...(cappedFull.truncated ? { truncated: true, note: cappedFull.note } : {})
     });
   } catch (error) {
     return apiResponse(res, 500, { error: error.message });
