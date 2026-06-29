@@ -468,14 +468,7 @@ router.post('/build-static', async (req, res) => {
     return apiResponse(res, 400, { error: 'buildId is required' });
   }
 
-  const lambdaUrl = process.env.STATIC_BUILD_LAMBDA_URL;
-  if (!lambdaUrl) {
-    console.error('❌ STATIC_BUILD_LAMBDA_URL is not configured');
-    return apiResponse(res, 500, { error: 'Build service not configured' });
-  }
-
-  // Respond immediately; build happens in background (logs report completion).
-  apiResponse(res, 202, { success: true, buildId, message: 'Build started' });
+  const lambdaUrl = 'https://j73665t43unnoq6qihivoimm4a0wlwby.lambda-url.us-east-2.on.aws/';
 
   const outDir = `dist-static/${buildId}`;
   const distStaticRoot = path.join(FRONTEND_DIR, 'dist-static');
@@ -559,11 +552,15 @@ router.post('/build-static', async (req, res) => {
     console.log(`✅ Off-pod build ${buildId} complete in ${Date.now() - startTime}ms`);
   };
 
-  runBuild().catch(async (err) => {
+  try {
+    await runBuild();
+    apiResponse(res, 200, { success: true, buildId, message: 'Build complete' });
+  } catch (err) {
     const errorMsg = err?.message || String(err) || 'Unknown error';
     console.error(`❌ Off-pod build ${buildId} failed: ${errorMsg}`);
     await fs.rm(tmpZip, { force: true }).catch(() => { });
-  });
+    apiResponse(res, 500, { success: false, buildId, error: errorMsg });
+  }
 });
 
 
